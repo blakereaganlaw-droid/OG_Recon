@@ -1,0 +1,4 @@
+# UT Cash Management Reconciliation Engine — runtime dependencies.
+# Standard library + decimal + openpyxl only (NO pandas — it float-coerces
+# zero-padded references and merchant IDs and silently corrupts keys).
+openpyxl>=3.1
