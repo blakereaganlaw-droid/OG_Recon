@@ -1,5 +1,13 @@
 # UT Cash Management Reconciliation Engine — Master Build Specification
 
+> **Addendum (2026-07-10, project owner decision):** this specification now
+> governs **two repositories**. `OG_Recon` implements the **forward** engine
+> only (all sections except §10); `Unreconcile2` implements the **backward**
+> engine (§10, plus the shared §4 router, §5 binder, §7 primitives, §8 pool).
+> The split exists for speed: the forward engine recognizes but never loads
+> an `*All_Data*` workbook. Statements below describing "one program with two
+> engines" predate the split and should be read per-repository.
+
 **Audience:** an autonomous coding agent (Claude Code first; portable to Grok, ChatGPT, and Perplexity).
 **Mandate:** write a complete, production-grade Python program that reconciles University of Tennessee (UT) bank accounts in Oracle Cash Management (DASH), forward (match open items) and backward (catch and unwind bad reconciliations).
 **Non-negotiable temperament:** fast, accurate, reliable, thorough, resilient, and **on rails** — the pipeline is fixed, every stage validates its inputs, and the program never skips a step, never guesses at a column, and never silently drops a row.

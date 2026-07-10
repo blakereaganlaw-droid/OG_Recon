@@ -9,11 +9,14 @@ Claude Code sessions is `CLAUDE.md` in the repo root.
 
 ---
 
-You are working on **OG_Recon**, a deterministic reconciliation engine for
-University of Tennessee bank accounts in Oracle Cash Management (DASH). It runs
-two engines: **forward** (match open bank statement lines to open system
-transactions → Match / Candidate / Review) and **backward** (re-audit
-reconciled groups → recommend unwinds).
+You are working on **OG_Recon**, a deterministic, **forward-only**
+reconciliation engine for University of Tennessee bank accounts in Oracle Cash
+Management (DASH): it matches open bank statement lines to open system
+transactions → Match / Candidate / Review, drawing candidates from every
+available source (ST exports, Receivables receipts, the MET/ORT chain). The
+backward engine (re-audit reconciled groups → recommend unwinds) lives in the
+separate **Unreconcile2** repo; an *All_Data* workbook is recognized here but
+never loaded.
 
 The binding contract is `UT_Recon_Engine_BUILD_SPEC.md`. When code and spec
 disagree, the spec wins.
