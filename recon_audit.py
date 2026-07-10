@@ -112,30 +112,46 @@ def _norm_header(h):
 
 # ---- independent minimal binder --------------------------------------
 
+class AuditBindError(Exception):
+    """The audit could not re-bind a source column unambiguously.  Callers
+    convert this into a named check FAILURE — never a guess, never a crash."""
+
+
 def _find_col(rows, header_index, aliases, predicate, sample=50):
-    """Return the best column index for a role, or None."""
+    """Return the best column index for a role, or None when no column shows
+    any evidence.  A blind tie (two columns equal on content AND header
+    score) raises AuditBindError rather than picking by position."""
     header = rows[header_index]
     ncols = max(len(r) for r in rows)
     data = rows[header_index + 1: header_index + 1 + sample]
     alias_norms = [_norm_header(a) for a in aliases]
-    best = (-1.0, -1, None)
+    scored = []
     for col in range(ncols):
         hnorm = _norm_header(header[col]) if col < len(header) else ""
         hscore = 3 if hnorm in alias_norms else (2 if any(a and a in hnorm for a in alias_norms) else 0)
         sampled = [r[col] for r in data if col < len(r) and _N(r[col]) != ""]
         cscore = (sum(1 for c in sampled if predicate(c)) / len(sampled)) if sampled else 0.0
-        if (cscore, hscore) > (best[0], best[1]):
-            best = (cscore, hscore, col)
+        scored.append((cscore, hscore, col))
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    best = scored[0]
+    if best[0] == 0 and best[1] == 0:
+        return None
+    if len(scored) > 1 and (best[0], best[1]) == (scored[1][0], scored[1][1]) and best[0] > 0:
+        raise AuditBindError(
+            f"columns {best[2]} and {scored[1][2]} tie for aliases {aliases}")
     return best[2]
 
 
 def _locate_header(rows, aliases, scan=12):
-    all_aliases = [_norm_header(a) for a in aliases]
-    best_i, best_hits = 0, -1
+    """Best header row within the scan window, or None when no row carries
+    enough recognized headers — never a positional default to row 0."""
+    all_aliases = [_norm_header(a) for a in aliases if _norm_header(a)]
+    need = min(2, len(all_aliases)) or 1
+    best_i, best_hits = None, need - 1
     for i in range(min(scan, len(rows))):
         hits = sum(1 for c in rows[i]
                    if _norm_header(c) and any(_norm_header(c) == a or a in _norm_header(c)
-                                              for a in all_aliases if a))
+                                              for a in all_aliases))
         if hits > best_hits:
             best_i, best_hits = i, hits
     return best_i
@@ -180,25 +196,58 @@ def _pred_any(v):
 
 # ---- source BSL re-parse (independent) -------------------------------
 
+# The full BSL header vocabulary, re-declared locally (§5.3 mirrored, NOT
+# imported from the engine): the audit must recognize every header the engine
+# does, or a benign column insertion makes the two bind different columns.
+_BSL_DATE_ALIASES = ["Transaction Date", "Booking Date", "Value Date", "Date", "Post Date"]
+_BSL_AMOUNT_ALIASES = ["Amount", "Transaction Amount", "Signed Amount"]
+_BSL_HEADER_VOCAB = _BSL_DATE_ALIASES + _BSL_AMOUNT_ALIASES + [
+    "Line Number", "Statement Line", "Sequence", "Reference",
+    "Account Servicer Reference", "Additional Information", "Transaction Code",
+]
+
+_YYYYMMDD_RE = re.compile(r"(\d{8})")
+
+
+def _newest_date_key(name):
+    """Newest plausible YYYYMMDD stamp in a filename (mirrors the engine's
+    newest-wins routing without importing it)."""
+    best = "00000000"
+    for m in _YYYYMMDD_RE.finditer(name):
+        s = m.group(1)
+        y, mo, d = int(s[:4]), int(s[4:6]), int(s[6:8])
+        if 1990 <= y <= 2099 and 1 <= mo <= 12 and 1 <= d <= 31 and s > best:
+            best = s
+    return best
+
+
 def _reparse_source_bsls(input_dir):
     """Re-read the BSL source and return a multiset of (date, cents)."""
-    bsl_file = None
+    candidates = []
     for name in sorted(os.listdir(input_dir)):
         low = name.lower()
         if "bsl" in low and "all_data" not in low and low.endswith((".xlsx", ".xlsm", ".csv")):
-            bsl_file = os.path.join(input_dir, name)
-            break
-    if bsl_file is None:
+            candidates.append(name)
+    if not candidates:
         return None
+    # Newest YYYYMMDD stamp wins, mirroring the engine's routing — the audit
+    # must re-parse the SAME file the engine reconciled, not the first name
+    # alphabetically.  Stable sort keeps alphabetical order among ties.
+    candidates.sort(key=_newest_date_key, reverse=True)
+    bsl_file = os.path.join(input_dir, candidates[0])
     if bsl_file.lower().endswith(".csv"):
         rows = _read_csv(bsl_file)
     else:
         rows = _read_xlsx(bsl_file)
     if not rows:
         return []
-    hi = _locate_header(rows, ["Date", "Transaction Date", "Amount"])
-    dcol = _find_col(rows, hi, ["Transaction Date", "Booking Date", "Date", "Value Date"], _pred_date)
-    acol = _find_col(rows, hi, ["Amount", "Transaction Amount"], _pred_amount)
+    hi = _locate_header(rows, _BSL_HEADER_VOCAB)
+    if hi is None:
+        raise AuditBindError(
+            f"{os.path.basename(bsl_file)}: no BSL header row found — "
+            "refusing to re-parse from a positional guess")
+    dcol = _find_col(rows, hi, _BSL_DATE_ALIASES, _pred_date)
+    acol = _find_col(rows, hi, _BSL_AMOUNT_ALIASES, _pred_amount)
     bag = []
     for r in rows[hi + 1:]:
         amt = _cents(r[acol]) if acol is not None and acol < len(r) else None
@@ -274,8 +323,15 @@ def audit(input_dir, recon_path, account):
     all_out = match_rows + cand_rows + review_rows
 
     # C1 conservation (count + multiset on date+cents)
-    src_bag = _reparse_source_bsls(input_dir)
-    if src_bag is None:
+    try:
+        src_bag = _reparse_source_bsls(input_dir)
+    except AuditBindError as e:
+        src_bag = None
+        checks["C1"] = "FAIL"
+        failures.append(f"C1: source re-parse could not bind unambiguously: {e}")
+    if "C1" in checks:
+        pass
+    elif src_bag is None:
         checks["C1"] = "SKIP (no source BSL found)"
     else:
         out_bag = []
@@ -312,20 +368,28 @@ def audit(input_dir, recon_path, account):
                 seen[st] = label
     checks["C3"] = "PASS" if c3_ok else "FAIL"
 
-    # C4 MET bridge validity — every cited d:/r: is a real MET pair.
+    # C4 MET bridge validity — every cited d:/r: is a real MET pair.  The
+    # citation loop runs UNCONDITIONALLY: a workbook citing d:/r: pairs when
+    # no MET source exists to validate them is a FAIL, never a silent pass.
     met_pairs = _reparse_met_pairs(input_dir)
-    c4_ok = True
-    if met_pairs:
-        for r in all_out:
-            for dep in _split_multi(r[6]):
-                if dep and ("d", dep) not in met_pairs:
+    c4_ok, cited = True, False
+    for r in all_out:
+        for dep in _split_multi(r[6]):
+            if dep:
+                cited = True
+                if ("d", dep) not in met_pairs:
                     c4_ok = False
                     failures.append(f"C4: cited d:{dep} not a real MET deposit")
-            for rec in _split_multi(r[7]):
-                if rec and ("r", rec) not in met_pairs:
+        for rec in _split_multi(r[7]):
+            if rec:
+                cited = True
+                if ("r", rec) not in met_pairs:
                     c4_ok = False
                     failures.append(f"C4: cited r:{rec} not a real MET receipt")
-    checks["C4"] = "PASS" if c4_ok else ("SKIP" if not met_pairs else "FAIL")
+    if not cited and not met_pairs:
+        checks["C4"] = "SKIP (no citations, no MET source)"
+    else:
+        checks["C4"] = "PASS" if c4_ok else "FAIL"
 
     # C5 dual-fire excluded from Matches (a Match may not cite the same ST twice).
     c5_ok = True
