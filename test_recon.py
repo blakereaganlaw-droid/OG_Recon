@@ -18,6 +18,7 @@ from datetime import date
 
 import recon_engine as E
 import recon_audit as A
+import run_recon as R
 
 
 class TestPrimitives(unittest.TestCase):
@@ -177,6 +178,30 @@ def _write_xlsx(path, sheets):
     wb.save(path)
 
 
+def _build_fhb_utc_inputs(d, bsl_name="20240101_FHB_UTC_BSL_UNR.xlsx",
+                          st_name="20240101_FHB_UTC_Account_ST.xlsx"):
+    """Synthetic FHB_UTC account: 2 matchable lines + 1 review line."""
+    # BSL: three open bank lines for FHB_UTC.
+    bsl = [
+        ("Transaction Date", "Amount", "Line Number", "Account Servicer Reference",
+         "Additional Information", "Transaction Code"),
+        ("2024-03-10", "150.00", "1", "REF100200", "ACH CREDIT VENDOR", "142"),   # exact 1:1
+        ("2024-03-12", "300.00", "2", "GRP500600", "DEPOSIT", "174"),             # 1:M group
+        ("2024-03-15", "999.99", "3", "NADA000111", "UNKNOWN THING", "142"),      # review
+    ]
+    _write_xlsx(os.path.join(d, bsl_name), [("Exported", bsl)])
+    # ST: open external transactions.
+    st = [
+        ("Transaction Date", "Amount", "Transaction Number", "Source", "Reference", "Counterparty"),
+        ("2024-03-09", "150.00", "ST1", "EXT", "REF100200", "VENDOR INC"),        # matches line 1
+        ("2024-03-11", "120.00", "ST2", "EXT", "GRP500600", "PAYER A"),           # part of group
+        ("2024-03-11", "180.00", "ST3", "EXT", "GRP500600", "PAYER A"),           # part of group
+        ("2024-03-01", "999.99", "ST4", "GL", "NADA000111", "JOURNAL"),           # journal: never matches
+    ]
+    _write_xlsx(os.path.join(d, st_name), [("Exported", st)])
+    return "FHB_UTC"
+
+
 class TestEndToEnd(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
@@ -187,27 +212,7 @@ class TestEndToEnd(unittest.TestCase):
         shutil.rmtree(self.out, ignore_errors=True)
 
     def _build_inputs(self):
-        # BSL: three open bank lines for FHB_UTC.
-        bsl = [
-            ("Transaction Date", "Amount", "Line Number", "Account Servicer Reference",
-             "Additional Information", "Transaction Code"),
-            ("2024-03-10", "150.00", "1", "REF100200", "ACH CREDIT VENDOR", "142"),   # exact 1:1
-            ("2024-03-12", "300.00", "2", "GRP500600", "DEPOSIT", "174"),             # 1:M group
-            ("2024-03-15", "999.99", "3", "NADA000111", "UNKNOWN THING", "142"),      # review
-        ]
-        _write_xlsx(os.path.join(self.d, "20240101_FHB_UTC_BSL_UNR.xlsx"),
-                    [("Exported", bsl)])
-        # ST: open external transactions.
-        st = [
-            ("Transaction Date", "Amount", "Transaction Number", "Source", "Reference", "Counterparty"),
-            ("2024-03-09", "150.00", "ST1", "EXT", "REF100200", "VENDOR INC"),        # matches line 1
-            ("2024-03-11", "120.00", "ST2", "EXT", "GRP500600", "PAYER A"),           # part of group
-            ("2024-03-11", "180.00", "ST3", "EXT", "GRP500600", "PAYER A"),           # part of group
-            ("2024-03-01", "999.99", "ST4", "GL", "NADA000111", "JOURNAL"),           # journal: never matches
-        ]
-        _write_xlsx(os.path.join(self.d, "20240101_FHB_UTC_Account_ST.xlsx"),
-                    [("Exported", st)])
-        return "FHB_UTC"
+        return _build_fhb_utc_inputs(self.d)
 
     def test_forward_and_audit(self):
         account = self._build_inputs()
@@ -236,6 +241,225 @@ class TestEndToEnd(unittest.TestCase):
         tabs, _ = A._read_output_tabs(recon_path)
         review = [r for r in tabs["Review Notes"][3:] if any(A._N(c) for c in r)]
         self.assertTrue(any("999.99" in A._N(r[2]) for r in review))
+
+
+class TestPerRunScript(unittest.TestCase):
+    """run_recon.py: stage one upload -> immutable run folder -> engine."""
+
+    def setUp(self):
+        self.upload = tempfile.mkdtemp()
+        self.runs = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.upload, ignore_errors=True)
+        shutil.rmtree(self.runs, ignore_errors=True)
+
+    def test_staged_name_prefix_rules(self):
+        # Hex upload prefix stripped; plausible YYYYMMDD date prefix kept.
+        self.assertEqual(R.staged_name("933782d6-FHB_UTC_BSL.xlsx"),
+                         "FHB_UTC_BSL.xlsx")
+        self.assertEqual(R.staged_name("20240101-FHB_UTC_BSL.xlsx"),
+                         "20240101-FHB_UTC_BSL.xlsx")
+        # All-digit but NOT a plausible date (month 20) -> an unlucky random
+        # hex prefix; must be stripped or it poisons newest-wins ordering.
+        self.assertEqual(R.staged_name("30201090-FHB_UTC_BSL.xlsx"),
+                         "FHB_UTC_BSL.xlsx")
+        self.assertEqual(R.staged_name("FHB_UTC_BSL.xlsx"), "FHB_UTC_BSL.xlsx")
+        self.assertEqual(R.staged_name("933782d6-x.xlsx", strip_prefix=False),
+                         "933782d6-x.xlsx")
+
+    def test_perform_run_end_to_end(self):
+        _build_fhb_utc_inputs(
+            self.upload,
+            bsl_name="933782d6-20240101_FHB_UTC_BSL_UNR.xlsx",
+            st_name="ab12cd34-20240101_FHB_UTC_Account_ST.xlsx")
+        # An unrouted spreadsheet and a non-spreadsheet ride along.
+        _write_xlsx(os.path.join(self.upload, "random_notes.xlsx"),
+                    [("Sheet1", [("a",)])])
+        with open(os.path.join(self.upload, "readme.txt"), "w") as fh:
+            fh.write("not a spreadsheet")
+
+        code, report = R.perform_run([self.upload], runs_root=self.runs,
+                                     run_id="run_test")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["account"], "FHB_UTC")
+        self.assertEqual(report["audit"], "PASS")
+
+        run_dir = os.path.join(self.runs, "run_test")
+        # Upload prefixes stripped in staging.
+        self.assertTrue(os.path.exists(os.path.join(
+            run_dir, "input", "20240101_FHB_UTC_BSL_UNR.xlsx")))
+        self.assertTrue(os.path.exists(report["recon_workbook"]))
+        self.assertTrue(os.path.exists(report["unwind_workbook"]))
+        self.assertTrue(os.path.exists(report["runlog"]))
+
+        import json
+        with open(os.path.join(run_dir, "manifest.json")) as fh:
+            manifest = json.load(fh)
+        roles = {e["staged_as"]: e["role"] for e in manifest["files"]}
+        self.assertEqual(roles["20240101_FHB_UTC_BSL_UNR.xlsx"], "BSL")
+        self.assertEqual(roles["20240101_FHB_UTC_Account_ST.xlsx"], "ST")
+        self.assertEqual(roles["random_notes.xlsx"], "UNROUTED")
+        self.assertTrue(all(len(e["sha256"]) == 64 for e in manifest["files"]))
+        self.assertTrue(any("random_notes.xlsx" in w for w in manifest["warnings"]))
+        self.assertEqual(len(manifest["ignored_non_spreadsheets"]), 1)
+        cv = manifest["code_versions"]
+        self.assertEqual(len(cv["recon_engine.py"]), 64)
+        self.assertEqual(len(cv["recon_audit.py"]), 64)
+
+    def test_individual_file_args_and_parent_dir_dedup(self):
+        # Documented primary usage: file arguments, including a file passed
+        # both explicitly and via its parent directory (one source, no
+        # spurious self-collision).
+        _build_fhb_utc_inputs(self.upload)
+        bsl = os.path.join(self.upload, "20240101_FHB_UTC_BSL_UNR.xlsx")
+        st = os.path.join(self.upload, "20240101_FHB_UTC_Account_ST.xlsx")
+        code, report = R.perform_run([bsl, st, self.upload, bsl],
+                                     runs_root=self.runs, run_id="rfiles")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["audit"], "PASS")
+
+    def test_audit_fail_exits_2_and_quarantines(self):
+        # Force the independent audit to FAIL: perform_run must recover the
+        # runlog (written before the gate raises), report FAIL, exit 2 —
+        # and the workbooks stay on disk for forensics.
+        import recon_audit
+        _build_fhb_utc_inputs(self.upload)
+        real_audit = recon_audit.audit
+        recon_audit.audit = lambda *a, **k: {
+            "status": "FAIL", "checks": {}, "failures": ["forced"]}
+        try:
+            self.assertEqual(
+                R.main([self.upload, "--runs-root", self.runs,
+                        "--run-id", "rfail"]), 2)
+            out = os.path.join(self.runs, "rfail", "outputs")
+            self.assertTrue(os.path.exists(
+                os.path.join(out, "FHB_UTC_reconciliation.xlsx")))
+            # Gate off: same failing audit -> exit 0, run completes.
+            code, report = R.perform_run([self.upload], runs_root=self.runs,
+                                         run_id="rfail2", present=False)
+            self.assertEqual(code, 0)
+            self.assertEqual(report["audit"], "FAIL")
+        finally:
+            recon_audit.audit = real_audit
+
+    def test_no_strip_flag_via_cli(self):
+        _build_fhb_utc_inputs(
+            self.upload,
+            bsl_name="933782d6-20240101_FHB_UTC_BSL_UNR.xlsx",
+            st_name="ab12cd34-20240101_FHB_UTC_Account_ST.xlsx")
+        self.assertEqual(
+            R.main([self.upload, "--runs-root", self.runs, "--run-id", "rk",
+                    "--no-strip-upload-prefix"]), 0)
+        self.assertTrue(os.path.exists(os.path.join(
+            self.runs, "rk", "input",
+            "933782d6-20240101_FHB_UTC_BSL_UNR.xlsx")))
+
+    def test_missing_bsl_fails_loud(self):
+        _build_fhb_utc_inputs(self.upload)
+        os.remove(os.path.join(self.upload, "20240101_FHB_UTC_BSL_UNR.xlsx"))
+        with self.assertRaises(R.PerRunError):
+            R.perform_run([self.upload], runs_root=self.runs, run_id="r1")
+
+    def test_mixed_accounts_fail_loud(self):
+        _build_fhb_utc_inputs(self.upload)
+        _build_fhb_utc_inputs(self.upload,
+                              bsl_name="20240101_Regions_UTM_BSL_UNR.xlsx",
+                              st_name="20240101_Regions_UTM_Account_ST.xlsx")
+        with self.assertRaises(R.PerRunError):
+            R.perform_run([self.upload], runs_root=self.runs, run_id="r1")
+
+    def test_mixed_account_st_alone_fails_loud(self):
+        # A wrong-account ST with the right-account BSL would cross-pollute
+        # the pool; the guard must span every routed file, not just BSL.
+        _build_fhb_utc_inputs(self.upload,
+                              st_name="20240101_Regions_UTM_Account_ST.xlsx")
+        with self.assertRaises(R.PerRunError):
+            R.perform_run([self.upload], runs_root=self.runs, run_id="r1")
+
+    def test_case_only_collision_fails_loud(self):
+        other = tempfile.mkdtemp()
+        try:
+            _build_fhb_utc_inputs(self.upload)
+            _build_fhb_utc_inputs(other,
+                                  bsl_name="20240101_fhb_utc_bsl_unr.xlsx",
+                                  st_name="20240101_FHB_UTC_ACCOUNT_st.xlsx")
+            with self.assertRaises(R.PerRunError):
+                R.perform_run([self.upload, other], runs_root=self.runs,
+                              run_id="r1")
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_failed_preflight_frees_run_id(self):
+        # An unusable upload must not leave a half-built folder or burn the id.
+        _build_fhb_utc_inputs(self.upload)
+        os.remove(os.path.join(self.upload, "20240101_FHB_UTC_BSL_UNR.xlsx"))
+        with self.assertRaises(R.PerRunError):
+            R.perform_run([self.upload], runs_root=self.runs, run_id="r1")
+        self.assertFalse(os.path.exists(os.path.join(self.runs, "r1")))
+        # Same id now works with a good upload.
+        _build_fhb_utc_inputs(self.upload)
+        code, _ = R.perform_run([self.upload], runs_root=self.runs,
+                                run_id="r1")
+        self.assertEqual(code, 0)
+
+    def test_bad_run_ids_rejected(self):
+        _build_fhb_utc_inputs(self.upload)
+        for bad in ("..", ".", "a/b", ""):
+            with self.assertRaises(R.PerRunError):
+                R.perform_run([self.upload], runs_root=self.runs, run_id=bad)
+
+    def test_nonexistent_path_fails_loud(self):
+        with self.assertRaises(R.PerRunError):
+            R.perform_run([os.path.join(self.upload, "nope.xlsx")],
+                          runs_root=self.runs, run_id="r1")
+
+    def test_subfolder_with_spreadsheets_warned(self):
+        _build_fhb_utc_inputs(self.upload)
+        nested = os.path.join(self.upload, "nested")
+        os.makedirs(nested)
+        _write_xlsx(os.path.join(nested, "20240201_FHB_UTC_BSL_UNR.xlsx"),
+                    [("Exported", [("a",)])])
+        code, report = R.perform_run([self.upload], runs_root=self.runs,
+                                     run_id="rsub")
+        self.assertEqual(code, 0)
+        import json
+        with open(os.path.join(report["run_dir"], "manifest.json")) as fh:
+            manifest = json.load(fh)
+        self.assertIn(nested, manifest["ignored_non_spreadsheets"])
+        self.assertTrue(any("NOT read" in w for w in manifest["warnings"]))
+
+    def test_collision_fails_loud(self):
+        other = tempfile.mkdtemp()
+        try:
+            _build_fhb_utc_inputs(self.upload)
+            _build_fhb_utc_inputs(other)  # same filenames, different folder
+            with self.assertRaises(R.PerRunError):
+                R.perform_run([self.upload, other], runs_root=self.runs,
+                              run_id="r1")
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_runs_are_immutable(self):
+        _build_fhb_utc_inputs(self.upload)
+        code, _ = R.perform_run([self.upload], runs_root=self.runs,
+                                run_id="r1")
+        self.assertEqual(code, 0)
+        with self.assertRaises(R.PerRunError):
+            R.perform_run([self.upload], runs_root=self.runs, run_id="r1")
+
+    def test_main_exit_codes(self):
+        # Empty upload -> exit 1 (fail loud, no run executed).
+        empty = tempfile.mkdtemp()
+        try:
+            self.assertEqual(
+                R.main([empty, "--runs-root", self.runs, "--run-id", "r1"]), 1)
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+        # Good upload -> exit 0.
+        _build_fhb_utc_inputs(self.upload)
+        self.assertEqual(
+            R.main([self.upload, "--runs-root", self.runs, "--run-id", "r2"]), 0)
 
 
 if __name__ == "__main__":

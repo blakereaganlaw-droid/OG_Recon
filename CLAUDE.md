@@ -22,14 +22,16 @@ and spec disagree, the spec wins — fix the code.
 |---|---|
 | `recon_engine.py` | Self-contained engine + CLI. Primitives (§7), router (§4), binder (§5), pool (§8), forward P0–P10 (§9), backward (§10), writers (§13/§10.6), `run()` + JSON run log (§15). |
 | `recon_audit.py` | Independent audit (§14). **Imports nothing** from the engine — keep it that way. Re-parses raw sources with its own binder; enforces C1–C10; gates delivery. |
-| `test_recon.py` | Unit + synthetic end-to-end tests. |
+| `run_recon.py` | Per-run (per-upload) wrapper. Stages one upload into an immutable `runs/<run_id>/` folder (strips 8-hex upload prefixes; keeps plausible `YYYYMMDD` date prefixes), pre-flights routing (fails loud on no-BSL / any mixed-account token / case-insensitive staged-name collisions, and removes the failed folder so the run-id stays free), writes a SHA-256 provenance `manifest.json`, then calls `recon_engine.run`. Exit 0 = audit PASS; 2 = audit FAIL (outputs quarantined — written for forensics, not approved for delivery); 1 = unusable upload. |
+| `test_recon.py` | Unit + synthetic end-to-end tests (engine and per-run wrapper). |
 | `UT_Recon_Engine_BUILD_SPEC.md` | The spec. Binding. |
 
 ## Run / test
 
 ```bash
-python3 recon_engine.py <input_dir> -o ./outputs   # reconcile one account
-python3 -m unittest test_recon -v                  # 23 tests
+python3 run_recon.py <upload_dir_or_files>          # one upload = one run folder
+python3 recon_engine.py <input_dir> -o ./outputs    # direct engine invocation
+python3 -m unittest test_recon -v                   # 39 tests
 ```
 
 Web sessions install deps via `.claude/hooks/session-start.sh`; locally,

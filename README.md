@@ -32,7 +32,8 @@ The full behavioral contract is the build spec
 |---|---|
 | `recon_engine.py` | Self-contained engine: primitives → router → binder → pool → forward P0–P10 → backward → workbook writers → `run()` orchestrator + JSON run log. |
 | `recon_audit.py` | Independent audit (imports nothing from the engine; re-parses raw sources with its own binder and enforces C1–C10). |
-| `test_recon.py` | Unit tests for primitives, router, binder, pool dedup, plus a synthetic end-to-end run gated by the audit. |
+| `run_recon.py` | Per-run (per-upload) wrapper: stages one upload into an immutable run folder, pre-flights the routing, records a provenance manifest, then runs the engine + audit. |
+| `test_recon.py` | Unit tests for primitives, router, binder, pool dedup, the per-run wrapper, plus a synthetic end-to-end run gated by the audit. |
 
 ## Requirements
 
@@ -42,6 +43,39 @@ The full behavioral contract is the build spec
   zero-padded references and merchant IDs and silently corrupts keys).
 
 ## Usage
+
+### Per-run (per-upload) — recommended
+
+Each upload of export files is one run. `run_recon.py` stages the upload into
+an isolated, immutable run folder, pre-flights it, and runs the engine:
+
+```bash
+# Point it at the uploaded files (a folder, individual files, or a mix).
+python3 run_recon.py /path/to/upload_folder
+python3 run_recon.py /root/.claude/uploads/<session>/          # a web upload
+python3 run_recon.py 20240101_FHB_UTC_BSL.xlsx 20240101_FHB_UTC_Account_ST.xlsx \
+        --runs-root ./runs --run-id 2026Q3_FHB_UTC
+```
+
+Each run produces `runs/<run_id>/` containing:
+
+- `input/` — the staged copies actually reconciled (Claude-web hex upload
+  prefixes like `933782d6-` are stripped; real `YYYYMMDD` date prefixes,
+  which drive the router's newest-wins ordering, are kept).
+- `manifest.json` — provenance: every file's origin, size, SHA-256, and router
+  role; unrouted files and warnings; the SHA-256 of the engine/audit code and
+  git commit that processed the run.
+- `outputs/` — the two workbooks and the JSON run log (below).
+
+Pre-flight fails loud **before** the engine runs on an unusable upload: no
+spreadsheets, no BSL file, a mixed-account upload (any two files naming
+different account tokens), or a staged-filename collision (case-insensitive) —
+and the failed run folder is removed so the run-id stays free. Exit codes:
+`0` ran + audit PASS; `2` ran but audit FAILed — `outputs/` is quarantined
+(the workbooks are on disk for forensics but not approved for delivery);
+`1` upload unusable.
+
+### Direct engine invocation
 
 ```bash
 # Reconcile one account's folder of export files.
