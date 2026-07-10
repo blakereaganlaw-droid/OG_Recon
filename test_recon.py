@@ -243,6 +243,172 @@ class TestEndToEnd(unittest.TestCase):
         self.assertTrue(any("999.99" in A._N(r[2]) for r in review))
 
 
+class TestColumnRobustness(unittest.TestCase):
+    """Column movement/renaming/insertion must never change results silently:
+    identical output for benign rearrangement, loud named errors for genuine
+    ambiguity. Pins the guarantees proven by the mutation sweep."""
+
+    def setUp(self):
+        self.a = tempfile.mkdtemp()   # baseline inputs
+        self.b = tempfile.mkdtemp()   # mutated inputs
+        self.oa = tempfile.mkdtemp()
+        self.ob = tempfile.mkdtemp()
+
+    def tearDown(self):
+        for d in (self.a, self.b, self.oa, self.ob):
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_leading_date_key_validates_dates(self):
+        # An 8-digit account number is not a date; the real stamp wins.
+        self.assertEqual(E._leading_date_key("acct_99999999_st_20250101.xlsx"),
+                         "20250101")
+        self.assertEqual(E._leading_date_key("20240101_FHB_UTC_BSL.xlsx"),
+                         "20240101")
+        self.assertEqual(E._leading_date_key("undated.xlsx"), "00000000")
+
+    def test_bind_columns_no_header_raises(self):
+        rows = [("Foo", "Bar"), ("2024-01-01", "10.00")]
+        specs = {"amount": E._rs(True, ["Amount"], E.pred_signed_amount)}
+        with self.assertRaises(E.InvalidSourceData):
+            E.bind_columns(rows, specs)
+
+    def test_optional_role_blind_tie_unbound(self):
+        # Two columns identical on content and header: an optional role must
+        # go unbound, never bind leftmost-by-position.
+        rows = [("Date", "Amount", "X", "Y"),
+                ("2024-01-01", "10.00", "REF1", "REF9"),
+                ("2024-01-02", "20.00", "REF2", "REF8")]
+        specs = {
+            "date": E._rs(True, ["Date"], E.pred_date),
+            "amount": E._rs(True, ["Amount"], E.pred_signed_amount),
+            "reference": E._rs(False, ["Reference"], E.pred_reference),
+        }
+        m, _hi = E.bind_columns(rows, specs)
+        self.assertNotIn("reference", m)
+
+    def test_pred_met_description(self):
+        self.assertTrue(E.pred_met_description("d:8812345 | r:991 | UT FOUNDATION"))
+        self.assertTrue(E.pred_met_description("something | else"))
+        self.assertFalse(E.pred_met_description("see attached"))
+        self.assertFalse(E.pred_met_description("word:123"))
+
+    def test_mid_master_multi_mid_and_conflict(self):
+        gl = "01-1234567-123456-123456"
+        p = os.path.join(self.a, "MID_Master.xlsx")
+        _write_xlsx(p, [("Sheet1", [("8012345678", "8098765432", gl)])])
+        rf = E.RoutedFile("MID_MASTER", p, "MID_Master.xlsx", "all")
+        out = E.load_mid_master(rf)
+        # Every MID in the row maps; no rightmost-wins column dependence.
+        self.assertEqual(out["mid_gl"]["8012345678"], gl)
+        self.assertEqual(out["mid_gl"]["8098765432"], gl)
+        # Two distinct GL strings in one row: genuinely ambiguous -> loud.
+        gl2 = "02-7654321-654321-654321"
+        p2 = os.path.join(self.a, "MID_Master_bad.xlsx")
+        _write_xlsx(p2, [("Sheet1", [("8012345678", gl, gl2)])])
+        with self.assertRaises(E.InvalidSourceData):
+            E.load_mid_master(E.RoutedFile("MID_MASTER", p2, "MID_Master_bad.xlsx", "all"))
+
+    def test_multi_file_newest_wins_and_tie_fails_loud(self):
+        # Distinct date stamps: newest wins, runs clean.
+        _build_fhb_utc_inputs(self.a)
+        _build_fhb_utc_inputs(self.a, bsl_name="20230101_FHB_UTC_BSL_UNR.xlsx",
+                              st_name="20230101_FHB_UTC_Account_ST.xlsx")
+        runlog = E.run(self.a, self.oa, present=True)
+        self.assertEqual(runlog["roles_bound"]["BSL"]["file"],
+                         "20240101_FHB_UTC_BSL_UNR.xlsx")
+        # Same date stamp on two BSL files: one would be silently ignored ->
+        # must fail loud instead.
+        _build_fhb_utc_inputs(self.b)
+        _build_fhb_utc_inputs(self.b, bsl_name="20240101_v2_FHB_UTC_BSL_UNR.xlsx",
+                              st_name="20240101_v2_FHB_UTC_Account_ST.xlsx")
+        with self.assertRaises(E.InvalidSourceData):
+            E.run(self.b, self.ob, present=True)
+
+    def test_backward_group_row_order_invariant(self):
+        # A many-to-one Recon Grp (two REC bank lines, one receipt) must
+        # balance against the group TOTAL, in either sheet row order.
+        line1 = {"date": date(2024, 3, 1), "amount_cents": 40000, "line_key": "1",
+                 "rec_status": "REC", "rec_grp": "G1", "reference": "R100",
+                 "line_info": "1 dep", "lane": E.LANE_GENERAL}
+        line2 = {"date": date(2024, 3, 1), "amount_cents": 60000, "line_key": "2",
+                 "rec_status": "REC", "rec_grp": "G1", "reference": "R100",
+                 "line_info": "2 dep", "lane": E.LANE_GENERAL}
+        receipt = {"id": "R100", "amount_cents": 100000, "reference": "R100",
+                   "rec_grp": "G1", "deposit_id": "", "status": "REC",
+                   "date": date(2024, 3, 1), "source": "EXT", "is_mid": False,
+                   "account": "FHB_UTC"}
+        for order in ([line1, line2], [line2, line1]):
+            all_data = {"bank_statement_lines": list(order),
+                        "misc_receipts": [receipt], "ar_matched": [],
+                        "recon_history": {"G1": {"ref_match": "Y"}}}
+            groups = E._assemble_reconciled_groups(all_data, "FHB_UTC")
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0]["bsl_amount_cents"], 100000)
+            self.assertEqual(groups[0]["bsl_line_info"], "1 dep")  # deterministic rep
+            defects, _lag = E._reverify_group(groups[0])
+            self.assertNotIn(E.DEFECT_AMOUNT, defects)
+
+    def test_column_shuffle_end_to_end_identical(self):
+        # The core guarantee: permuted columns + preamble rows + a decoy
+        # constant-date column produce cell-for-cell identical output.
+        account = _build_fhb_utc_inputs(self.a)
+        base = E.run(self.a, self.oa, present=True)
+
+        def _mutate(src, dst, perm, preamble, decoy_at):
+            from openpyxl import load_workbook, Workbook
+            wb = load_workbook(src)
+            rows = [list(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+            out = Workbook(); out.remove(out.active)
+            ws = out.create_sheet("Exported")
+            for p in preamble:
+                ws.append(p)
+            for i, r in enumerate(rows):
+                new = [r[j] for j in perm]
+                if decoy_at is not None:
+                    new.insert(decoy_at, "As Of" if i == 0 else "2024-04-01")
+                ws.append(new)
+            out.save(dst)
+
+        _mutate(os.path.join(self.a, "20240101_FHB_UTC_BSL_UNR.xlsx"),
+                os.path.join(self.b, "20240101_FHB_UTC_BSL_UNR.xlsx"),
+                [5, 3, 1, 0, 4, 2], [("University of Tennessee",), ()], 2)
+        _mutate(os.path.join(self.a, "20240101_FHB_UTC_Account_ST.xlsx"),
+                os.path.join(self.b, "20240101_FHB_UTC_Account_ST.xlsx"),
+                [5, 4, 3, 2, 1, 0], [], None)
+        mut = E.run(self.b, self.ob, present=True)
+
+        self.assertEqual(mut["audit"]["status"], "PASS",
+                         msg=str(mut["audit"].get("failures")))
+        self.assertEqual(base["recon_summary"], mut["recon_summary"])
+        ta, _ = A._read_output_tabs(base["recon_workbook"])
+        tb, _ = A._read_output_tabs(mut["recon_workbook"])
+        self.assertEqual(ta, tb)
+
+    def test_audit_binds_same_columns_as_engine(self):
+        # 'Post Date' header plus an inserted date-parseable decoy column:
+        # both engine and audit must bind the exact-alias column -> PASS.
+        bsl = [
+            ("Trade Date", "Post Date", "Amount", "Line Number",
+             "Account Servicer Reference", "Additional Information", "Transaction Code"),
+            ("2024-03-09", "2024-03-10", "150.00", "1", "REF100200", "ACH CREDIT", "142"),
+            ("2024-03-11", "2024-03-12", "300.00", "2", "GRP500600", "DEPOSIT", "174"),
+        ]
+        st = [
+            ("Transaction Date", "Amount", "Transaction Number", "Source", "Reference", "Counterparty"),
+            ("2024-03-09", "150.00", "ST1", "EXT", "REF100200", "VENDOR INC"),
+            ("2024-03-11", "120.00", "ST2", "EXT", "GRP500600", "PAYER A"),
+            ("2024-03-11", "180.00", "ST3", "EXT", "GRP500600", "PAYER A"),
+        ]
+        _write_xlsx(os.path.join(self.a, "20240101_FHB_UTC_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        _write_xlsx(os.path.join(self.a, "20240101_FHB_UTC_Account_ST.xlsx"),
+                    [("Exported", st)])
+        runlog = E.run(self.a, self.oa, present=True)
+        self.assertEqual(runlog["roles_bound"]["BSL"]["columns"]["date"], 1)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+
+
 class TestPerRunScript(unittest.TestCase):
     """run_recon.py: stage one upload -> immutable run folder -> engine."""
 

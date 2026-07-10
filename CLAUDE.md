@@ -31,7 +31,7 @@ and spec disagree, the spec wins — fix the code.
 ```bash
 python3 run_recon.py <upload_dir_or_files>          # one upload = one run folder
 python3 recon_engine.py <input_dir> -o ./outputs    # direct engine invocation
-python3 -m unittest test_recon -v                   # 39 tests
+python3 -m unittest test_recon -v                   # 48 tests
 ```
 
 Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
@@ -67,6 +67,13 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
 
 - `datetime` is checked **before** `date` (`datetime` subclasses `date`).
 - Falsy-zero guard: test `is not None`, never truthiness (0 cents is valid).
+- **Position never binds.** Columns bind by content-first scoring over all
+  columns; the header row is located, never assumed row 0; optional roles stay
+  unbound on zero evidence or a blind tie; newest-file ties, ambiguous sheet
+  substring matches, and MID-master GL conflicts fail loud. The audit re-binds
+  with the same alias vocabulary (duplicated literals — still imports nothing
+  from the engine). Column rearrangement is pinned identical-output by
+  `TestColumnRobustness`.
 - Output cells starting with `=` get a leading space (no formula injection);
   workbooks are **static values only**, zero formula cells.
 - Output format is locked by §13: Carlito 11pt, navy `FF1F4E78` header (dark-red

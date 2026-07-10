@@ -383,8 +383,16 @@ def infer_account(filename) -> str | None:
 
 
 def _leading_date_key(filename):
-    m = _YYYYMMDD_RE.search(filename)
-    return m.group(1) if m else "00000000"
+    """Newest plausible YYYYMMDD stamp in the filename ('00000000' if none).
+    An 8-digit run that does not parse as a calendar date (an account or
+    merchant number like 99999999) is ignored, never mistaken for a date."""
+    best = "00000000"
+    for m in _YYYYMMDD_RE.finditer(filename):
+        s = m.group(1)
+        y, mo, d = int(s[:4]), int(s[4:6]), int(s[6:8])
+        if 1990 <= y <= 2099 and 1 <= mo <= 12 and 1 <= d <= 31 and s > best:
+            best = s
+    return best
 
 
 @dataclass
@@ -504,6 +512,16 @@ def pred_number(v):
     return bool(s) and bool(re.search(r"\d", s))
 
 
+_MET_DESC_RE = re.compile(r"(?i)\b[dr]\s*:\s*\d+")
+
+
+def pred_met_description(v):
+    """MET CET_DESCRIPTION carries d:/r: citations and/or pipe segments; a
+    generic text column satisfies neither, so content can decide the bind."""
+    s = N(v)
+    return bool(_MET_DESC_RE.search(s)) or "|" in s
+
+
 def pred_any(v):  # non-empty
     return N(v) != ""
 
@@ -526,10 +544,12 @@ def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50)
         all_aliases.extend(_norm_header(a) for a in spec.header_aliases)
     max_arity = len(role_specs)
 
-    # 1. Locate the header row.
-    header_index = 0
+    # 1. Locate the header row.  Never assume row 0: a deep report preamble
+    # (banner + total rows) bound at row 0 silently emits phantom data rows.
+    header_index = None
     best_hits = -1
     scan = min(header_scan, len(rows))
+    need_hits = min(2, len({a for a in all_aliases if a})) or 1
     for i in range(scan):
         row = rows[i]
         nonempty = sum(1 for c in row if N(c) != "")
@@ -538,10 +558,18 @@ def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50)
             hc = _norm_header(c)
             if hc and any(hc == a or (a and a in hc) for a in all_aliases):
                 hits += 1
-        # Prefer a row with enough columns AND >=2 alias hits.
-        if nonempty >= min(max_arity, 2) and hits >= 2 and hits > best_hits:
+        # Prefer a row with enough columns AND enough alias hits.
+        if nonempty >= min(max_arity, 2) and hits >= need_hits and hits > best_hits:
             best_hits = hits
             header_index = i
+    if header_index is None:
+        if any(s.required for s in role_specs.values()):
+            raise InvalidSourceData(
+                filename, "HEADER",
+                f"no header row found in the first {scan} rows "
+                f"(need >= {need_hits} recognized column headers); "
+                "refusing to assume row 0")
+        header_index = 0
     header = rows[header_index]
     ncols = max(len(r) for r in rows)
     data_rows = rows[header_index + 1: header_index + 1 + sample]
@@ -577,6 +605,14 @@ def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50)
             raise InvalidSourceData(
                 filename, role,
                 f"no column satisfied content predicate (header={_norm_header(header[best[2]]) if best[2] < len(header) else ''!r})")
+        if not spec.required:
+            # An optional role never binds by position alone: leave it unbound
+            # on zero evidence or a blind tie (same content AND header score
+            # on two columns) rather than guess the leftmost column.
+            if best[0] == 0 and best[1] == 0:
+                continue
+            if len(scored) > 1 and (best[0], best[1]) == (scored[1][0], scored[1][1]):
+                continue
         mapping[role] = best[2]
     return mapping, header_index
 
@@ -627,7 +663,7 @@ MET_ROLES = {
     "amount": _rs(True, ["Amount", "Transaction Amount"], pred_signed_amount),
     "transaction_date": _rs(True, ["Transaction Date", "Date"], pred_date),
     "status": _rs(True, ["Status", "State"], pred_any),
-    "description": _rs(True, ["CET Description", "Description", "Desc"], pred_any),
+    "description": _rs(True, ["CET Description", "Description", "Desc"], pred_met_description),
     "cleared_date": _rs(False, ["Cleared Date"], pred_date),
     "offset": _rs(False, ["Offset Concatenated Segments", "Offset", "GL"], pred_any),
 }
@@ -702,22 +738,36 @@ def _read_sheet_rows(path, sheet_hint):
         wb = load_workbook(path, read_only=False, data_only=True)
     except Exception as e:
         raise InvalidSourceData(os.path.basename(path), "WORKBOOK", f"load failed: {e}")
-    ws = _pick_sheet(wb, sheet_hint)
+    ws = _pick_sheet(wb, sheet_hint, os.path.basename(path))
     rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
     title = ws.title
     wb.close()
     return rows, title
 
 
-def _pick_sheet(wb, sheet_hint):
+def _match_sheet(wb, title_substr, filename):
+    """Resolve a sheet by title substring: an exact title wins; several
+    non-exact matches are ambiguous (fail loud, never take the first tab);
+    zero matches returns None (caller decides the spec-mandated fallback)."""
+    low = title_substr.lower().strip()
+    matches = [ws for ws in wb.worksheets if low in ws.title.lower()]
+    for ws in matches:
+        if ws.title.lower().strip() == low:
+            return ws
+    if len(matches) > 1:
+        raise InvalidSourceData(
+            filename, title_substr,
+            f"multiple sheets match {title_substr!r}: "
+            f"{[ws.title for ws in matches]} — rename or pass the exact title")
+    return matches[0] if matches else None
+
+
+def _pick_sheet(wb, sheet_hint, filename="<workbook>"):
     if sheet_hint in ("first", "multi", "all", "reference", "stream", None):
         return wb.worksheets[0]
-    # substring match (case-insensitive)
-    low = sheet_hint.lower()
-    for ws in wb.worksheets:
-        if low in ws.title.lower():
-            return ws
-    return wb.worksheets[0]
+    ws = _match_sheet(wb, sheet_hint, filename)
+    # No match: spec §4.1 mandates the first-sheet fallback for named hints.
+    return ws if ws is not None else wb.worksheets[0]
 
 
 def _read_csv_rows(path):
@@ -751,12 +801,7 @@ def read_named_sheet(path, title_substr, role_specs):
     Returns (rows, mapping, header_index) or (None, None, None) if absent."""
     from openpyxl import load_workbook
     wb = load_workbook(path, read_only=False, data_only=True)
-    low = title_substr.lower()
-    target = None
-    for ws in wb.worksheets:
-        if low in ws.title.lower():
-            target = ws
-            break
+    target = _match_sheet(wb, title_substr, os.path.basename(path))
     if target is None:
         wb.close()
         return None, None, None
@@ -1800,14 +1845,22 @@ def _assemble_reconciled_groups(all_data, account):
     for grp, bsl_lines in sorted(bsl_by_grp.items()):
         raw_members = members_by_grp.get(grp, [])
         members = _dedup_members_keep_total(raw_members)
-        # Represent the group by its first bank line (usually 1).
+        # Deterministic representative — sort by (amount, date, line key) so
+        # the output never depends on ALL_DATA sheet row order — and the
+        # group's TOTAL bank amount: a Recon Grp may span several bank lines,
+        # and members must balance against the whole group, not its first row.
+        bsl_lines = sorted(bsl_lines, key=lambda r: (
+            r.get("amount_cents") or 0,
+            r.get("date").toordinal() if r.get("date") else 0,
+            str(r.get("line_key") or "")))
         b0 = bsl_lines[0]
+        grp_amount = sum(r.get("amount_cents") or 0 for r in bsl_lines)
         hist = history.get(grp, {})
         groups.append({
             "recon_grp": grp,
             "bsl_date": b0.get("date"),
             "bsl_line_info": b0.get("line_info", ""),
-            "bsl_amount_cents": b0.get("amount_cents"),
+            "bsl_amount_cents": grp_amount,
             "bsl_reference": b0.get("reference", ""),
             "bsl_lane": b0.get("lane", LANE_GENERAL),
             "members": members,
@@ -2201,16 +2254,30 @@ def load_mid_master(routed_file: RoutedFile):
     mid_gl = {}
     for ws in wb.worksheets:
         for row in ws.iter_rows(values_only=True):
-            mid = None
-            gl = None
+            mids, gls = [], []
             for c in row:
                 s = N(c)
                 if is_mid(s):
-                    mid = znorm(s)
+                    mids.append(znorm(s))
                 if pred_gl_string(s):
-                    gl = s
-            if mid and gl:
-                mid_gl.setdefault(mid, gl)
+                    gls.append(s)
+            if not mids or not gls:
+                continue
+            # Never let column position pick silently: a row naming two
+            # distinct GL strings, or remapping a MID already mapped to a
+            # different GL, is genuinely ambiguous — fail loud.
+            if len(set(gls)) > 1:
+                raise InvalidSourceData(
+                    routed_file.filename, "MID_MASTER",
+                    f"sheet {ws.title!r}: row maps MID(s) {sorted(set(mids))} "
+                    f"to multiple distinct GL strings {sorted(set(gls))}")
+            for mid in dict.fromkeys(mids):
+                prev = mid_gl.setdefault(mid, gls[0])
+                if prev != gls[0]:
+                    raise InvalidSourceData(
+                        routed_file.filename, "MID_MASTER",
+                        f"MID {mid} maps to conflicting GL strings "
+                        f"{prev!r} and {gls[0]!r}")
     wb.close()
     return {"mid_gl": mid_gl}
 
@@ -2236,7 +2303,7 @@ def load_and_bind(by_role, runlog):
     }
     bound_report = {}
     for role, files in by_role.items():
-        rf = files[0]  # newest wins; union+dedup handled in pool by id
+        rf = _pick_newest(files, role)  # newest YYYYMMDD stamp wins
         if role == "ALL_DATA":
             continue  # loaded separately (multi-sheet)
         if role == "MID_MASTER":
@@ -2254,6 +2321,19 @@ def load_and_bind(by_role, runlog):
         bound_report[role] = {"file": rf.filename, "columns": mapping, "header_index": hi}
     runlog["roles_bound"] = bound_report
     return loaded
+
+
+def _pick_newest(files, role):
+    """Newest-wins file selection for a role (spec §4.1).  Two files whose
+    date keys tie would mean one silently ignored — fail loud instead and
+    ask for a disambiguating YYYYMMDD stamp."""
+    if len(files) > 1 and _leading_date_key(files[0].filename) == _leading_date_key(files[1].filename):
+        raise InvalidSourceData(
+            files[0].filename, role,
+            f"multiple files tie for role {role}: "
+            f"{[f.filename for f in files]} — add a YYYYMMDD date stamp so "
+            "the newest can be chosen (the rest are never read silently)")
+    return files[0]
 
 
 def build_bsls(loaded, by_role, account):
@@ -2313,7 +2393,7 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     # ALL_DATA (multi-sheet) loaded separately for the backward engine.
     all_data = None
     if "ALL_DATA" in by_role:
-        all_data = load_all_data(by_role["ALL_DATA"][0], account)
+        all_data = load_all_data(_pick_newest(by_role["ALL_DATA"], "ALL_DATA"), account)
         loaded["ALL_DATA"] = all_data
 
     pool = build_pool(loaded, account, runlog)

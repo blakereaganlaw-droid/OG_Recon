@@ -110,6 +110,36 @@ folder, classifies each file by a case-insensitive substring test on its
 **content first, header as tiebreak** (`bind_columns`). The account is inferred
 from the BSL/ALL_DATA filename token (`FHB_UTC`, `Regions_UTM`, …).
 
+## Layout robustness (columns may move)
+
+Column position never matters: every role is bound by scoring **all** columns
+(content predicate first, header alias as tiebreak), the header row is
+**located** by scanning the first 12 rows (never assumed to be row 0), and the
+independent audit re-binds with the same vocabulary so both sides pick the
+same columns. Verified end-to-end: reordered/reversed columns, inserted decoy
+columns (constant dates, row IDs, notes), preamble rows above the header,
+alias renames, and ragged/trailing cells all produce **cell-for-cell identical
+workbooks** (pinned by `TestColumnRobustness`).
+
+When layout genuinely cannot be resolved, the run fails loud, never guesses:
+
+- Two columns tying on content **and** header for a required role →
+  `AmbiguousColumn` naming the file, role, and candidate columns.
+- No recognizable header row → `InvalidSourceData` (`HEADER`) instead of a
+  positional row-0 guess (which would emit phantom rows from report preambles).
+- Optional roles never bind by position alone: zero evidence or a blind tie
+  leaves the role unbound rather than grabbing the leftmost column.
+- Two files tying for one role's newest-date slot → `InvalidSourceData`
+  (nothing is silently ignored); 8-digit account numbers in filenames are not
+  mistaken for date stamps.
+- A MID-master row naming two distinct GL strings, or remapping a MID →
+  `InvalidSourceData` (no rightmost-column-wins).
+
+Known audit-scope limitation: the audit re-parses the standalone BSL and MET
+sources; it does not yet independently re-parse `ALL_DATA` sheets or audit the
+unwind workbook (backward-engine inputs are validated by the engine's own
+binder and the unit tests instead).
+
 ## Tests
 
 ```bash
