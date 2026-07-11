@@ -794,6 +794,70 @@ class TestRealDataShapes(unittest.TestCase):
         cand = [r for r in tabs["Candidate Matches"][3:] if any(A._N(c) for c in r)]
         self.assertIn("already-closed", A._N(cand[0][8]))
 
+
+    def test_router_token_hardening(self):
+        # Short bare tokens match whole name segments only.
+        self.assertIsNone(E.classify_file("Market_Analysis.xlsx"))   # 'ar' in 'Market'
+        self.assertIsNone(E.classify_file("Smart_Data.xlsx"))
+        self.assertEqual(E.classify_file("ORT_Departments.xlsx"), "DEPT_INFO")
+        self.assertEqual(E.classify_file("ORT_Chart_Of_Accounts.xlsx"), "CHART_OF_ACCOUNTS")
+        self.assertEqual(E.classify_file("ORT_AR_All.xlsb"), "ORT_AR")
+        self.assertEqual(E.classify_file("UT_MID_Master_Consolidated.xlsx"), "MID_MASTER")
+        self.assertEqual(E.classify_file("20260710_FHB_Master_BAI2.xlsx"), "BAI2")  # bai+digits
+
+    def test_bai2_enrichment(self):
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-03", "150.00", "NA", "MERCHANT SERVICEDEPOSIT", "NA",
+             "Automated clearing house", "Line 1 , 2026-07-03", "142"),
+            ("2026-07-04", "75.00", "NA", "AMBIG", "NA",
+             "Automated clearing house", "Line 2 , 2026-07-04", "142"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        bai = [
+            ("Post Date", "Transaction Description", "Amount", "Debit/Credit",
+             "Bank Reference", "Customer Reference", "BAI Code", "DETAIL1", "DETAIL2"),
+            ("2026-07-03", "ACH CREDIT RECEIVED", "150.00", "Credit",
+             "ACH123", "8036121500", "142", "MERCHANT SERVICEDEPOSIT   26", "FULL ADDENDA TEXT"),
+            # two BAI2 rows tie on (date, cents) with unrelated details: never guess
+            ("2026-07-04", "X", "75.00", "Credit", "B1", "", "142", "ROW ONE", ""),
+            ("2026-07-04", "Y", "75.00", "Credit", "B2", "", "142", "ROW TWO", ""),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BAI2.xlsx"),
+                    [("CSVEXP", bai)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Counterparty"),
+              ("2026-07-02", "150.00", "8036121500", 601, "External", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["bai2_enrichment"],
+                         {"joined": 1, "ambiguous": 1, "no_hit": 0})
+        # The BAI2 Customer Reference (a MID) reached the line's addenda:
+        # the line classifies MERCHANT and the MID ties the ST reference.
+        self.assertEqual(runlog["bsl_by_lane"].get("MERCHANT"), 1)
+
+    def test_mid_directory(self):
+        _write_xlsx(os.path.join(self.d, "ORT_Departments.xlsx"),
+                    [("Report (3)", [
+                        ("Campus Name", "Department Name", "Campus Bank Account",
+                         "Dept Bank Account", "Campus Bank Name", "Dept Bank Name", "Credit Card Mid"),
+                        ("Knoxville", "Ticket Office", "1", "2",
+                         "FHB - Master Account", "FHB - UTIA", "8036121500"),
+                        ("Knoxville", "No Mid Dept", "1", "2",
+                         "FHB - Master Account", "FHB - Master Account", "N/A"),
+                    ])])
+        rf = E.RoutedFile("DEPT_INFO", os.path.join(self.d, "ORT_Departments.xlsx"),
+                          "ORT_Departments.xlsx", "Report")
+        rows, _ = E.read_rows(rf)
+        m, hi = E.bind_columns(rows, E.DEPT_INFO_ROLES, filename=rf.filename)
+        loaded = {"DEPT_INFO": {"rows": rows, "map": m, "header_index": hi}}
+        d = E._mid_directory(loaded, "FHB_MASTER")
+        self.assertEqual(d["8036121500"]["department"], "Ticket Office")
+        self.assertEqual(d["8036121500"]["home_account"], "FHB_UTIA")
+        self.assertEqual(len(d), 1)  # N/A row never enters
+
     def test_type_gate(self):
         b = E.make_bsl("1", date(2026, 7, 1), 1000, "R", "R", "", "Miscellaneous", "399")
         cc = E._mk_entry("S1", 1000, date(2026, 7, 1), "R", "", "EXT", "UNR",

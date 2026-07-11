@@ -318,7 +318,9 @@ ROUTER_TABLE = [
     # _Statement.  Require a separator (or end) after the token.
     RouterRule("ST", [], [], ["_st_", "_st.", "account_st"], "first", False),
     RouterRule("RECEIPTS", [], [], ["receivables_receipts", "receipts_all"], "Export to Excel", False),
-    RouterRule("ORT_AR", ["ort", "ar"], [], [], "Report", False),
+    RouterRule("DEPT_INFO", [], [], ["ort_department", "department_info"], "Report", False),
+    RouterRule("CHART_OF_ACCOUNTS", ["chart_of_accounts"], [], [], "Report", False),
+    RouterRule("ORT_AR", ["ort", "_ar"], [], [], "Report", False),
     RouterRule("ORT_MISC", ["ort", "misc"], [], [], "Report", False),
     RouterRule("BAI2", ["bai"], [], [], "first", False),
     RouterRule("EDISON_PAY", ["edison_payments"], [], [], "first", False),
@@ -331,7 +333,6 @@ ROUTER_TABLE = [
     RouterRule("AR_INVOICES", ["ar_invoices"], [], [], "first", False),
     RouterRule("AR_MATCHED", [], [], ["ar_matched", "deposit_receipts"], "first", False),
     RouterRule("AR_UNAPPLIED_SUMMARY", [], [], ["ar_063", "unapplied_receipts_summary"], "first", False),
-    RouterRule("DEPT_INFO", ["ort_department_info"], [], [], "first", False),
     RouterRule("GMS_SPONSOR_MAP", ["rpt_gms_00"], [], [], "first", False),
     RouterRule("CFG_MATCHING", ["matching_rules"], [], [], "first", False),
     RouterRule("CFG_PARSE", ["parse_rules"], [], [], "first", False),
@@ -364,20 +365,40 @@ _ACCOUNT_TOKENS = [
 _YYYYMMDD_RE = re.compile(r"(\d{8})")
 
 
+def _name_segments(low):
+    return [s for s in re.split(r"[^a-z0-9]+", low) if s]
+
+
+def _token_hit(low, segments, tok):
+    """Filename-token semantics: a token carrying a separator ('_st_',
+    'all_data') or 5+ chars matches as a substring; a short bare token
+    ('ar', 'st', 'met', 'bai') matches only a WHOLE name segment, with a
+    numeric suffix allowed ('bai' matches 'bai2') — so 'ar' can never fire
+    inside 'chart' or 'departments'."""
+    if len(tok) >= 5 or any(ch in tok for ch in "_.-"):
+        return tok in low
+    for seg in segments:
+        if seg == tok or (seg.startswith(tok) and seg[len(tok):].isdigit()):
+            return True
+    return False
+
+
 def _tokens_present(fname_lower, tokens):
-    return all(t in fname_lower for t in tokens)
+    segments = _name_segments(fname_lower)
+    return all(_token_hit(fname_lower, segments, t) for t in tokens)
 
 
 def classify_file(filename) -> str | None:
     """Return the internal role key for a filename, or None if unmatched.
     First matching router rule wins (Section 4.1)."""
     low = filename.lower()
+    segments = _name_segments(low)
     for rule in ROUTER_TABLE:
-        if rule.contains and not _tokens_present(low, rule.contains):
+        if rule.contains and not all(_token_hit(low, segments, t) for t in rule.contains):
             continue
-        if rule.excludes and any(t in low for t in rule.excludes):
+        if rule.excludes and any(_token_hit(low, segments, t) for t in rule.excludes):
             continue
-        if rule.any_of and not any(t in low for t in rule.any_of):
+        if rule.any_of and not any(_token_hit(low, segments, t) for t in rule.any_of):
             continue
         if not rule.contains and not rule.any_of:
             continue  # a rule with no positive tokens matches nothing
@@ -709,6 +730,23 @@ MET_ROLES = {
 
 
 
+
+BAI2_ROLES = {
+    "post_date": _rs(True, ["Post Date", "Date"], pred_date),
+    "amount": _rs(True, ["Amount"], pred_signed_amount),
+    "description": _rs(False, ["Transaction Description"], pred_any),
+    "bank_reference": _rs(False, ["Bank Reference"], pred_reference),
+    "customer_reference": _rs(False, ["Customer Reference"], pred_reference),
+    "bai_code": _rs(False, ["BAI Code"], pred_number),
+}
+
+DEPT_INFO_ROLES = {
+    "department": _rs(True, ["Department Name"], pred_customer),
+    "campus": _rs(False, ["Campus Name"], pred_customer),
+    "dept_bank_name": _rs(False, ["Dept Bank Name"], pred_any),
+    "campus_bank_name": _rs(False, ["Campus Bank Name"], pred_any),
+    "mid": _rs(False, ["Credit Card Mid"], pred_mid),
+}
 
 EDISON_PAY_ROLES = {
     "reference": _rs(True, ["Reference", "Payment Reference"], pred_reference),
@@ -1570,7 +1608,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     state_ran = _p5_state(unplaced, place, pool, ledger, loaded, runlog)
 
     # ---- P6 Merchant / MID ------------------------------------------
-    _p6_merchant(unplaced, place, pool, ledger, loaded, runlog)
+    _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account)
 
     # ---- P7 Receivables SPN group -----------------------------------
     _p7_spn(unplaced, place, pool, ledger, loaded, runlog)
@@ -1818,8 +1856,9 @@ def _state_receipts(invoices, pool, ledger):
     return out
 
 
-def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog):
+def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account=None):
     """Merchant / MID (Section 9 P6)."""
+    mid_dir = _mid_directory(loaded, account)
 
     for bsl in unplaced():
         if bsl.lane != LANE_MERCHANT:
@@ -1840,7 +1879,8 @@ def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog):
                   "P6_merchant")
         elif stale and not in_window:
             place(bsl, REVIEW, CONF_LOW, [], ["MID_GUARDRAIL"],
-                  "Stale (>30d) same-MID group; likely auto-rec artifact.", "P6_merchant")
+                  "Stale (>30d) same-MID group; likely auto-rec artifact."
+                  + _mid_note(bsl, mid_dir, account), "P6_merchant")
         elif group:
             place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
                   ["GROUPING_CONFLICT"],
@@ -1932,6 +1972,38 @@ def _p8_named_payer(unplaced, place, pool, ledger, runlog):
                       "P8_named_payer")
                 break
     runlog["p8_named_payer"] = "ran"
+
+
+def _mid_directory(loaded, account):
+    """MID -> {department, campus, home_account} from DEPT_INFO (+ any MIDs
+    the MID master names).  Used to annotate merchant lines; never a gate."""
+    out = {}
+    di = loaded.get("DEPT_INFO")
+    if di:
+        rows, m, hi = di["rows"], di["map"], di["header_index"]
+        for r in rows[hi + 1:]:
+            mid = znorm(clean_ref(_cell(r, m.get("mid"))))
+            if not mid or not is_mid(mid):
+                continue
+            home = account_of_bank_name(_cell(r, m.get("dept_bank_name"))) or \
+                   account_of_bank_name(_cell(r, m.get("campus_bank_name")))
+            out.setdefault(mid, {
+                "department": N(_cell(r, m.get("department"))),
+                "campus": N(_cell(r, m.get("campus"))),
+                "home_account": home,
+            })
+    return out
+
+
+def _mid_note(bsl, mid_dir, account):
+    info = mid_dir.get(bsl.mid or znorm(bsl.recon_reference) or "")
+    if not info:
+        return ""
+    note = f" MID belongs to {info['department']} ({info['campus']})."
+    if info["home_account"] and account and account != "UNKNOWN" and \
+            info["home_account"] != account:
+        note += f" ADVISORY: MID's home account is {info['home_account']}, not {account}."
+    return note
 
 
 def _p10_review_cause(bsl, pool, feed_errors):
@@ -2171,6 +2243,8 @@ def load_and_bind(by_role, runlog):
         "ST": ST_ROLES,
         "RECEIPTS": RECEIPTS_ROLES,
         "MET": MET_ROLES,
+        "BAI2": BAI2_ROLES,
+        "DEPT_INFO": DEPT_INFO_ROLES,
         "EDISON_PAY": EDISON_PAY_ROLES,
         "EDISON_INV": EDISON_INV_ROLES,
         "APPLIED_UNAPPLIED": APPLIED_UNAPPLIED_ROLES,
@@ -2216,9 +2290,66 @@ def _pick_newest(files, role):
     return files[0]
 
 
-def build_bsls(loaded, by_role, account):
-    """Build the open BSL list from the BSL file."""
+def _bai2_index(loaded):
+    """Index BAI2 rows by (date, signed cents).  DETAIL1..DETAIL10 columns are
+    located by exact header name (deterministic; they carry the full addenda
+    the Oracle BSL feed truncates at ~1000 chars)."""
+    bai = loaded.get("BAI2")
+    if not bai:
+        return None
+    rows, m, hi = bai["rows"], bai["map"], bai["header_index"]
+    header = rows[hi]
+    detail_cols = [i for i, h in enumerate(header)
+                   if re.fullmatch(r"DETAIL\d+", _norm_header(h) or "")]
+    idx = {}
+    for r in rows[hi + 1:]:
+        dt = parse_date(_cell(r, m.get("post_date")))
+        amt = cents(_cell(r, m.get("amount")))
+        if dt is None or amt is None:
+            continue
+        details = "".join(N(_cell(r, c)) for c in detail_cols)
+        idx.setdefault((dt, amt), []).append({
+            "details": details,
+            "description": N(_cell(r, m.get("description"))),
+            "bank_reference": clean_ref(_cell(r, m.get("bank_reference"))),
+            "customer_reference": clean_ref(_cell(r, m.get("customer_reference"))),
+        })
+    return idx
+
+
+def _bai2_enrich(info, dt, amt, bai2_idx, counters):
+    """Resolve the BSL line's BAI2 row by (date, cents), tiebreaking on the
+    space-normalized addenda prefix; never guess on a residual tie.  Returns
+    the enriched additional-information text."""
+    cands = bai2_idx.get((dt, amt), [])
+    if not cands:
+        counters["no_hit"] += 1
+        return info
+    chosen = None
+    if len(cands) == 1:
+        chosen = cands[0]
+    else:
+        key = N(info)[:40].replace(" ", "")
+        pref = [c for c in cands
+                if key and c["details"].replace(" ", "").startswith(key)]
+        if len(pref) == 1:
+            chosen = pref[0]
+    if chosen is None:
+        counters["ambiguous"] += 1
+        return info
+    counters["joined"] += 1
+    extra = " ".join(x for x in (chosen["description"], chosen["details"],
+                                 chosen["bank_reference"], chosen["customer_reference"]) if x)
+    return (N(info) + " | BAI2: " + extra).strip(" |")
+
+
+def build_bsls(loaded, by_role, account, runlog=None):
+    """Build the open BSL list from the BSL file, enriched with the matching
+    BAI2 row's full addenda + raw bank references when a BAI2 export is
+    present (the chain: BSL -> BAI2 -> ORT/MET text -> amounts -> ST)."""
     bsls = []
+    bai2_idx = _bai2_index(loaded)
+    counters = {"joined": 0, "ambiguous": 0, "no_hit": 0}
     if "BSL" in loaded:
         b = loaded["BSL"]
         rows, m, hi = b["rows"], b["map"], b["header_index"]
@@ -2227,17 +2358,22 @@ def build_bsls(loaded, by_role, account):
             dt = parse_date(_cell(r, m.get("date")))
             if amt is None:
                 continue
+            info = N(_cell(r, m.get("additional_info")))
+            if bai2_idx is not None:
+                info = _bai2_enrich(info, dt, amt, bai2_idx, counters)
             bsl = make_bsl(
                 line_key=_cell(r, m.get("line_key")) or f"L{len(bsls)+1}",
                 dt=dt,
                 amount_cents=amt,
                 reference=_cell(r, m.get("reference")),
                 account_servicer_reference=_cell(r, m.get("account_servicer_reference")),
-                additional_info=_cell(r, m.get("additional_info")),
+                additional_info=info,
                 transaction_type=_cell(r, m.get("transaction_type")),
                 transaction_code=_cell(r, m.get("transaction_code")),
             )
             bsls.append(bsl)
+    if runlog is not None and bai2_idx is not None:
+        runlog["bai2_enrichment"] = counters
     # Deterministic order; also disambiguate any duplicate line keys.
     bsls.sort(key=lambda b: (b.date.toordinal() if b.date else 0, b.amount_cents, b.line_key))
     seen = {}
@@ -2280,7 +2416,7 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     pool = build_pool(loaded, account, runlog)
     runlog["stages"].append("pool")
 
-    bsls = build_bsls(loaded, by_role, account)
+    bsls = build_bsls(loaded, by_role, account, runlog)
     runlog["bsl_count"] = len(bsls)
     runlog["bsl_by_lane"] = _count_lanes(bsls)
 
