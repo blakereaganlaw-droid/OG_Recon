@@ -105,8 +105,6 @@ class TestPrimitives(unittest.TestCase):
         self.assertEqual(E.date_band(12), "WEAK")
         self.assertEqual(E.date_band(20), "SUSPICIOUS")
         self.assertEqual(E.date_band(40), "REJECT")
-        self.assertTrue(E.date_ok_state(-100))     # BSL precedes ST: no ceiling
-        self.assertFalse(E.date_ok_state(25))       # ST precedes BSL >20d
         self.assertTrue(E.date_ok_merchant(3))
         self.assertFalse(E.date_ok_merchant(10))
 
@@ -375,40 +373,6 @@ class TestColumnRobustness(unittest.TestCase):
         self.assertIn("not loaded", runlog["all_data"])
         self.assertNotIn("ALL_DATA", runlog["roles_bound"])
 
-    def test_p5_state_date_rule(self):
-        # Spec §11 State carve-out: no ceiling when the BSL precedes the
-        # receipt; a receipt preceding the BSL by >20d demotes Match->Candidate.
-        loaded = {
-            "EDISON_PAY": {"rows": [("Reference", "Invoice Number", "Amount"),
-                                    ("EDIREF1", "777888", "100.00")],
-                           "map": {"reference": 0, "invoice_number": 1, "amount": 2},
-                           "header_index": 0},
-            "EDISON_INV": {"rows": [("Invoice Number", "Gross Amount"),
-                                    ("777888", "100.00")],
-                           "map": {"invoice_number": 0, "gross_amount": 1},
-                           "header_index": 0},
-        }
-        cases = [
-            (date(2024, 3, 5), E.MATCH),      # lag 5d: fresh tie
-            (date(2023, 12, 1), E.CANDIDATE),  # lag 100d: stale, demoted
-            (date(2024, 6, 1), E.MATCH),      # BSL precedes receipt: no ceiling
-        ]
-        for rec_date, expected in cases:
-            bsl = E.make_bsl(line_key="1", dt=date(2024, 3, 10),
-                             amount_cents=10000, reference="EDIREF1",
-                             account_servicer_reference="EDIREF1",
-                             additional_info="", transaction_type="",
-                             transaction_code="")
-            bsl.lane = E.LANE_STATE
-            receipt = E._mk_entry("REC777888", 10000, rec_date, "INV 777888",
-                                  "STATE", "AR", "UNR", True, "RECEIPTS")
-            placed = []
-            E._p5_state(lambda: [bsl],
-                        lambda b, tab, conf, entries, flags, expl, pn:
-                            placed.append(tab),
-                        [receipt], E.Ledger(), loaded, {})
-            self.assertEqual(placed, [expected],
-                             msg=f"receipt date {rec_date}")
 
     def test_audit_binds_same_columns_as_engine(self):
         # 'Post Date' header plus an inserted date-parseable decoy column:
@@ -859,33 +823,17 @@ class TestRealDataShapes(unittest.TestCase):
         self.assertEqual(len(d), 1)  # N/A row never enters
 
 
-    def test_candidate_without_st_is_impossible(self):
-        # Owner doctrine: a Match/Candidate must cite ST(s) summing exactly
-        # to the BSL.  A State line whose Edison bundle sums but has no
-        # summing receipt set is a Review (RECEIPT_ENTRY_BACKLOG), never an
-        # ST-less Candidate.
-        loaded = {
-            "EDISON_PAY": {"rows": [("Reference", "Invoice Number", "Amount"),
-                                    ("EDIREF1", "777888", "100.00")],
-                           "map": {"reference": 0, "invoice_number": 1, "amount": 2},
-                           "header_index": 0},
-            "EDISON_INV": {"rows": [("Invoice Number", "Gross Amount"),
-                                    ("777888", "100.00")],
-                           "map": {"invoice_number": 0, "gross_amount": 1},
-                           "header_index": 0},
-        }
-        bsl = E.make_bsl("1", date(2024, 3, 10), 10000, "EDIREF1", "EDIREF1",
-                         "", "", "142")
-        bsl.lane = E.LANE_STATE
-        placed = []
-        E._p5_state(lambda: [bsl],
-                    lambda b, tab, conf, entries, flags, expl, pn:
-                        placed.append((tab, len(entries), flags, expl)),
-                    [], E.Ledger(), loaded, {})
-        tab, n_entries, flags, expl = placed[0]
-        self.assertEqual(tab, E.REVIEW)
-        self.assertEqual(n_entries, 0)
-        self.assertIn("RECEIPT_ENTRY_BACKLOG", flags)
+
+
+    def test_directional_date_doctrine(self):
+        # BSL may PRECEDE the ST by any amount (entry lag, no ceiling);
+        # BSL trailing the ST beyond the band is stale — never a Match.
+        self.assertTrue(E.date_ok_directional(-300))   # ST after BSL: valid
+        self.assertTrue(E.date_ok_directional(0))
+        self.assertTrue(E.date_ok_directional(7))
+        self.assertFalse(E.date_ok_directional(8))     # ST 8+ days before BSL
+        self.assertFalse(E.date_ok_directional(300))
+        self.assertTrue(E.date_ok_directional(None))   # unknown dates not gated
 
     def test_type_gate(self):
         b = E.make_bsl("1", date(2026, 7, 1), 1000, "R", "R", "", "Miscellaneous", "399")

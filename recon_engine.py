@@ -760,17 +760,7 @@ DEPT_INFO_ROLES = {
     "mid": _rs(False, ["Credit Card Mid"], pred_mid),
 }
 
-EDISON_PAY_ROLES = {
-    "reference": _rs(True, ["Reference", "Payment Reference"], pred_reference),
-    "invoice_number": _rs(True, ["Invoice Number", "Invoice"], pred_reference),
-    "payment_date": _rs(False, ["Payment Date", "Date"], pred_date),
-    "amount": _rs(True, ["Amount", "Payment Amount", "Payment Total"], pred_signed_amount),
-}
 
-EDISON_INV_ROLES = {
-    "invoice_number": _rs(True, ["Invoice Number", "Invoice"], pred_reference),
-    "gross_amount": _rs(True, ["Gross Amount", "Gross", "Amount"], pred_signed_amount),
-}
 
 APPLIED_UNAPPLIED_ROLES = {
     "trx_number": _rs(True, ["Trx Number", "Transaction Number"], pred_reference),
@@ -924,10 +914,12 @@ class PoolEntry:
     deposit_id: str = ""    # ORT d:
     receipt_id: str = ""    # ORT r:
     transaction_type: str = ""  # Credit Card / Check / EFT (type gate)
+    spr: str = ""           # Structured Payment Reference (screened separately)
 
 
 def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
-              available, origin, deposit_id="", receipt_id="", transaction_type=""):
+              available, origin, deposit_id="", receipt_id="", transaction_type="",
+              spr=""):
     ref = clean_ref(reference)
     return PoolEntry(
         id=N(id),
@@ -947,6 +939,7 @@ def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
         deposit_id=N(deposit_id),
         receipt_id=N(receipt_id),
         transaction_type=N(transaction_type),
+        spr=clean_ref(spr),
     )
 
 
@@ -1004,7 +997,8 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 id=txn,
                 amount_cents=amt,
                 dt=parse_date(_cell(r, m.get("date"))),
-                reference=_cell(r, m.get("reference")) or _cell(r, m.get("structured_payment_reference")),
+                reference=_cell(r, m.get("reference")),
+                spr=_cell(r, m.get("structured_payment_reference")),
                 counterparty=_cell(r, m.get("counterparty")),
                 source=src_norm,
                 status="UNR",
@@ -1228,6 +1222,8 @@ class BSL:
     additional_info: str
     transaction_type: str
     transaction_code: str
+    customer_reference: str = ""
+    account_servicer_reference: str = ""
     lane: str = LANE_GENERAL
     ref_digits: set = field(default_factory=set)
     payer_tokens: set = field(default_factory=set)
@@ -1286,7 +1282,8 @@ def classify_lane(bsl: BSL) -> str:
 
 
 def make_bsl(line_key, dt, amount_cents, reference, account_servicer_reference,
-             additional_info, transaction_type, transaction_code):
+             additional_info, transaction_type, transaction_code,
+             customer_reference=""):
     recon_ref = build_recon_reference(reference, account_servicer_reference, transaction_code)
     ach_payer = extract_ach_payer(additional_info)
     mid = _mid_from_text(additional_info) or (znorm(recon_ref) if is_mid(recon_ref) else "")
@@ -1295,8 +1292,10 @@ def make_bsl(line_key, dt, amount_cents, reference, account_servicer_reference,
         date=dt,
         amount_cents=amount_cents,
         recon_reference=recon_ref,
-        reference_raw=N(reference),
+        reference_raw=clean_ref(reference),
         additional_info=N(additional_info),
+        customer_reference=clean_ref(customer_reference),
+        account_servicer_reference=clean_ref(account_servicer_reference),
         transaction_type=N(transaction_type),
         transaction_code=N(transaction_code),
         ref_digits=digit_runs(recon_ref),
@@ -1333,18 +1332,18 @@ def date_band(lag):
     return "REJECT"
 
 
+def date_ok_directional(lag):
+    """Owner doctrine (2026-07-11, final): the date gate applies ONLY when
+    the ST was entered 8 or more days before the BSL (lag = BSL - ST >= 8).
+    An ST entered after the BSL — by any amount, even months — is valid;
+    unknown dates are not gated."""
+    return lag is None or lag < 8
+
+
 def date_ok_general(lag):
     return lag is not None and abs(lag) <= DATE_CEILING
 
 
-def date_ok_state(lag):
-    """State exception: no ceiling when BSL precedes ST (lag <= 0); demote when
-    ST precedes BSL by more than 20 days (lag > 20)."""
-    if lag is None:
-        return False
-    if lag <= 0:
-        return True
-    return lag <= 20
 
 
 def date_ok_merchant(lag):
@@ -1411,6 +1410,25 @@ class Placement:
 # ======================================================================
 # Section 9 — FORWARD pipeline (fixed order; later never overrides earlier)
 # ======================================================================
+
+def cross_reference_tie(bsl, e):
+    """Owner-mandated multi-cross-reference screen (2026-07-11): EVERY BSL
+    identifier field — Reference, Additional Information (full text, BAI2-
+    enriched), Customer Reference, Account Servicer Reference — is compared
+    against EVERY ST identifier field — Reference, Transaction Number,
+    Structured Payment Reference, Counterparty.  Full cell contents; no
+    field skipped, no truncation."""
+    bsl_vals = (bsl.reference_raw, bsl.additional_info, bsl.customer_reference,
+                bsl.account_servicer_reference, bsl.recon_reference)
+    st_vals = (e.reference, e.id, e.spr, e.counterparty)
+    for b in bsl_vals:
+        if not b:
+            continue
+        for s in st_vals:
+            if s and reference_equal(b, s):
+                return True
+    return False
+
 
 def _type_gate_ok(bsl, e):
     """Deterministic type gate (ORT doc section 5.2): a Credit Card ST never
@@ -1482,8 +1500,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         for e in _open_entries(pool, ledger):
             if not _amount_matches(bsl, e):
                 continue
-            if not reference_equal(bsl.recon_reference, e.reference) and \
-               not reference_equal(bsl.recon_reference, e.id):
+            if not cross_reference_tie(bsl, e):
                 continue
             # Guardrails: journal never matches; MID-into-non-merchant
             # conflict; deterministic type gate (Credit Card ST never pairs
@@ -1497,12 +1514,16 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             cands.append(e)
         ties = cands
         cands = [e for e in ties
-                 if date_ok_general(signed_lag(bsl.date, e.date))]
+                 if date_ok_directional(signed_lag(bsl.date, e.date))]
         if len(cands) == 1:
             e = cands[0]
             lag = signed_lag(bsl.date, e.date)
-            place(bsl, MATCH, CONF_HIGH, [e],
-                  [], f"Exact amount + reference tie (lag {lag}d, band {date_band(lag)}); source {e.source}.",
+            conf = CONF_HIGH if abs(lag) <= DATE_CEILING else CONF_MEDIUM
+            note = "" if abs(lag) <= DATE_CEILING else \
+                f" (receipt-entry lag {-lag}d — BSL precedes ST; no ceiling)"
+            place(bsl, MATCH, conf, [e],
+                  [], f"Exact amount + reference tie (lag {lag}d, band {date_band(lag)})"
+                  f"{note}; source {e.source}.",
                   "P3_exact_1to1")
         elif len(cands) > 1:
             ordered = _sorted(cands)
@@ -1513,14 +1534,14 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   + ", ".join(e.id for e in ordered[1:5]) + ".",
                   "P3_exact_1to1")
         elif len(ties) == 1:
-            # Owner doctrine (2026-07-11): a UNIQUE exact amount+reference
-            # tie is a Match regardless of date — the lag is disclosed, the
-            # confidence lowered, never the pairing destroyed.
+            # Directional doctrine: the only remaining ties here TRAIL the
+            # ST beyond the band (stale-ST) — Candidate, never Match.
             e = ties[0]
             lag = signed_lag(bsl.date, e.date)
-            place(bsl, MATCH, CONF_MEDIUM, [e],
-                  [], f"Exact amount + reference tie; date out of band "
-                  f"(lag {lag}d, band {date_band(lag)}); source {e.source}.",
+            place(bsl, CANDIDATE, CONF_MEDIUM, [e],
+                  ["DATE_CONFLICT"],
+                  f"Exact amount + reference tie to {e.id}, but the BSL "
+                  f"trails the ST by {lag}d — stale-ST pairing, never a Match.",
                   "P3_exact_1to1")
         elif ties:
             ordered = _sorted(ties)
@@ -1533,19 +1554,18 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
 
     # ---- P4 1:M ECT / ORT reference group (the workhorse) -----------
     for bsl in unplaced():
-        if bsl.lane == LANE_STATE:
-            continue
         group, closed_members, competing = _p4_reference_group(bsl, pool, ledger)
         if group is None:
             continue
         total = sum(e.amount_cents for e in group)
-        plausible = any(date_ok_general(signed_lag(bsl.date, e.date)) for e in group)
+        plausible = all(date_ok_directional(signed_lag(bsl.date, e.date))
+                        for e in group)
         if total == bsl.amount_cents and not plausible and not closed_members \
                 and not competing:
-            place(bsl, MATCH, CONF_MEDIUM, _sorted(group),
-                  [],
-                  f"1:M reference group of {len(group)} receipt(s) sums to BSL; "
-                  "reference tie holds; no member date in band (lag disclosed).",
+            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                  ["DATE_CONFLICT"],
+                  f"1:M reference group of {len(group)} receipt(s) sums to BSL "
+                  "but the BSL trails a member ST beyond the band (stale-ST).",
                   "P4_ref_group")
             continue
         if total == bsl.amount_cents and plausible:
@@ -1604,8 +1624,6 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         return ""
 
     for bsl in unplaced():
-        if bsl.lane == LANE_STATE:
-            continue
         exact_open, split_groups = [], []
         for dep, members in deposit_index.items():
             gated = [e for e in members if _type_gate_ok(bsl, e)]
@@ -1620,19 +1638,21 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 closed = [e for e in gated if not e.available]
                 if closed:
                     split_groups.append((dep, gated, closed))
-        # Date plausibility: at least one member inside the +-15 window
-        # qualifies for Match; a corroborated exact sum with every member
-        # out of window DEMOTES to Candidate (never dropped).
+        # Directional date gate: every member may precede the BSL by at
+        # most 15 days OR be entered after it by any amount (entry lag has
+        # no ceiling); a deposit the BSL trails beyond the band is stale.
         dated = [(d, g) for d, g in exact_open
-                 if any(date_ok_general(signed_lag(bsl.date, e.date)) for e in g)]
+                 if all(date_ok_directional(signed_lag(bsl.date, e.date))
+                        for e in g)]
         if not dated and exact_open:
             corro = [(d, g) for d, g in exact_open if _deposit_corroboration(bsl, g)]
             if len(corro) == 1:
                 dep, group = corro[0]
                 why = _deposit_corroboration(bsl, group)
-                place(bsl, MATCH, CONF_MEDIUM, _sorted(group), [],
-                      f"ORT deposit d:{dep} — {len(group)} open receipt(s) "
-                      f"sum to BSL; {why}; no member date in band (lag disclosed).",
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                      ["DATE_CONFLICT"],
+                      f"ORT deposit d:{dep} sums to BSL with {why}, but the "
+                      "BSL trails the deposit beyond the band (stale-ST).",
                       "P4_deposit_group")
                 continue
             if corro:
@@ -1692,8 +1712,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   + " (auto-rec split; run Unreconcile2).",
                   "P4_deposit_group")
 
-    # ---- P5 STATE / Edison bundle -----------------------------------
-    state_ran = _p5_state(unplaced, place, pool, ledger, loaded, runlog)
+    runlog["p5_state"] = "retired (owner doctrine 2026-07-11: Edison pass eliminated)"
 
     # ---- P6 Merchant / MID ------------------------------------------
     _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account)
@@ -1710,7 +1729,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             continue
         cands = [e for e in _open_entries(pool, ledger)
                  if e.source == "AP" and _amount_matches(bsl, e)]
-        tied = [e for e in cands if reference_equal(bsl.recon_reference, e.reference)]
+        tied = [e for e in cands if cross_reference_tie(bsl, e)]
         if len(tied) == 1:
             e = tied[0]
             place(bsl, MATCH, CONF_HIGH, [e],
@@ -1805,18 +1824,16 @@ def _p2_data_feed_errors(loaded, account=None):
 
 
 def _p4_reference_group(bsl, pool, ledger):
-    """Assemble the all-status deduped reference group for a BSL.  Returns
+    """Assemble the all-status deduped reference group for a BSL via the
+    owner-mandated 4x4 cross-reference screen.  Returns
     (group_entries or None, closed_members, competing_bool)."""
-    ref = bsl.recon_reference
-    if not ref:
-        return None, [], False
     members = []
     for e in pool:
         if e.source in JOURNAL_SOURCES:
             continue
         if not _type_gate_ok(bsl, e):
             continue
-        if reference_equal(ref, e.reference) or reference_equal(ref, e.id):
+        if cross_reference_tie(bsl, e):
             members.append(e)
     if not members:
         return None, [], False
@@ -1853,107 +1870,10 @@ def _p4_reference_group(bsl, pool, ledger):
     return None, [], False
 
 
-def _edison_key(v):
-    """Edison references are zero-padded 10-digit strings; the BSL reference
-    is not (BSL 7182042 = Edison 0007182042).  Compare zero-stripped."""
-    z = znorm(v)
-    return z.lstrip("0") or z
 
 
-def _p5_state(unplaced, place, pool, ledger, loaded, runlog):
-    """STATE / Edison bundle (Section 9 P5)."""
-    edison_pay = loaded.get("EDISON_PAY")
-    edison_inv = loaded.get("EDISON_INV")
-    ran = edison_pay is not None and edison_inv is not None
-    if not ran:
-        runlog["p5_state"] = "not-run: EDISON files absent"
-        return False
-
-    # index invoice -> gross
-    inv_gross = {}
-    rows, m, hi = edison_inv["rows"], edison_inv["map"], edison_inv["header_index"]
-    for r in rows[hi + 1:]:
-        inv = znorm(_cell(r, m.get("invoice_number")))
-        g = cents(_cell(r, m.get("gross_amount")))
-        if inv and g is not None:
-            inv_gross[inv] = g
-    # index reference -> (invoice set, payment amount)  (amount repeated; one per ref)
-    ref_invoices = {}
-    ref_amount = {}
-    rows, m, hi = edison_pay["rows"], edison_pay["map"], edison_pay["header_index"]
-    for r in rows[hi + 1:]:
-        ref = _edison_key(_cell(r, m.get("reference")))
-        inv = znorm(_cell(r, m.get("invoice_number")))
-        amt = cents(_cell(r, m.get("amount")))
-        if not ref:
-            continue
-        ref_invoices.setdefault(ref, set())
-        if inv:
-            ref_invoices[ref].add(inv)
-        if amt is not None:
-            ref_amount.setdefault(ref, amt)  # one per reference, never sum
-
-    for bsl in unplaced():
-        if bsl.lane != LANE_STATE:
-            continue
-        eref = _edison_key(bsl.recon_reference)
-        invoices = ref_invoices.get(eref)
-        if not invoices:
-            place(bsl, REVIEW, CONF_LOW, [], ["STATE_LANE_ISOLATION", "NO_MATCH_FOUND"],
-                  "STATE line: no Edison bundle found for reference.", "P5_state")
-            continue
-        bundle_sum = sum(inv_gross.get(i, 0) for i in invoices if i in inv_gross)
-        # Map invoices to Receivables receipts (reference contains invoice num).
-        receipts = _state_receipts(invoices, pool, ledger)
-        receipts_sum = sum(e.amount_cents for e in receipts)
-        if bundle_sum == bsl.amount_cents and receipts and \
-                receipts_sum == bsl.amount_cents:
-            # The receipt set itself must sum to the BSL (owner doctrine:
-            # BSL - sum(STs) == 0 on every listed pairing; Receivables
-            # receipts combine, often many to one BSL).
-            # State date rule (spec §11): no ceiling when the BSL precedes
-            # the receipt; demote when the receipt precedes the BSL by >20d.
-            def _state_fresh(e):
-                lag = signed_lag(bsl.date, e.date)
-                return lag is None or date_ok_state(lag)
-            tie = all(_state_fresh(e) and
-                      any(inv in znorm(e.reference) or inv in znorm(e.id)
-                          for inv in invoices)
-                      for e in receipts)
-            place(bsl, MATCH if tie else CANDIDATE,
-                  CONF_HIGH if tie else CONF_MEDIUM, _sorted(receipts),
-                  [] if tie else ["INCOMPLETE_REFERENCE_SUPPORT"],
-                  f"STATE bundle of {len(invoices)} Edison invoice(s) sums to BSL; "
-                  f"{len(receipts)} receipt(s) sum to BSL"
-                  + (" with reference ties." if tie else "; reference/date support incomplete."),
-                  "P5_state")
-        elif bundle_sum == bsl.amount_cents:
-            place(bsl, REVIEW, CONF_LOW, [],
-                  ["RECEIPT_ENTRY_BACKLOG"],
-                  "STATE: Edison confirms the payment identity"
-                  f" ({len(invoices)} invoice(s) sum to BSL) but no DASH "
-                  "receipt/ST set sums to it — receipt-entry backlog.",
-                  "P5_state")
-        else:
-            place(bsl, REVIEW, CONF_LOW, [], ["STATE_LANE_ISOLATION", "PARTIAL_CHAIN"],
-                  "STATE line: Edison invoice grosses do not sum to BSL.", "P5_state")
-    runlog["p5_state"] = "ran"
-    return True
 
 
-def _state_receipts(invoices, pool, ledger):
-    """RECEIVABLES receipts whose reference/id contains one of the bundle
-    invoice numbers, open and available.  State lines match Receivables
-    receipts ONLY (lane isolation, ORT doc section 5.1): never a card-batch
-    (MID) receipt and never an ORT-chain (EXT) entry — the audit's C6 rejects
-    any State Match citing ORT d:/r: coordinates."""
-    out = []
-    for e in pool:
-        if not ledger.is_available(e) or e.is_mid or e.source != "AR":
-            continue
-        if any(inv and (inv in znorm(e.reference) or inv in znorm(e.id)) for inv in invoices):
-            out.append(e)
-    return out
 
 
 def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account=None):
@@ -2069,7 +1989,7 @@ def _p8_named_payer(unplaced, place, pool, ledger, runlog):
                 if not _type_gate_ok(bsl, e):
                     continue
                 lag = signed_lag(bsl.date, e.date)
-                if not date_ok_general(lag):
+                if not date_ok_directional(lag):
                     continue
                 cp_z = znorm(e.counterparty)
                 if any(tok in cp_z for tok in cp_tokens):
@@ -2129,8 +2049,8 @@ def _p10_review_cause(bsl, pool, feed_errors):
 
     def _tied(entries):
         return [e for e in entries
-                if reference_tie(bsl.recon_reference, e.reference)
-                or reference_equal(bsl.recon_reference, e.reference)
+                if cross_reference_tie(bsl, e)
+                or reference_tie(bsl.recon_reference, e.reference)
                 or (e.payer_tokens & bsl.payer_tokens)]
 
     codes = []
@@ -2359,8 +2279,6 @@ def load_and_bind(by_role, runlog):
         "MET": MET_ROLES,
         "BAI2": BAI2_ROLES,
         "DEPT_INFO": DEPT_INFO_ROLES,
-        "EDISON_PAY": EDISON_PAY_ROLES,
-        "EDISON_INV": EDISON_INV_ROLES,
         "APPLIED_UNAPPLIED": APPLIED_UNAPPLIED_ROLES,
         "ORT_AR": {"trx_id": _rs(False, ["Transaction Number"], pred_reference),
                    "parked_receipt_id": _rs(False, ["Parked Receipt ID"], pred_number),
@@ -2484,6 +2402,7 @@ def build_bsls(loaded, by_role, account, runlog=None):
                 additional_info=info,
                 transaction_type=_cell(r, m.get("transaction_type")),
                 transaction_code=_cell(r, m.get("transaction_code")),
+                customer_reference=_cell(r, m.get("customer_reference")),
             )
             bsls.append(bsl)
     if runlog is not None and bai2_idx is not None:

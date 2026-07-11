@@ -430,15 +430,10 @@ def audit(input_dir, recon_path, account):
             failures.append(f"C5: dual-fire ST in a Match row: {sts}")
     checks["C5"] = "PASS" if c5_ok else "FAIL"
 
-    # C6 STATE lane isolation — no ORT citation on a State Match.
-    c6_ok = True
-    for r in match_rows:
-        info = _N(r[1]).upper()
-        is_state = info.startswith("STATE-TN") or "STATE-TN" in info or "STATE OF TENN" in info
-        if is_state and (_N(r[6]) or _N(r[7])):
-            c6_ok = False
-            failures.append(f"C6: STATE Match cites ORT d:/r:: {r[:2]}")
-    checks["C6"] = "PASS" if c6_ok else "FAIL"
+    # C6 retired (owner doctrine 2026-07-11): the Edison/State pass was
+    # eliminated; State lines reconcile through the same ORT/reference
+    # chain as every other line.
+    checks["C6"] = "SKIP (retired 2026-07-11)"
 
     # C7 MID guardrail — a MID reference should not appear on a non-merchant Match.
     c7_ok = True
@@ -457,32 +452,22 @@ def audit(input_dir, recon_path, account):
             failures.append(f"C7: MID guardrail suspected on non-merchant Match: {r[:2]}")
     checks["C7"] = "PASS" if c7_ok else "FAIL"
 
-    # C8 date ceiling with the State carve-out — owner doctrine 2026-07-11:
-    #    a non-State Match outside the ±15-day band is permitted ONLY when
-    #    the row's explanation discloses the lag ("out of band"/"lag
-    #    disclosed"); an undisclosed stale Match still FAILS.  A State Match
-    #    whose cited ST precedes the BSL by >20 days keeps failing; no
-    #    ceiling when the BSL precedes the ST.
+    # C8 directional date rule (owner doctrine, final): the gate applies
+    #    ONLY when the ST precedes the BSL by 8+ days; an ST after the BSL
+    #    (by any amount) is valid.  A Match whose BSL trails EVERY cited ST
+    #    by 8+ days fails.
     c8_ok = True
     for r in match_rows:
         bdt = _parse_date(r[0])
-        info = _N(r[1]).upper()
-        expl = _N(r[8]).lower()
-        disclosed = ("out of band" in expl) or ("lag disclosed" in expl)
-        is_state = "STATE-TN" in info or "STATE OF TENN" in info
         st_dates = [_parse_date(x) for x in _split_multi(r[3])]
         st_dates = [d for d in st_dates if d]
         if bdt is None or not st_dates:
             continue
         lags = [(bdt - d).days for d in st_dates]
-        if is_state:
-            if all(lag > 20 for lag in lags):
-                c8_ok = False
-                failures.append(f"C8: State Match with all lags > 20d: {r[:3]}")
-        else:
-            if all(abs(lag) > 15 for lag in lags) and not disclosed:
-                c8_ok = False
-                failures.append(f"C8: undisclosed out-of-band Match: {r[:3]}")
+        if all(lag >= 8 for lag in lags):
+            c8_ok = False
+            failures.append(
+                f"C8: Match trails every cited ST by >= 8d (stale-ST): {r[:3]}")
     checks["C8"] = "PASS" if c8_ok else "FAIL"
 
     # C9 formatting — Carlito, navy header fill, freeze A4, zero formulas, structure.
