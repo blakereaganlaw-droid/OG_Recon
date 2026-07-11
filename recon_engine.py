@@ -321,7 +321,9 @@ class RouterRule:
 # First matching rule wins (Section 4.1).  `any_of` handles "several filename
 # shapes"; `excludes` handles the "not All_Data" style negative constraints.
 ROUTER_TABLE = [
-    RouterRule("BSL", ["bsl"], ["all_data"], [], "first", True),
+    # 'enriched' excluded: an Enriched_..._BSL_... workbook is the parsed
+    # enrichment source (ENRICHED below), not a competing BSL export.
+    RouterRule("BSL", ["bsl"], ["all_data", "enriched"], [], "first", True),
     RouterRule("ALL_DATA", ["all_data"], [], [], "multi", False),
     RouterRule("MET", ["met"], [], [], "first", False),
     # "_st" alone is too greedy: it matches All_Status / Rosetta_Stone /
@@ -339,7 +341,7 @@ ROUTER_TABLE = [
     RouterRule("EDISON_PAY", ["edison_payments"], [], [], "first", False),
     RouterRule("EDISON_INV", ["edison_invoices"], [], [], "first", False),
     RouterRule("MID_MASTER", ["mid_master"], [], [], "all", False),
-    RouterRule("ENRICHED", ["enriched", "crossref"], [], [], "first", False),
+    RouterRule("ENRICHED", [], [], ["enriched", "crossref"], "first", False),
     RouterRule("APPLIED_UNAPPLIED", ["applied", "unapplied"], [], [], "first", False),
     RouterRule("CONTRACTS_INV", ["contracts_to_receivable_invoices"], [], [], "first", False),
     RouterRule("GMS_AGING", [], [], ["gms_001", "sponsored_aging"], "first", False),
@@ -838,6 +840,20 @@ DEPT_INFO_ROLES = {
 }
 
 
+
+ENRICHED_ROLES = {
+    # Pre-parsed enriched BSL workbook (all rows, full year): parsed trace
+    # ids / MIDs / reconciliation keys the Oracle feed does not carry.
+    # Joined back onto the open BSLs by Statement line, then (date, cents).
+    "date": _rs(True, ["Date"], pred_date),
+    "amount": _rs(True, ["Amount (USD)", "Amount"], pred_signed_amount),
+    "line_key": _rs(False, ["Statement"], pred_any),
+    "additional_info": _rs(False, ["Additional Information"], pred_any),
+    "parsed_trace": _rs(False, ["Parsed_Trace_ID", "Parsed Trace ID"], pred_reference),
+    "parsed_mid": _rs(False, ["Parsed_MID", "Parsed MID"], pred_mid),
+    "recon_key": _rs(False, ["Reconciliation_Key", "Reconciliation Key"], pred_any),
+    "category": _rs(False, ["Transaction_Category", "Transaction Category"], pred_any),
+}
 
 AR_MATCHED_ROLES = {
     # ACRA/ABA receipt-application feed (AR_Matched_Invoice_Receipts...):
@@ -2797,6 +2813,7 @@ def load_and_bind(by_role, runlog):
         "DEPT_INFO": DEPT_INFO_ROLES,
         "APPLIED_UNAPPLIED": APPLIED_UNAPPLIED_ROLES,
         "AR_MATCHED": AR_MATCHED_ROLES,
+        "ENRICHED": ENRICHED_ROLES,
         "ORT_AR": {"trx_id": _rs(False, ["Transaction Number"], pred_reference),
                    "parked_receipt_id": _rs(False, ["Parked Receipt ID"], pred_number),
                    "bank_name": _rs(False, ["BANK_NAME", "Bank Account Name"], pred_any)},
@@ -2892,13 +2909,76 @@ def _bai2_enrich(info, dt, amt, bai2_idx, counters):
     return (N(info) + " | BAI2: " + extra).strip(" |")
 
 
+def _enriched_index(loaded):
+    """Index the pre-parsed enriched-BSL workbook by Statement line key and by
+    (date, signed cents)."""
+    en = loaded.get("ENRICHED")
+    if not en:
+        return None
+    rows, m, hi = en["rows"], en["map"], en["header_index"]
+    by_line, by_da = {}, {}
+    for r in rows[hi + 1:]:
+        dt = parse_date(_cell(r, m.get("date")))
+        amt = cents(_cell(r, m.get("amount")))
+        if amt is None:
+            continue
+        rec = {
+            "info": N(_cell(r, m.get("additional_info"))),
+            "trace": clean_ref(_cell(r, m.get("parsed_trace"))),
+            "mid": znorm(clean_ref(_cell(r, m.get("parsed_mid")))),
+            "key": N(_cell(r, m.get("recon_key"))),
+            "category": N(_cell(r, m.get("category"))),
+        }
+        lk = znorm(_cell(r, m.get("line_key")))
+        if lk:
+            by_line.setdefault(lk, []).append(rec)
+        if dt is not None:
+            by_da.setdefault((dt, amt), []).append(rec)
+    return {"by_line": by_line, "by_da": by_da}
+
+
+def _enriched_enrich(info, line_key, dt, amt, en_idx, counters):
+    """Join one BSL to its enriched-workbook row: exact Statement line key
+    first, unique (date, cents) as fallback; never guess a residual tie.
+    Appends the parsed trace/MID/recon-key text to the addenda."""
+    cands = en_idx["by_line"].get(znorm(line_key), [])
+    if len(cands) != 1:
+        da = en_idx["by_da"].get((dt, amt), [])
+        if len(da) == 1:
+            cands = da
+        elif cands or da:
+            counters["ambiguous"] += 1
+            return info
+        else:
+            counters["no_hit"] += 1
+            return info
+    chosen = cands[0]
+    counters["joined"] += 1
+    extra = " ".join(x for x in (
+        chosen["category"],
+        ("trace:" + chosen["trace"]) if chosen["trace"] else "",
+        ("mid:" + chosen["mid"]) if chosen["mid"] else "",
+        chosen["key"],
+    ) if x)
+    base = N(info)
+    # Prefer the LONGER additional-information text (the enriched workbook
+    # carries the untruncated addenda when no BAI2 export is present).
+    if len(chosen["info"]) > len(base):
+        base = chosen["info"]
+    if not extra:
+        return base
+    return (base + " | ENR: " + extra).strip(" |")
+
+
 def build_bsls(loaded, by_role, account, runlog=None):
     """Build the open BSL list from the BSL file, enriched with the matching
     BAI2 row's full addenda + raw bank references when a BAI2 export is
     present (the chain: BSL -> BAI2 -> ORT/MET text -> amounts -> ST)."""
     bsls = []
     bai2_idx = _bai2_index(loaded)
+    en_idx = _enriched_index(loaded)
     counters = {"joined": 0, "ambiguous": 0, "no_hit": 0}
+    en_counters = {"joined": 0, "ambiguous": 0, "no_hit": 0}
     if "BSL" in loaded:
         b = loaded["BSL"]
         rows, m, hi = b["rows"], b["map"], b["header_index"]
@@ -2910,6 +2990,10 @@ def build_bsls(loaded, by_role, account, runlog=None):
             info = N(_cell(r, m.get("additional_info")))
             if bai2_idx is not None:
                 info = _bai2_enrich(info, dt, amt, bai2_idx, counters)
+            if en_idx is not None:
+                info = _enriched_enrich(
+                    info, _cell(r, m.get("line_key")) or "", dt, amt,
+                    en_idx, en_counters)
             bsl = make_bsl(
                 line_key=_cell(r, m.get("line_key")) or f"L{len(bsls)+1}",
                 dt=dt,
@@ -2924,6 +3008,8 @@ def build_bsls(loaded, by_role, account, runlog=None):
             bsls.append(bsl)
     if runlog is not None and bai2_idx is not None:
         runlog["bai2_enrichment"] = counters
+    if runlog is not None and en_idx is not None:
+        runlog["enriched_bsl_enrichment"] = en_counters
     # Deterministic order; also disambiguate any duplicate line keys.
     bsls.sort(key=lambda b: (b.date.toordinal() if b.date else 0, b.amount_cents, b.line_key))
     seen = {}
