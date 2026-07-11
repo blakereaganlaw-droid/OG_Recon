@@ -263,7 +263,17 @@ def clean_ref(v):
     """Null out placeholder reference tokens: a literal 'NA' must never tie
     another literal 'NA' (37 of 283 real FHB Master BSL references are 'NA')."""
     s = N(v)
-    return "" if znorm(s) in _NULL_REF_TOKENS else s
+    if znorm(s) in _NULL_REF_TOKENS or not re.search(r"[A-Za-z0-9]", s):
+        return ""
+    return s
+
+
+def _blankish(v):
+    """A placeholder cell ('NA', '.', '-') is blank for content sampling:
+    real Oracle exports pad id columns with them, and counting them dilutes
+    the true column's content score below junk text columns."""
+    s = N(v)
+    return not s or znorm(s) in _NULL_REF_TOKENS or not re.search(r"[A-Za-z0-9]", s)
 
 
 def reference_equal(a, b) -> bool:
@@ -317,7 +327,7 @@ ROUTER_TABLE = [
     # "_st" alone is too greedy: it matches All_Status / Rosetta_Stone /
     # _Statement.  Require a separator (or end) after the token.
     RouterRule("ST", [], [], ["_st_", "_st.", "account_st"], "first", False),
-    RouterRule("RECEIPTS", [], [], ["receivables_receipts", "receipts_all"], "Export to Excel", False),
+    RouterRule("RECEIPTS", [], [], ["receivables_receipts", "receipts_all", "oracle_receipts"], "Export to Excel", False),
     RouterRule("DEPT_INFO", [], [], ["ort_department", "department_info"], "Report", False),
     RouterRule("CHART_OF_ACCOUNTS", ["chart_of_accounts"], [], [], "Report", False),
     RouterRule("ORT_AR", ["ort", "_ar"], [], [], "Report", False),
@@ -333,7 +343,7 @@ ROUTER_TABLE = [
     RouterRule("AR_INVOICES", ["ar_invoices"], [], [], "first", False),
     RouterRule("AR_MATCHED", [], [], ["ar_matched", "deposit_receipts"], "first", False),
     RouterRule("AR_UNAPPLIED_SUMMARY", [], [], ["ar_063", "unapplied_receipts_summary"], "first", False),
-    RouterRule("GMS_SPONSOR_MAP", ["rpt_gms_00"], [], [], "first", False),
+    RouterRule("GMS_SPONSOR_MAP", ["rpt_gms_0"], [], [], "first", False),
     RouterRule("CFG_MATCHING", ["matching_rules"], [], [], "first", False),
     RouterRule("CFG_PARSE", ["parse_rules"], [], [], "first", False),
     RouterRule("CFG_TOLERANCE", ["tolerance_rules"], [], [], "first", False),
@@ -641,7 +651,7 @@ def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50)
                 header_score = 2
             else:
                 header_score = 0
-            sampled = [r[col] for r in data_rows if col < len(r) and N(r[col]) != ""]
+            sampled = [r[col] for r in data_rows if col < len(r) and not _blankish(r[col])]
             if sampled:
                 content_score = sum(1 for c in sampled if spec.predicate(c)) / len(sampled)
             else:
@@ -691,7 +701,7 @@ BSL_ROLES = {
 ST_ROLES = {
     "date": _rs(True, ["Transaction Date", "Date", "Accounting Date", "GL Date"], pred_date),
     "amount": _rs(True, ["Amount", "Transaction Amount", "Signed Amount"], pred_signed_amount),
-    "transaction_number": _rs(True, ["Transaction Number", "Trx Number", "Transaction Num", "Number"], pred_reference),
+    "transaction_number": _rs(True, ["Transaction Number", "Transaction", "Trx Number", "Transaction Num", "Number"], pred_reference),
     "source": _rs(True, ["Source", "Transaction Source", "Origin"], pred_any),
     "reference": _rs(False, ["Reference", "Recon Match Reference", "Match Reference"], pred_reference),
     "structured_payment_reference": _rs(False, ["Structured Payment Reference", "Strc Pay Ref"], pred_reference),
@@ -700,8 +710,10 @@ ST_ROLES = {
 }
 
 RECEIPTS_ROLES = {
-    "receipt_number": _rs(True, ["Receipt Number", "Receipt Num", "Receipt"], pred_reference),
-    "status": _rs(True, ["Status", "Receipt Status", "State"], pred_status),
+    "receipt_number": _rs(True, ["Receipt Number", "Receipt Num"], pred_reference),
+    # 'Status' is the lifecycle (Cleared/Remitted/Reversed); the export's
+    # separate 'State' column (Applied/Unapplied) must not tie it.
+    "status": _rs(True, ["Status", "Receipt Status"], pred_status),
     "amount": _rs(True, ["Receipt Amount", "Entered Amount", "Amount"], pred_signed_amount),
     "customer_name": _rs(True, ["Customer Name", "Customer", "Payer"], pred_customer),
     "receipt_date": _rs(False, ["Receipt Date", "Date"], pred_date),
@@ -1430,6 +1442,19 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     def place(bsl, kind, confidence, entries, codes, explanation, pass_name):
         if bsl.line_key in placements:
             return  # a later pass never overrides an earlier one
+        # HARD GUARDRAIL (owner doctrine, 2026-07-11): a Match or Candidate
+        # without STs, or whose cited STs do not sum exactly to the BSL in
+        # signed cents, must not exist.  Engine invariant — fail loud.
+        if kind in (MATCH, CANDIDATE):
+            if not entries:
+                raise ReconError(
+                    f"engine bug: {kind} for BSL {bsl.line_key} cites no ST "
+                    f"({pass_name})")
+            cited = sum(e.amount_cents for e in entries)
+            if cited != bsl.amount_cents:
+                raise ReconError(
+                    f"engine bug: {kind} for BSL {bsl.line_key} cites STs "
+                    f"summing {cited} != BSL {bsl.amount_cents} ({pass_name})")
         ids = [e.id for e in entries]
         if kind == MATCH:
             ledger.consume_match(ids)
@@ -1460,9 +1485,6 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             if not reference_equal(bsl.recon_reference, e.reference) and \
                not reference_equal(bsl.recon_reference, e.id):
                 continue
-            lag = signed_lag(bsl.date, e.date)
-            if not date_ok_general(lag):
-                continue
             # Guardrails: journal never matches; MID-into-non-merchant
             # conflict; deterministic type gate (Credit Card ST never pairs
             # with a Check/Miscellaneous line).
@@ -1473,6 +1495,9 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             if not _type_gate_ok(bsl, e):
                 continue
             cands.append(e)
+        ties = cands
+        cands = [e for e in ties
+                 if date_ok_general(signed_lag(bsl.date, e.date))]
         if len(cands) == 1:
             e = cands[0]
             lag = signed_lag(bsl.date, e.date)
@@ -1480,9 +1505,23 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   [], f"Exact amount + reference tie (lag {lag}d, band {date_band(lag)}); source {e.source}.",
                   "P3_exact_1to1")
         elif len(cands) > 1:
-            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(cands),
+            ordered = _sorted(cands)
+            place(bsl, CANDIDATE, CONF_MEDIUM, [ordered[0]],
                   ["MULTIPLE_EQUAL_CANDIDATES"],
-                  f"{len(cands)} open entries match amount+reference; conservative Candidate.",
+                  f"{len(cands)} open entries match amount+reference; citing "
+                  f"{ordered[0].id}, alternates: "
+                  + ", ".join(e.id for e in ordered[1:5]) + ".",
+                  "P3_exact_1to1")
+        elif ties:
+            # Date supports a Match; its absence DEMOTES an exact
+            # amount+reference tie to Candidate — never destroys it
+            # (owner doctrine: never lose an exact BSL<->ST pairing).
+            e = _sorted(ties)[0]
+            lag = signed_lag(bsl.date, e.date)
+            place(bsl, CANDIDATE, CONF_MEDIUM, [e],
+                  ["DATE_CONFLICT"],
+                  f"Exact amount + reference tie to {e.id} but date is out "
+                  f"of band (lag {lag}d, band {date_band(lag)}).",
                   "P3_exact_1to1")
 
     # ---- P4 1:M ECT / ORT reference group (the workhorse) -----------
@@ -1494,6 +1533,14 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             continue
         total = sum(e.amount_cents for e in group)
         plausible = any(date_ok_general(signed_lag(bsl.date, e.date)) for e in group)
+        if total == bsl.amount_cents and not plausible and not closed_members \
+                and not competing:
+            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                  ["DATE_CONFLICT"],
+                  f"1:M reference group of {len(group)} receipt(s) sums to BSL "
+                  "but no member date is in band (demoted, never dropped).",
+                  "P4_ref_group")
+            continue
         if total == bsl.amount_cents and plausible:
             if closed_members:
                 place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
@@ -1566,9 +1613,36 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 closed = [e for e in gated if not e.available]
                 if closed:
                     split_groups.append((dep, gated, closed))
-        # Date plausibility: at least one member inside the +-15 window.
-        exact_open = [(d, g) for d, g in exact_open
-                      if any(date_ok_general(signed_lag(bsl.date, e.date)) for e in g)]
+        # Date plausibility: at least one member inside the +-15 window
+        # qualifies for Match; a corroborated exact sum with every member
+        # out of window DEMOTES to Candidate (never dropped).
+        dated = [(d, g) for d, g in exact_open
+                 if any(date_ok_general(signed_lag(bsl.date, e.date)) for e in g)]
+        if not dated and exact_open:
+            corro = [(d, g) for d, g in exact_open if _deposit_corroboration(bsl, g)]
+            if corro:
+                dep, group = sorted(corro)[0]
+                why = _deposit_corroboration(bsl, group)
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                      ["DATE_CONFLICT"],
+                      f"ORT deposit d:{dep} sums to BSL with {why} but no "
+                      "member date is in band"
+                      + (f"; {len(corro)} such deposit(s)." if len(corro) > 1 else "."),
+                      "P4_deposit_group")
+                continue
+            # Owner call (2026-07-11): stale amount-only deposit sums surface
+            # as LOW-confidence Candidates (double-flagged) rather than
+            # vanishing into Review — the reviewer decides.
+            dep, group = sorted(exact_open)[0]
+            place(bsl, CANDIDATE, CONF_LOW, _sorted(group),
+                  ["AMOUNT_ONLY_GROUP", "DATE_CONFLICT"],
+                  f"ORT deposit d:{dep} sums to BSL but carries no reference/"
+                  "payer/deposit-type corroboration and no member date in band"
+                  + (f"; {len(exact_open)} equal-sum deposit(s)."
+                     if len(exact_open) > 1 else "."),
+                  "P4_deposit_group")
+            continue
+        exact_open = dated
         if len(exact_open) == 1:
             dep, group = exact_open[0]
             why = _deposit_corroboration(bsl, group)
@@ -1629,9 +1703,13 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   [], "Negative BSL matched to single reference-tied open Payables ST.",
                   "P9_payables")
         elif cands:
-            place(bsl, CANDIDATE, CONF_LOW, _sorted(cands),
+            ordered = _sorted(cands)
+            place(bsl, CANDIDATE, CONF_LOW, [ordered[0]],
                   ["MISSING_REFERENCE"],
-                  "Payables amount match without a clean reference tie.",
+                  "Payables amount match without a clean reference tie; citing "
+                  f"{ordered[0].id}"
+                  + (", alternates: " + ", ".join(e.id for e in ordered[1:4])
+                     if len(ordered) > 1 else "") + ".",
                   "P9_payables")
 
     # ---- P10 Residual -> Review -------------------------------------
@@ -1813,29 +1891,34 @@ def _p5_state(unplaced, place, pool, ledger, loaded, runlog):
         bundle_sum = sum(inv_gross.get(i, 0) for i in invoices if i in inv_gross)
         # Map invoices to Receivables receipts (reference contains invoice num).
         receipts = _state_receipts(invoices, pool, ledger)
-        if bundle_sum == bsl.amount_cents and receipts:
-            # Match when bundle sums and Edison reference ties a receipt.
-            # State date rule (spec §11): a Match-qualifying tie receipt
-            # must pass date_ok_state — no ceiling when the BSL precedes the
-            # receipt, demote to Candidate when the receipt precedes the BSL
-            # by more than 20 days.  A missing date is not ">20d": kept.
+        receipts_sum = sum(e.amount_cents for e in receipts)
+        if bundle_sum == bsl.amount_cents and receipts and \
+                receipts_sum == bsl.amount_cents:
+            # The receipt set itself must sum to the BSL (owner doctrine:
+            # BSL - sum(STs) == 0 on every listed pairing; Receivables
+            # receipts combine, often many to one BSL).
+            # State date rule (spec §11): no ceiling when the BSL precedes
+            # the receipt; demote when the receipt precedes the BSL by >20d.
             def _state_fresh(e):
                 lag = signed_lag(bsl.date, e.date)
                 return lag is None or date_ok_state(lag)
-            tie = [e for e in receipts
-                   if any(inv in znorm(e.reference) or inv in znorm(e.id)
-                          for inv in invoices) and _state_fresh(e)]
-            chosen = tie or receipts
+            tie = all(_state_fresh(e) and
+                      any(inv in znorm(e.reference) or inv in znorm(e.id)
+                          for inv in invoices)
+                      for e in receipts)
             place(bsl, MATCH if tie else CANDIDATE,
-                  CONF_HIGH if tie else CONF_MEDIUM, _sorted(chosen),
+                  CONF_HIGH if tie else CONF_MEDIUM, _sorted(receipts),
                   [] if tie else ["INCOMPLETE_REFERENCE_SUPPORT"],
                   f"STATE bundle of {len(invoices)} Edison invoice(s) sums to BSL; "
-                  + ("Edison reference ties receipt." if tie else "no receipt reference tie."),
+                  f"{len(receipts)} receipt(s) sum to BSL"
+                  + (" with reference ties." if tie else "; reference/date support incomplete."),
                   "P5_state")
         elif bundle_sum == bsl.amount_cents:
-            place(bsl, CANDIDATE, CONF_MEDIUM, [],
-                  ["INCOMPLETE_REFERENCE_SUPPORT"],
-                  "STATE Edison bundle sums to BSL but no Receivables receipt found.",
+            place(bsl, REVIEW, CONF_LOW, [],
+                  ["RECEIPT_ENTRY_BACKLOG"],
+                  "STATE: Edison confirms the payment identity"
+                  f" ({len(invoices)} invoice(s) sum to BSL) but no DASH "
+                  "receipt/ST set sums to it — receipt-entry backlog.",
                   "P5_state")
         else:
             place(bsl, REVIEW, CONF_LOW, [], ["STATE_LANE_ISOLATION", "PARTIAL_CHAIN"],
@@ -1845,11 +1928,14 @@ def _p5_state(unplaced, place, pool, ledger, loaded, runlog):
 
 
 def _state_receipts(invoices, pool, ledger):
-    """Receipts whose reference/id contains one of the bundle invoice numbers,
-    open and available.  Never a card-batch (MID) receipt."""
+    """RECEIVABLES receipts whose reference/id contains one of the bundle
+    invoice numbers, open and available.  State lines match Receivables
+    receipts ONLY (lane isolation, ORT doc section 5.1): never a card-batch
+    (MID) receipt and never an ORT-chain (EXT) entry — the audit's C6 rejects
+    any State Match citing ORT d:/r: coordinates."""
     out = []
     for e in pool:
-        if not ledger.is_available(e) or e.is_mid or e.source == "GL":
+        if not ledger.is_available(e) or e.is_mid or e.source != "AR":
             continue
         if any(inv and (inv in znorm(e.reference) or inv in znorm(e.id)) for inv in invoices):
             out.append(e)
@@ -1882,9 +1968,23 @@ def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account=None):
                   "Stale (>30d) same-MID group; likely auto-rec artifact."
                   + _mid_note(bsl, mid_dir, account), "P6_merchant")
         elif group:
-            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
-                  ["GROUPING_CONFLICT"],
-                  "Same-MID receipts present but window/sum ambiguous.", "P6_merchant")
+            whole = sum(e.amount_cents for e in group)
+            singles = [e for e in group if e.amount_cents == bsl.amount_cents]
+            if whole == bsl.amount_cents:
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                      ["GROUPING_CONFLICT"],
+                      "Same-MID receipts sum to settlement but not inside the 1-4d window.",
+                      "P6_merchant")
+            elif singles:
+                best = _sorted(singles)[0]
+                place(bsl, CANDIDATE, CONF_MEDIUM, [best],
+                      ["GROUPING_CONFLICT"],
+                      f"Same-MID receipt {best.id} equals the settlement out of window; "
+                      f"{len(group)} same-MID receipt(s) present.", "P6_merchant")
+            else:
+                place(bsl, REVIEW, CONF_LOW, [], ["GROUPING_CONFLICT"],
+                      f"Same-MID receipts present ({len(group)}) but no subset sums "
+                      "to the settlement.", "P6_merchant")
         # else: no card receipt -> defer to P7/P10.
     runlog["p6_merchant"] = "ran"
 
