@@ -164,6 +164,39 @@ class TestPoolDedup(unittest.TestCase):
         self.assertEqual(out[0].amount_cents, 10000)          # kept the total
         self.assertEqual(out[0].counterparty, "ACME CORP")     # borrowed
 
+    def test_deposit_correction_detection(self):
+        class _B:
+            additional_info = ""
+            line_info = ""
+        b = _B()
+        b.line_info = "Line 1 , 2026-06-10 DEPOSIT CORRECTION CREDIT"
+        self.assertTrue(E._is_deposit_correction(b))
+        b2 = _B()
+        b2.additional_info = "CORRECTED DEPOSIT 0123"
+        self.assertTrue(E._is_deposit_correction(b2))
+        b3 = _B()
+        b3.additional_info = "MERCHANT SERVICEDEPOSIT"
+        b3.line_info = "Line 2"
+        self.assertFalse(E._is_deposit_correction(b3))
+
+    def test_amount_distinctive(self):
+        self.assertTrue(E.amount_distinctive(245546969))   # 2,455,469.69
+        self.assertTrue(E.amount_distinctive(-154638))     # (1,546.38)
+        self.assertFalse(E.amount_distinctive(500000))     # 5,000.00 round
+        self.assertFalse(E.amount_distinctive(6500))       # 65.00 too small
+        self.assertFalse(E.amount_distinctive(-13000))     # (130.00)
+
+    def test_convera_payables_only(self):
+        class _B:
+            additional_info = "CONVERA TENN DEBITS 260703"
+            line_info = "Line 59 , 2026-07-03"
+            transaction_type = "Wire"
+        b = _B()
+        ap = E._mk_entry("1394", -59690, date(2026, 7, 2), "1394", "Stichting EHEDG", "AP", "UNR", True, "ST")
+        ext = E._mk_entry("999", -59690, date(2026, 7, 2), "999", "Someone", "EXT", "UNR", True, "MET")
+        self.assertTrue(E._type_gate_ok(b, ap))
+        self.assertFalse(E._type_gate_ok(b, ext))
+
     def test_distinct_receipts_sharing_label_all_kept(self):
         # Real FHB Master case: two receipts share one transaction-number
         # label but do NOT fit the total-plus-splits signature — both stay,
@@ -742,10 +775,15 @@ class TestRealDataShapes(unittest.TestCase):
         # bridge: trx 601 exists in both ST and MET -> one pool entry
         self.assertEqual(runlog["met_bridged_to_st"], 1)
         self.assertEqual(runlog["pool_total"], 3)
-        # deposit line -> Match via deposit group; ACH line -> P3 exact
+        # ACH line -> P3 exact Match; deposit line -> deposit-type consistency
+        # confers NOTHING (owner doctrine 2026-07-11): the exact sum alone
+        # surfaces as an amount-only Candidate, never a Match.
         self.assertEqual(runlog["recon_summary"],
-                         {"matches": 2, "candidates": 0, "reviews": 0})
+                         {"matches": 1, "candidates": 1, "reviews": 0})
         self.assertEqual(runlog["forward_pass_counts"].get("P4_deposit_group"), 1)
+        tabs_c, _ = A._read_output_tabs(runlog["recon_workbook"])
+        cand = [r for r in tabs_c["Candidate Matches"][3:] if any(A._N(c) for c in r)]
+        self.assertIn("AMOUNT_ONLY_GROUP", A._N(cand[0][A.COL_EXPL]))
         # the bridged entry carries the ORT coordinates
         tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
         match_rows = [r for r in tabs["Matches"][3:] if any(A._N(c) for c in r)]

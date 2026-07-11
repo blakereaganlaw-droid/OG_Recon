@@ -490,6 +490,19 @@ def audit(input_dir, recon_path, account):
         if has_mid and not merchant and "card" not in _N(r[COL_EXPL]).lower() and "MID" in _N(r[COL_EXPL]):
             c7_ok = False
             failures.append(f"C7: MID guardrail suspected on non-merchant Match: {r[:2]}")
+    # Owner (2026-07-11, false-match review): deposit-type consistency alone
+    # never makes a Match, and a deposit-correction line (manual fix; needs a
+    # manual ECT) never Matches from an amount-sum pass.
+    for label, rows_ in (("Match", match_rows), ("Candidate", cand_rows)):
+        for r in rows_:
+            if "deposit-type consistency" in _N(r[COL_EXPL]).lower():
+                c7_ok = False
+                failures.append(f"C7: {label} rests on deposit-type consistency: {r[:3]}")
+    for r in match_rows:
+        info_txt = _norm_header(r[COL_INFO])
+        if "CORRECTION" in info_txt or "CORRECTED" in info_txt:
+            c7_ok = False
+            failures.append(f"C7: deposit-correction line placed as a Match: {r[:3]}")
     checks["C7"] = "PASS" if c7_ok else "FAIL"
 
     # C8 directional date rule (owner doctrine, final): the gate applies

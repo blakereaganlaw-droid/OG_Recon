@@ -1621,10 +1621,34 @@ def payer_contradiction(bsl, entries):
     return not _token_overlap(bt, st)
 
 
+def _is_deposit_correction(bsl):
+    """Deposit-correction bank lines are manual fixes (owner, 2026-07-11):
+    they rarely have an ST and need a manual ECT.  They may surface as
+    flagged Candidates — never as Matches from amount-sum passes."""
+    txt = _norm_header(bsl.additional_info) + _norm_header(bsl.line_info)
+    return "CORRECTION" in txt or "CORRECTED" in txt
+
+
+def amount_distinctive(c):
+    """Owner doctrine (2026-07-11): amount alone can suffice ONLY when the
+    exact signed-cents value is statistically unlikely to collide — a rare
+    combination of digits.  Deterministic proxy: non-zero cents AND at least
+    $1,000 in magnitude (e.g. 2,455,469.69 qualifies; 500.00, 60.00, or any
+    round-dollar amount never does)."""
+    return c % 100 != 0 and abs(c) >= 100000
+
+
+def _is_convera(bsl):
+    return "CONVERA" in _norm_header(bsl.additional_info) + _norm_header(bsl.line_info)
+
+
 def _type_gate_ok(bsl, e):
     """Deterministic type gate (ORT doc section 5.2): a Credit Card ST never
     pairs with a Check or Miscellaneous bank line.  EFT is never rejected on
-    the label alone."""
+    the label alone.  Convera lines (owner, 2026-07-11) are international
+    wires and ALWAYS Payables — they never pair with a non-Payables ST."""
+    if _is_convera(bsl) and e.source != "AP":
+        return False
     et = _norm_header(e.transaction_type)
     if "CREDITCARD" in et:
         bt = _norm_header(bsl.transaction_type)
@@ -1680,6 +1704,10 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
 
     def unplaced():
         return [b for b in bsls if b.line_key not in placements]
+
+    bsl_amount_counts = {}
+    for b in bsls:
+        bsl_amount_counts[b.amount_cents] = bsl_amount_counts.get(b.amount_cents, 0) + 1
 
     # ---- P2 DATA_FEED_ERROR sweep -----------------------------------
     feed_errors = _p2_data_feed_errors(loaded, account)
@@ -1810,9 +1838,9 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     # Primary ORT path (relationship doc §3): index MET rows by DEPOSIT_ID;
     # the deposit's deduped open receipts sum to one BSL.  An exact sum is
     # necessary, never sufficient — corroborate by (a) reference tie,
-    # (b) payer tie, or (c) deposit-type consistency for bundled DEPOSIT
-    # lines.  All-status context: closed members completing the sum mean an
-    # auto-rec split -> Candidate naming them.
+    # or (b) payer tie (deposit-type consistency confers NOTHING —
+    # owner, 2026-07-11).  All-status context: closed members completing
+    # the sum mean an auto-rec split -> Candidate naming them.
     deposit_index = {}
     for e in pool:
         if e.deposit_id and e.source not in JOURNAL_SOURCES:
@@ -1835,12 +1863,19 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         for e in members:
             if reference_equal(bsl.recon_reference, e.reference) or                reference_equal(bsl.recon_reference, e.id) or                reference_tie(bsl.recon_reference, e.reference):
                 return "reference tie"
+        # Merchant-lane (MID) bank lines corroborate ONLY through a reference/
+        # MID tie (owner, 2026-07-11): a card deposit that doesn't carry the
+        # line's MID belongs to some other department — payer text and
+        # deposit-type consistency prove nothing in the merchant lane.
+        if bsl.lane == LANE_MERCHANT:
+            return ""
         for e in members:
             if e.payer_tokens & bsl.payer_tokens:
                 return "payer tie"
-        bt = _norm_header(bsl.transaction_type) + _norm_header(bsl.additional_info)
-        if "DEPOSIT" in bt or N(bsl.transaction_code) in ("174", "195"):
-            return "deposit-type consistency"
+        # Deposit-type consistency confers NOTHING (owner, 2026-07-11
+        # false-match review): "if that's the only criteria, there is no
+        # candidate."  A deposit-typed line with only an exact sum falls to
+        # the amount-only path like any other line.
         return ""
 
     for bsl in unplaced():
@@ -1858,8 +1893,9 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 closed = [e for e in gated if not e.available]
                 if closed:
                     split_groups.append((dep, gated, closed))
+        correction = _is_deposit_correction(bsl)
         # Directional date gate: every member may precede the BSL by at
-        # most 15 days OR be entered after it by any amount (entry lag has
+        # most 8 days OR be entered after it by any amount (entry lag has
         # no ceiling); a deposit the BSL trails beyond the band is stale.
         dated = [(d, g) for d, g in exact_open
                  if all(date_ok_directional(signed_lag(bsl.date, e.date))
@@ -1893,10 +1929,13 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             if not uncontra:
                 continue
             dep, group = sorted(uncontra)[0]
+            stale_codes = ["AMOUNT_ONLY_GROUP", "DATE_CONFLICT"]
+            if correction:
+                stale_codes.append("MANUAL_ECT")
             place(bsl, CANDIDATE, CONF_LOW, _sorted(group),
-                  ["AMOUNT_ONLY_GROUP", "DATE_CONFLICT"],
+                  stale_codes,
                   f"ORT deposit d:{dep} sums to BSL but carries no reference/"
-                  "payer/deposit-type corroboration and no member date in band"
+                  "payer corroboration and no member date in band"
                   + (f"; {len(uncontra)} equal-sum deposit(s)."
                      if len(uncontra) > 1 else "."),
                   "P4_deposit_group")
@@ -1905,32 +1944,70 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         if len(exact_open) == 1:
             dep, group = exact_open[0]
             why = _deposit_corroboration(bsl, group)
-            if why:
+            if why and correction:
+                # Owner (2026-07-11): corrections are manual fixes — surface
+                # the exact-sum group as a Candidate flagged for a manual ECT,
+                # never a Match.
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                      ["MANUAL_ECT"],
+                      f"Deposit correction — manual ECT required. ORT deposit "
+                      f"d:{dep} sums to BSL ({why}), cited for reference only.",
+                      "P4_deposit_group")
+            elif why:
                 place(bsl, MATCH, CONF_HIGH, _sorted(group), [],
                       f"ORT deposit d:{dep} — {len(group)} open receipt(s) sum to BSL; {why}.",
                       "P4_deposit_group")
             else:
                 if payer_contradiction(bsl, group):
                     continue
+                if amount_distinctive(bsl.amount_cents) and \
+                        bsl_amount_counts.get(bsl.amount_cents) == 1 and \
+                        not correction:
+                    place(bsl, MATCH, CONF_MEDIUM, _sorted(group),
+                          ["DISTINCTIVE_AMOUNT"],
+                          f"Distinctive-amount ORT deposit group: d:{dep} is "
+                          "the ONLY deposit summing to this non-round amount, "
+                          "and no other bank line carries it — a rare digit "
+                          "combination is valid match evidence (owner "
+                          "doctrine).",
+                          "P4_deposit_group")
+                    continue
+                codes = ["AMOUNT_ONLY_GROUP"]
+                note = ""
+                if correction:
+                    codes.append("MANUAL_ECT")
+                    note = " Deposit correction — manual ECT required; cited for reference only."
                 place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
-                      ["AMOUNT_ONLY_GROUP"],
-                      f"ORT deposit d:{dep} sums to BSL but carries no reference/payer/deposit-type corroboration.",
+                      codes,
+                      f"ORT deposit d:{dep} sums to BSL but carries no reference/payer corroboration." + note,
                       "P4_deposit_group")
         elif len(exact_open) > 1:
             corroborated = [(d, g) for d, g in exact_open if _deposit_corroboration(bsl, g)]
             if len(corroborated) == 1:
                 dep, group = corroborated[0]
-                place(bsl, MATCH, CONF_HIGH, _sorted(group), [],
-                      f"ORT deposit d:{dep} uniquely corroborated among {len(exact_open)} equal-sum deposits.",
-                      "P4_deposit_group")
+                why = _deposit_corroboration(bsl, group)
+                if correction:
+                    place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                          ["MANUAL_ECT"],
+                          f"Deposit correction — manual ECT required. ORT "
+                          f"deposit d:{dep} sums to BSL ({why}), cited for "
+                          "reference only.",
+                          "P4_deposit_group")
+                else:
+                    place(bsl, MATCH, CONF_HIGH, _sorted(group), [],
+                          f"ORT deposit d:{dep} uniquely corroborated among {len(exact_open)} equal-sum deposits.",
+                          "P4_deposit_group")
             else:
                 uncontra = [(d, g) for d, g in exact_open
                             if not payer_contradiction(bsl, g)]
                 if not uncontra:
                     continue
                 dep, group = sorted(uncontra)[0]
+                multi_codes = ["MULTIPLE_EQUAL_CANDIDATES"]
+                if correction:
+                    multi_codes.append("MANUAL_ECT")
                 place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
-                      ["MULTIPLE_EQUAL_CANDIDATES"],
+                      multi_codes,
                       f"{len(uncontra)} deposits sum to BSL: "
                       + ", ".join(f"d:{d}" for d, _ in sorted(uncontra)) + ".",
                       "P4_deposit_group")
@@ -2030,13 +2107,29 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   if date_ok_directional(signed_lag(bsl.date, e.date))]
         if inband:
             ordered = _sorted(inband)
+            if len(inband) == 1 and amount_distinctive(bsl.amount_cents) and \
+                    bsl_amount_counts.get(bsl.amount_cents) == 1 and \
+                    not _is_deposit_correction(bsl):
+                place(bsl, MATCH, CONF_MEDIUM, [ordered[0]],
+                      ["DISTINCTIVE_AMOUNT"],
+                      f"Distinctive-amount 1:1: {ordered[0].id} is the ONLY "
+                      "open ST at this non-round amount and no other bank "
+                      "line carries it — a rare digit combination is valid "
+                      "match evidence (owner doctrine).",
+                      "P9b_amount_only")
+                continue
+            codes = ["AMOUNT_ONLY"]
+            note = ""
+            if _is_deposit_correction(bsl):
+                codes.append("MANUAL_ECT")
+                note = " Deposit correction — manual ECT required."
             place(bsl, CANDIDATE, CONF_LOW, [ordered[0]],
-                  ["AMOUNT_ONLY"],
+                  codes,
                   f"AMOUNT_ONLY: {len(inband)} open ST(s) at exact cents but "
                   f"zero cross-reference corroboration; citing {ordered[0].id}"
                   + (", alternates: " + ", ".join(e.id for e in ordered[1:])
                      if len(ordered) > 1 else "")
-                  + ". Hard guardrail bars Match without corroboration.",
+                  + ". Hard guardrail bars Match without corroboration." + note,
                   "P9b_amount_only")
             continue
         # Only stale exact-cents STs remain: surface as a DATE_GATE Candidate
@@ -2057,6 +2150,10 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     # ---- P10 Residual -> Review -------------------------------------
     for bsl in unplaced():
         codes, expl = _p10_review_cause(bsl, pool, feed_errors)
+        if _is_deposit_correction(bsl):
+            codes = ["MANUAL_ECT"] + [c for c in codes if c != "MANUAL_ECT"]
+            expl = ("Deposit correction — rarely has an ST; manual ECT "
+                    "required. " + expl)
         gl = recommend_gl_string(bsl, loaded)
         if gl:
             expl += f" Recommended GL: {gl}."

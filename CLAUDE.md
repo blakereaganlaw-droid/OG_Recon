@@ -47,9 +47,14 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
 3. **Fail loud.** Unresolved required file/column/relationship → raise
    `InvalidSourceData` / `MissingRequiredFile` / `AmbiguousColumn` naming the
    file, role, and candidates. Never guess a column; never silently drop a row.
-4. **Amount alone never makes a Match.** Requires exact amount **and**
-   corroboration (reference tie, or payer tie for named-payer rules). Date
-   supports, never suffices.
+4. **Amount alone never makes a Match** — with ONE owner exception
+   (2026-07-11): a **distinctive amount** (non-zero cents, >= $1,000) that is
+   unique on BOTH sides (one open counterpart in the pool/deposit chain, one
+   bank line at that amount) is valid match evidence (`amount_distinctive`,
+   Medium confidence, `DISTINCTIVE_AMOUNT`). Everything else requires exact
+   amount **and** corroboration (reference tie, or payer tie for named-payer
+   rules). Transaction type alone confers nothing. Date supports, never
+   suffices.
 5. **Conservation.** Each BSL appears exactly once across the three tabs; each
    ST is consumed at most once across Matches + Candidates (shared `Ledger`).
    Both asserted at end of `forward_reconcile`.
@@ -69,6 +74,15 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    carry payer tokens and share none ("City of Chattanooga has nothing to do
    with Israel"). Reference ties outrank payer text; silence never
    contradicts.
+8c. **Deposit-type / merchant / correction (owner, 2026-07-11).**
+   "Deposit-type consistency" confers NOTHING — an exact-sum deposit group
+   without a reference or payer tie is a plain amount-only Candidate, never
+   a Match. Merchant-lane (MID) lines corroborate deposit groups ONLY via a
+   reference/MID tie. Deposit-correction lines are manual fixes — Candidates
+   flagged `MANUAL_ECT` at best, never amount-sum Matches; edge cases err
+   toward Candidate over rejection. Audit C7 enforces all three. Convera
+   lines are international wires and ALWAYS Payables — they never pair with
+   a non-Payables ST (central `_type_gate_ok`).
 9. **Determinism.** No randomness, no clock. `Date.now`/serials excepted where
    parsing Excel. Sort candidate sets by (amount, date, id) before choosing.
 
