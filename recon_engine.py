@@ -263,7 +263,17 @@ def clean_ref(v):
     """Null out placeholder reference tokens: a literal 'NA' must never tie
     another literal 'NA' (37 of 283 real FHB Master BSL references are 'NA')."""
     s = N(v)
-    return "" if znorm(s) in _NULL_REF_TOKENS else s
+    if znorm(s) in _NULL_REF_TOKENS or not re.search(r"[A-Za-z0-9]", s):
+        return ""
+    return s
+
+
+def _blankish(v):
+    """A placeholder cell ('NA', '.', '-') is blank for content sampling:
+    real Oracle exports pad id columns with them, and counting them dilutes
+    the true column's content score below junk text columns."""
+    s = N(v)
+    return not s or znorm(s) in _NULL_REF_TOKENS or not re.search(r"[A-Za-z0-9]", s)
 
 
 def reference_equal(a, b) -> bool:
@@ -317,7 +327,7 @@ ROUTER_TABLE = [
     # "_st" alone is too greedy: it matches All_Status / Rosetta_Stone /
     # _Statement.  Require a separator (or end) after the token.
     RouterRule("ST", [], [], ["_st_", "_st.", "account_st"], "first", False),
-    RouterRule("RECEIPTS", [], [], ["receivables_receipts", "receipts_all"], "Export to Excel", False),
+    RouterRule("RECEIPTS", [], [], ["receivables_receipts", "receipts_all", "oracle_receipts"], "Export to Excel", False),
     RouterRule("DEPT_INFO", [], [], ["ort_department", "department_info"], "Report", False),
     RouterRule("CHART_OF_ACCOUNTS", ["chart_of_accounts"], [], [], "Report", False),
     RouterRule("ORT_AR", ["ort", "_ar"], [], [], "Report", False),
@@ -641,7 +651,7 @@ def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50)
                 header_score = 2
             else:
                 header_score = 0
-            sampled = [r[col] for r in data_rows if col < len(r) and N(r[col]) != ""]
+            sampled = [r[col] for r in data_rows if col < len(r) and not _blankish(r[col])]
             if sampled:
                 content_score = sum(1 for c in sampled if spec.predicate(c)) / len(sampled)
             else:
@@ -700,8 +710,10 @@ ST_ROLES = {
 }
 
 RECEIPTS_ROLES = {
-    "receipt_number": _rs(True, ["Receipt Number", "Receipt Num", "Receipt"], pred_reference),
-    "status": _rs(True, ["Status", "Receipt Status", "State"], pred_status),
+    "receipt_number": _rs(True, ["Receipt Number", "Receipt Num"], pred_reference),
+    # 'Status' is the lifecycle (Cleared/Remitted/Reversed); the export's
+    # separate 'State' column (Applied/Unapplied) must not tie it.
+    "status": _rs(True, ["Status", "Receipt Status"], pred_status),
     "amount": _rs(True, ["Receipt Amount", "Entered Amount", "Amount"], pred_signed_amount),
     "customer_name": _rs(True, ["Customer Name", "Customer", "Payer"], pred_customer),
     "receipt_date": _rs(False, ["Receipt Date", "Date"], pred_date),

@@ -117,6 +117,14 @@ class AuditBindError(Exception):
     convert this into a named check FAILURE — never a guess, never a crash."""
 
 
+_NULL_TOKENS = {"NA", "NONE", "NULL", "UNKNOWN"}
+
+
+def _blankish(v):
+    s = _N(v)
+    return not s or _znorm(s) in _NULL_TOKENS or not re.search(r"[A-Za-z0-9]", s)
+
+
 def _find_col(rows, header_index, aliases, predicate, sample=50):
     """Return the best column index for a role, or None when no column shows
     any evidence.  A blind tie (two columns equal on content AND header
@@ -129,7 +137,7 @@ def _find_col(rows, header_index, aliases, predicate, sample=50):
     for col in range(ncols):
         hnorm = _norm_header(header[col]) if col < len(header) else ""
         hscore = 3 if hnorm in alias_norms else (2 if any(a and a in hnorm for a in alias_norms) else 0)
-        sampled = [r[col] for r in data if col < len(r) and _N(r[col]) != ""]
+        sampled = [r[col] for r in data if col < len(r) and not _blankish(r[col])]
         cscore = (sum(1 for c in sampled if predicate(c)) / len(sampled)) if sampled else 0.0
         scored.append((cscore, hscore, col))
     scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
