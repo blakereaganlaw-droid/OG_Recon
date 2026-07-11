@@ -6,12 +6,14 @@ UT Cash Management Reconciliation Engine
 A production-grade, deterministic reconciliation engine for University of
 Tennessee bank accounts in Oracle Cash Management (DASH).
 
-Two engines in one program:
-  * FORWARD  — match open bank statement lines (BSL) to open system
-               transactions (ST), classifying each line Match / Candidate /
-               Review.
-  * BACKWARD — re-audit already-reconciled groups against doctrine and
-               recommend unwinding the unsound ones.
+Forward matching engine: match open bank statement lines (BSL) to open
+system transactions (ST), classifying each line Match / Candidate / Review.
+Every available source feeds the candidate pool — ST exports, Receivables
+receipts, and the MET/ORT chain (d:/r: deposit-receipt bridge).
+
+The BACKWARD engine (re-audit reconciled groups -> recommend unwinds) was
+split into the separate Unreconcile2 project so this engine stays fast:
+an ALL_DATA workbook is recognized but never loaded here.
 
 Temperament (binding, see BUILD SPEC sections 0 & 15):
   * Determinism first — same inputs, identical outputs, no float, no clock.
@@ -332,7 +334,8 @@ ROUTER_TABLE = [
 
 # Roles the pipeline treats as hard requirements at the top level (Section 4.1
 # "Required?" column reads "yes"/conditional).  BSL is the sole unconditional
-# requirement; ST is required only when no ALL_DATA is present.
+# requirement.  ALL_DATA is recognized but not loaded — it fuels the backward
+# engine, which lives in the separate Unreconcile2 project.
 HARD_REQUIRED_ROLES = {"BSL"}
 
 # Account tokens recognized in filenames (Section 1.2 + 4.1).
@@ -668,41 +671,8 @@ MET_ROLES = {
     "offset": _rs(False, ["Offset Concatenated Segments", "Offset", "GL"], pred_any),
 }
 
-RECON_HISTORY_ROLES = {
-    "recon_grp": _rs(True, ["Recon Grp", "Recon Group", "Reconciliation Group"], pred_reference),
-    "amount": _rs(True, ["Amount"], pred_signed_amount),
-    "auto_flag": _rs(True, ["Auto Recon Flag", "Auto Recon", "Auto Flag"], pred_any),
-    "rule_name": _rs(True, ["Rule Name", "Matching Rule Name"], pred_any),
-    "match_type": _rs(True, ["Match Type"], pred_any),
-    "type_match": _rs(True, ["Type Match"], pred_any),
-    "amount_match": _rs(True, ["Amount Match"], pred_any),
-    "date_match": _rs(True, ["Date Match"], pred_any),
-    "ref_match": _rs(True, ["Ref Match", "Reference Match"], pred_any),
-    "recon_src": _rs(False, ["Recon Src", "Recon Source"], pred_any),
-}
 
-BANK_STATEMENT_LINES_ROLES = {
-    "date": _rs(True, ["Transaction Date", "Booking Date", "Date"], pred_date),
-    "amount": _rs(True, ["Amount", "Transaction Amount"], pred_signed_amount),
-    "line_key": _rs(True, ["Line Number", "Statement Line", "Line", "Sequence"], pred_number),
-    "rec_status": _rs(False, ["Rec Status", "Reconciliation Status", "Status"], pred_any),
-    "rec_grp": _rs(False, ["Rec Grp", "Recon Grp", "Rec Group"], pred_reference),
-    "reference": _rs(False, ["Reference", "Account Servicer Reference"], pred_reference),
-    "additional_info": _rs(False, ["Additional Information", "Additional Info"], pred_any),
-    "matching_rule_name": _rs(False, ["Matching Rule Name", "Rule Name"], pred_any),
-    "match_type": _rs(False, ["Match Type"], pred_any),
-}
 
-MISC_RECEIPTS_ROLES = {
-    "rec_num": _rs(True, ["Rec Num", "Receipt Number", "Receipt Num"], pred_reference),
-    "rec_amnt": _rs(True, ["Rec Amnt", "Receipt Amount", "Amount"], pred_signed_amount),
-    "rec_status": _rs(False, ["Rec Status", "Status"], pred_any),
-    "rec_ref": _rs(False, ["Rec Ref", "Reference"], pred_reference),
-    "rec_grp": _rs(False, ["Rec Grp", "Recon Grp"], pred_reference),
-    "dep_num": _rs(False, ["Dep Num", "Deposit Number"], pred_reference),
-    "offset": _rs(False, ["Offset", "GL"], pred_any),
-    "recommended_bank_line": _rs(False, ["Recommended Bank Line"], pred_any),
-}
 
 EDISON_PAY_ROLES = {
     "reference": _rs(True, ["Reference", "Payment Reference"], pred_reference),
@@ -795,22 +765,6 @@ def read_rows(routed_file: RoutedFile):
     except Exception as e:
         raise InvalidSourceData(routed_file.filename, routed_file.role, f"read failed: {e}")
 
-
-def read_named_sheet(path, title_substr, role_specs):
-    """Read a specific sheet by title substring (for ALL_DATA multi-sheet).
-    Returns (rows, mapping, header_index) or (None, None, None) if absent."""
-    from openpyxl import load_workbook
-    wb = load_workbook(path, read_only=False, data_only=True)
-    target = _match_sheet(wb, title_substr, os.path.basename(path))
-    if target is None:
-        wb.close()
-        return None, None, None
-    rows = [tuple(r) for r in target.iter_rows(values_only=True)]
-    wb.close()
-    mapping, hi = bind_columns(rows, role_specs, filename=os.path.basename(path))
-    return rows, mapping, hi
-
-
 # ======================================================================
 # Section 8 — Candidate ST pool (all-status, deduped)
 # ======================================================================
@@ -899,7 +853,8 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
     counts = {}
 
     # 1. Open non-Receivables STs from ST (exclude Journal from eligibility but
-    #    keep for backward engine; dedup keep-largest by transaction number).
+    #    keep in the pool so P10 can explain journal-only lines; dedup
+    #    keep-largest by transaction number).
     st = loaded.get("ST")
     if st:
         rows, m, hi = st["rows"], st["map"], st["header_index"]
@@ -1356,7 +1311,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                       ["POSSIBLE_AUTO_REC_SPLIT"],
                       "Reference group sums exactly but includes already-closed member(s): "
                       + ", ".join(sorted(m.id for m in closed_members))
-                      + " (auto-rec-stranded; hand to backward engine).",
+                      + " (auto-rec-stranded; run Unreconcile2 to re-audit the group).",
                       "P4_ref_group")
             elif competing:
                 place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
@@ -1535,10 +1490,17 @@ def _p5_state(unplaced, place, pool, ledger, loaded, runlog):
         receipts = _state_receipts(invoices, pool, ledger)
         if bundle_sum == bsl.amount_cents and receipts:
             # Match when bundle sums and Edison reference ties a receipt.
-            tie = [e for e in receipts if any(inv in znorm(e.reference) or inv in znorm(e.id)
-                                              for inv in invoices)]
+            # State date rule (spec §11): a Match-qualifying tie receipt
+            # must pass date_ok_state — no ceiling when the BSL precedes the
+            # receipt, demote to Candidate when the receipt precedes the BSL
+            # by more than 20 days.  A missing date is not ">20d": kept.
+            def _state_fresh(e):
+                lag = signed_lag(bsl.date, e.date)
+                return lag is None or date_ok_state(lag)
+            tie = [e for e in receipts
+                   if any(inv in znorm(e.reference) or inv in znorm(e.id)
+                          for inv in invoices) and _state_fresh(e)]
             chosen = tie or receipts
-            # State date rule handled in _state_receipts filtering.
             place(bsl, MATCH if tie else CANDIDATE,
                   CONF_HIGH if tie else CONF_MEDIUM, _sorted(chosen),
                   [] if tie else ["INCOMPLETE_REFERENCE_SUPPORT"],
@@ -1571,8 +1533,7 @@ def _state_receipts(invoices, pool, ledger):
 
 def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog):
     """Merchant / MID (Section 9 P6)."""
-    mid_master = loaded.get("MID_MASTER")
-    ran = True
+
     for bsl in unplaced():
         if bsl.lane != LANE_MERCHANT:
             continue
@@ -1598,7 +1559,7 @@ def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog):
                   ["GROUPING_CONFLICT"],
                   "Same-MID receipts present but window/sum ambiguous.", "P6_merchant")
         # else: no card receipt -> defer to P7/P10.
-    runlog["p6_merchant"] = "ran" if ran else "not-run"
+    runlog["p6_merchant"] = "ran"
 
 
 def _p7_spn(unplaced, place, pool, ledger, loaded, runlog):
@@ -1710,7 +1671,8 @@ def _p10_review_cause(bsl, pool, feed_errors):
 
 def recommend_gl_string(bsl, loaded):
     """Best-effort GL account string for a manual ECT (Section 6 sources)."""
-    # MID master first (merchant lane), then MISC receipts offset.
+    # MID master only (merchant lane); MISC Receipts is an ALL_DATA sheet,
+    # never loaded here — returns "" when there is no MID hit.
     mid_master = loaded.get("MID_MASTER")
     if bsl.mid and mid_master:
         gl = mid_master.get("mid_gl", {}).get(bsl.mid)
@@ -1735,310 +1697,13 @@ def _assert_conservation(bsls, placements):
                     f"ST {e.id} consumed twice ({consumed.get(e.id)} and {p.pass_name})")
                 consumed[e.id] = p.pass_name
 
-
 # ======================================================================
-# Section 10 — BACKWARD un-reconciliation engine
-# ======================================================================
-
-@dataclass
-class UnwindRec:
-    recon_grp: str
-    bsl_date: object
-    bsl_line_info: str
-    bsl_amount_cents: int
-    reconciled_sts: list          # list of (id, amount_cents)
-    defect_codes: list
-    signed_lag: object
-    rule_name: str
-    recommended_action: str
-    recommended_rereconciliation: str
-    explanation: str
-
-
-DEFECT_AMOUNT = "AMOUNT_INTEGRITY"
-DEFECT_REFERENCE = "REFERENCE_INTEGRITY"
-DEFECT_DATE = "DATE_PLAUSIBILITY"
-DEFECT_ONE_TO_MANY = "ONE_TO_MANY_INTEGRITY"
-DEFECT_SOURCE = "SOURCE_LEGALITY"
-DEFECT_DUAL_FIRE = "DUAL_FIRE"
-DEFECT_STATUS = "STATUS_COHERENCE"
-DEFECT_CROSS_ACCOUNT = "CROSS_ACCOUNT_FLAG"
-
-DEFECT_SEVERITY = {
-    DEFECT_AMOUNT: (0, "High"),
-    DEFECT_SOURCE: (0, "High"),
-    DEFECT_ONE_TO_MANY: (1, "Medium"),
-    DEFECT_REFERENCE: (1, "Medium"),
-    DEFECT_DUAL_FIRE: (1, "Medium"),
-    DEFECT_STATUS: (1, "Medium"),
-    DEFECT_DATE: (2, "Low"),
-    DEFECT_CROSS_ACCOUNT: (3, "Advisory"),
-}
-
-
-def backward_reconcile(loaded, account, pool, runlog):
-    """Re-audit reconciled groups from ALL_DATA + Recon History (Section 10)."""
-    all_data = loaded.get("ALL_DATA")
-    if not all_data:
-        runlog["backward"] = "not-run: ALL_DATA absent"
-        return []
-    groups = _assemble_reconciled_groups(all_data, account)
-    runlog["backward_group_count"] = len(groups)
-    recs = []
-    defect_counts = {}
-    for grp in groups:
-        defects, lag = _reverify_group(grp)
-        if not defects:
-            continue
-        for d in defects:
-            defect_counts[d] = defect_counts.get(d, 0) + 1
-        action, rerec = _recommend_fix(grp, defects, pool)
-        recs.append(UnwindRec(
-            recon_grp=grp["recon_grp"],
-            bsl_date=grp["bsl_date"],
-            bsl_line_info=grp["bsl_line_info"],
-            bsl_amount_cents=grp["bsl_amount_cents"],
-            reconciled_sts=[(e["id"], e["amount_cents"]) for e in grp["members"]],
-            defect_codes=defects,
-            signed_lag=lag,
-            rule_name=grp["rule_name"],
-            recommended_action=action,
-            recommended_rereconciliation=rerec,
-            explanation=_defect_explanation(grp, defects, lag),
-        ))
-    # Priority ordering (Section 10.4): severity, then auto-rec first.
-    recs.sort(key=lambda r: (min(DEFECT_SEVERITY[d][0] for d in r.defect_codes),
-                             0 if grp else 1, r.recon_grp))
-    runlog["backward"] = "ran"
-    runlog["backward_defect_counts"] = defect_counts
-    runlog["backward_recommendations"] = len(recs)
-    return recs
-
-
-def _assemble_reconciled_groups(all_data, account):
-    """Gather bank line(s), member receipts/STs, and the history row per
-    Recon Grp (Section 10.1).  Dedup members keeping the total."""
-    bsl_rows = all_data.get("bank_statement_lines", [])
-    misc_rows = all_data.get("misc_receipts", [])
-    ar_rows = all_data.get("ar_matched", [])
-    history = all_data.get("recon_history", {})
-
-    # index members by rec_grp
-    members_by_grp = {}
-    for src in (misc_rows, ar_rows):
-        for row in src:
-            grp = row.get("rec_grp")
-            if not grp:
-                continue
-            members_by_grp.setdefault(grp, []).append(row)
-
-    groups = []
-    bsl_by_grp = {}
-    for row in bsl_rows:
-        if _norm_header(row.get("rec_status")) != "REC":
-            continue
-        grp = row.get("rec_grp")
-        if not grp:
-            continue
-        bsl_by_grp.setdefault(grp, []).append(row)
-
-    for grp, bsl_lines in sorted(bsl_by_grp.items()):
-        raw_members = members_by_grp.get(grp, [])
-        members = _dedup_members_keep_total(raw_members)
-        # Deterministic representative — sort by (amount, date, line key) so
-        # the output never depends on ALL_DATA sheet row order — and the
-        # group's TOTAL bank amount: a Recon Grp may span several bank lines,
-        # and members must balance against the whole group, not its first row.
-        bsl_lines = sorted(bsl_lines, key=lambda r: (
-            r.get("amount_cents") or 0,
-            r.get("date").toordinal() if r.get("date") else 0,
-            str(r.get("line_key") or "")))
-        b0 = bsl_lines[0]
-        grp_amount = sum(r.get("amount_cents") or 0 for r in bsl_lines)
-        hist = history.get(grp, {})
-        groups.append({
-            "recon_grp": grp,
-            "bsl_date": b0.get("date"),
-            "bsl_line_info": b0.get("line_info", ""),
-            "bsl_amount_cents": grp_amount,
-            "bsl_reference": b0.get("reference", ""),
-            "bsl_lane": b0.get("lane", LANE_GENERAL),
-            "members": members,
-            "rule_name": hist.get("rule_name", ""),
-            "auto_flag": hist.get("auto_flag", ""),
-            "match_type": hist.get("match_type", ""),
-            "ref_match_claim": hist.get("ref_match", ""),
-            "amount_match_claim": hist.get("amount_match", ""),
-            "date_match_claim": hist.get("date_match", ""),
-            "type_match_claim": hist.get("type_match", ""),
-            "account": account,
-        })
-    return groups
-
-
-def _dedup_members_keep_total(rows):
-    """Dedup by receipt/transaction number keeping the total (largest magnitude)."""
-    groups = {}
-    for r in rows:
-        key = r.get("id")
-        groups.setdefault(key, []).append(r)
-    out = []
-    for key, members in groups.items():
-        keep = max(members, key=lambda m: abs(m.get("amount_cents") or 0))
-        out.append(keep)
-    return out
-
-
-def _reverify_group(grp):
-    """Run all Section 10.2 checks; return (defect_codes, worst_signed_lag)."""
-    defects = []
-    members = grp["members"]
-    bsl_amt = grp["bsl_amount_cents"]
-    bsl_date = grp["bsl_date"]
-    lane = grp.get("bsl_lane", LANE_GENERAL)
-
-    # 1. AMOUNT_INTEGRITY
-    total = sum((m.get("amount_cents") or 0) for m in members)
-    if bsl_amt is not None and total != bsl_amt:
-        defects.append(DEFECT_AMOUNT)
-
-    # 2. REFERENCE_INTEGRITY (only when history claims Ref Match = Y)
-    if _is_yes(grp.get("ref_match_claim")):
-        ref = grp.get("bsl_reference", "")
-        if members and not any(reference_equal(ref, m.get("reference", "")) or
-                               reference_equal(ref, m.get("id", "")) for m in members):
-            defects.append(DEFECT_REFERENCE)
-
-    # 3. DATE_PLAUSIBILITY
-    worst_lag = None
-    for m in members:
-        lag = signed_lag(bsl_date, m.get("date"))
-        if lag is None:
-            continue
-        if worst_lag is None or abs(lag) > abs(worst_lag):
-            worst_lag = lag
-        if lane == LANE_STATE and lag <= 0:
-            continue  # State entry-lag exempt when BSL precedes ST
-        if lag >= 31 or (lane != LANE_STATE and lag <= -31):
-            if DEFECT_DATE not in defects:
-                defects.append(DEFECT_DATE)
-
-    # 4. ONE_TO_MANY_INTEGRITY
-    if len(members) > 1:
-        keys = [(_group_key(m)) for m in members]
-        # every member must share the grouping key (reference / deposit / SPN root)
-        ref = grp.get("bsl_reference", "")
-        belongs = []
-        for m in members:
-            ok = reference_equal(ref, m.get("reference", "")) or \
-                reference_equal(ref, m.get("id", "")) or \
-                bool(spn_of(m.get("id", "")))
-            belongs.append(ok)
-        if not all(belongs) and any(belongs):
-            defects.append(DEFECT_ONE_TO_MANY)
-
-    # 5. SOURCE_LEGALITY
-    for m in members:
-        src = _norm_header(m.get("source", ""))
-        if src in JOURNAL_SOURCES:
-            defects.append(DEFECT_SOURCE)
-            break
-        if m.get("is_mid") and lane != LANE_MERCHANT:
-            defects.append(DEFECT_SOURCE)
-            break
-
-    # 6. DUAL_FIRE — one receipt id feeding two open external STs that cleared.
-    id_counts = {}
-    for m in members:
-        rid = m.get("receipt_id") or m.get("id")
-        id_counts[rid] = id_counts.get(rid, 0) + 1
-    if any(c >= 2 for c in id_counts.values()):
-        defects.append(DEFECT_DUAL_FIRE)
-
-    # 7. STATUS_COHERENCE — VOID/Reversed inside a live group.
-    for m in members:
-        st = _norm_header(m.get("status", ""))
-        if st in {"VOID", "REVERSED"}:
-            defects.append(DEFECT_STATUS)
-            break
-
-    # 8. CROSS_ACCOUNT_FLAG (advisory only)
-    for m in members:
-        macc = m.get("account")
-        if macc and macc != grp.get("account"):
-            defects.append(DEFECT_CROSS_ACCOUNT)
-            break
-
-    return list(dict.fromkeys(defects)), worst_lag
-
-
-def _group_key(m):
-    return znorm(m.get("reference", "")) or spn_of(m.get("id", "")) or N(m.get("deposit_id"))
-
-
-def _is_yes(v):
-    return _norm_header(v) in {"Y", "YES", "TRUE", "1"}
-
-
-def _recommend_fix(grp, defects, pool):
-    """Section 10.3: run forward over the group's bank line to find the correct
-    group; attach as recommended re-reconciliation, else recommend unwind."""
-    # Build a synthetic BSL for the group's bank line.
-    bsl = make_bsl(
-        line_key=grp["recon_grp"],
-        dt=grp["bsl_date"],
-        amount_cents=grp["bsl_amount_cents"],
-        reference=grp.get("bsl_reference", ""),
-        account_servicer_reference=grp.get("bsl_reference", ""),
-        additional_info=grp.get("bsl_line_info", ""),
-        transaction_type="",
-        transaction_code="",
-    )
-    ledger = Ledger()
-    grp_ref = grp.get("bsl_reference", "")
-    cands = []
-    for e in pool:
-        if not e.available or e.source in JOURNAL_SOURCES:
-            continue
-        if reference_equal(grp_ref, e.reference) or reference_equal(grp_ref, e.id):
-            cands.append(e)
-    total = sum(e.amount_cents for e in cands)
-    if cands and total == grp["bsl_amount_cents"]:
-        rerec = "Re-reconcile to: " + ", ".join(sorted(e.id for e in cands))
-        return "RE-RECONCILE", rerec
-    return "UNWIND-TO-OPEN", "Return bank line to the forward queue."
-
-
-def _defect_explanation(grp, defects, lag):
-    parts = []
-    total = sum((m.get("amount_cents") or 0) for m in grp["members"])
-    if DEFECT_AMOUNT in defects:
-        parts.append(f"Members sum {_usd(total)} != BSL {_usd(grp['bsl_amount_cents'])}.")
-    if DEFECT_REFERENCE in defects:
-        parts.append("History claims Ref Match=Y but no member ties the BSL reference.")
-    if DEFECT_ONE_TO_MANY in defects:
-        parts.append("A member does not share the grouping key (mis-pulled receipt).")
-    if DEFECT_SOURCE in defects:
-        parts.append("Illegal source: journal or card-batch reconciled to this line.")
-    if DEFECT_DATE in defects:
-        parts.append(f"Implausible date lag ({lag}d).")
-    if DEFECT_DUAL_FIRE in defects:
-        parts.append("One receipt id feeds two cleared STs.")
-    if DEFECT_STATUS in defects:
-        parts.append("VOID/Reversed member inside a live group.")
-    if DEFECT_CROSS_ACCOUNT in defects:
-        parts.append("Advisory: a member's native account differs from the group.")
-    return " ".join(parts)
-
-
-# ======================================================================
-# Section 13 / 10.6 — Workbook writers
+# Section 13 — Workbook writer (the §10.6 unwind writer is Unreconcile2's)
 # ======================================================================
 
 FONT_NAME = "Carlito"
 FONT_SIZE = 11
 NAVY = "FF1F4E78"
-DARK_RED = "FF7A1F1F"
 WHITE = "FFFFFFFF"
 
 
@@ -2144,109 +1809,9 @@ def write_reconciliation_workbook(path, account, placements):
     return {"matches": len(matches), "candidates": len(candidates), "reviews": len(reviews)}
 
 
-UNWIND_COLUMNS = ["Recon Grp", "BSL Date", "BSL Line Info", "BSL Amount",
-                  "Reconciled ST(s)", "Defect Code(s)", "Signed Lag",
-                  "Rule Name (as reconciled)", "Recommended Action",
-                  "Recommended Re-Reconciliation", "Explanation"]
-
-
-def write_unwind_workbook(path, account, recs):
-    """Unwind Recommendations (Section 10.6)."""
-    title = f"UT Un-Reconciliation (Forensic) — {account}"
-    rows = []
-    for r in recs:
-        sts = _join_multi([f"{i} ({_usd(a)})" for i, a in r.reconciled_sts]) if r.reconciled_sts else ""
-        rows.append([
-            r.recon_grp,
-            _fmt_date(r.bsl_date),
-            r.bsl_line_info,
-            _usd(r.bsl_amount_cents),
-            sts,
-            ", ".join(r.defect_codes),
-            "" if r.signed_lag is None else str(r.signed_lag),
-            r.rule_name,
-            r.recommended_action,
-            r.recommended_rereconciliation,
-            r.explanation,
-        ])
-    _write_workbook(path, title, [("Unwind Recommendations", UNWIND_COLUMNS, rows)], DARK_RED)
-    return {"recommendations": len(recs)}
-
-
 # ======================================================================
-# ALL_DATA loader (multi-sheet, Section 4.2)
+# MID master loader (Section 4.2)
 # ======================================================================
-
-def load_all_data(routed_file: RoutedFile, account):
-    """Load the ALL_DATA lifecycle workbook into a dict of normalized rows."""
-    path = routed_file.path
-    out = {"bank_statement_lines": [], "misc_receipts": [], "ar_matched": [],
-           "recon_history": {}}
-
-    rows, m, hi = read_named_sheet(path, "Bank Statement Lines", BANK_STATEMENT_LINES_ROLES)
-    if rows is not None:
-        for r in rows[hi + 1:]:
-            amt = cents(_cell(r, m.get("amount")))
-            if amt is None:
-                continue
-            ref = build_recon_reference(_cell(r, m.get("reference")),
-                                        _cell(r, m.get("reference")), "")
-            info = N(_cell(r, m.get("additional_info")))
-            lane = classify_lane(BSL(
-                line_key="", date=None, amount_cents=amt, recon_reference=ref,
-                reference_raw=ref, additional_info=info, transaction_type="",
-                transaction_code="", mid=_mid_from_text(info)))
-            out["bank_statement_lines"].append({
-                "date": parse_date(_cell(r, m.get("date"))),
-                "amount_cents": amt,
-                "line_key": N(_cell(r, m.get("line_key"))),
-                "rec_status": N(_cell(r, m.get("rec_status"))),
-                "rec_grp": N(_cell(r, m.get("rec_grp"))),
-                "reference": ref,
-                "line_info": (N(_cell(r, m.get("line_key"))) + " " + info).strip()[:200],
-                "lane": lane,
-            })
-
-    rows, m, hi = read_named_sheet(path, "MISC Receipts", MISC_RECEIPTS_ROLES)
-    if rows is not None:
-        for r in rows[hi + 1:]:
-            amt = cents(_cell(r, m.get("rec_amnt")))
-            rid = N(_cell(r, m.get("rec_num")))
-            if amt is None or not rid:
-                continue
-            out["misc_receipts"].append({
-                "id": rid,
-                "amount_cents": amt,
-                "reference": N(_cell(r, m.get("rec_ref"))),
-                "rec_grp": N(_cell(r, m.get("rec_grp"))),
-                "deposit_id": N(_cell(r, m.get("dep_num"))),
-                "status": N(_cell(r, m.get("rec_status"))),
-                "date": None,
-                "source": "EXT",
-                "is_mid": is_mid(_cell(r, m.get("rec_ref"))),
-                "account": account,
-            })
-
-    # Recon History — the ground truth (Section 4.2 / 5.3).
-    rows, m, hi = read_named_sheet(path, "Recon History", RECON_HISTORY_ROLES)
-    if rows is not None:
-        for r in rows[hi + 1:]:
-            grp = N(_cell(r, m.get("recon_grp")))
-            if not grp:
-                continue
-            out["recon_history"][grp] = {
-                "amount_cents": cents(_cell(r, m.get("amount"))),
-                "auto_flag": N(_cell(r, m.get("auto_flag"))),
-                "rule_name": N(_cell(r, m.get("rule_name"))),
-                "match_type": N(_cell(r, m.get("match_type"))),
-                "type_match": N(_cell(r, m.get("type_match"))),
-                "amount_match": N(_cell(r, m.get("amount_match"))),
-                "date_match": N(_cell(r, m.get("date_match"))),
-                "ref_match": N(_cell(r, m.get("ref_match"))),
-            }
-    return out
-
-
 def load_mid_master(routed_file: RoutedFile):
     """Scan every sheet for MID tokens; build MID -> account-string map."""
     from openpyxl import load_workbook
@@ -2303,9 +1868,9 @@ def load_and_bind(by_role, runlog):
     }
     bound_report = {}
     for role, files in by_role.items():
-        rf = _pick_newest(files, role)  # newest YYYYMMDD stamp wins
         if role == "ALL_DATA":
-            continue  # loaded separately (multi-sheet)
+            continue  # recognized but never loaded (Unreconcile2 owns it)
+        rf = _pick_newest(files, role)  # newest YYYYMMDD stamp wins
         if role == "MID_MASTER":
             loaded["MID_MASTER"] = load_mid_master(rf)
             continue
@@ -2337,7 +1902,7 @@ def _pick_newest(files, role):
 
 
 def build_bsls(loaded, by_role, account):
-    """Build the open BSL list from the BSL file (or ALL_DATA UNR lines)."""
+    """Build the open BSL list from the BSL file."""
     bsls = []
     if "BSL" in loaded:
         b = loaded["BSL"]
@@ -2376,7 +1941,7 @@ def build_bsls(loaded, by_role, account):
 
 def run(account_input_dir, output_dir="./outputs", present=True):
     """Single entry point (Section 15.1): route -> bind -> validate -> build
-    pool -> forward P0-P10 -> backward -> write workbooks -> audit -> present."""
+    pool -> forward P0-P10 -> write workbook -> audit -> present."""
     runlog = {"input_dir": account_input_dir, "stages": []}
 
     # P0 route + bind + validate
@@ -2387,14 +1952,15 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     runlog["account"] = account
     runlog["stages"].append("route")
 
+    # ALL_DATA feeds nothing forward — it is the backward engine's fuel,
+    # which now lives in the Unreconcile2 project.  Recognized, noted, and
+    # deliberately not loaded (this is the forward engine's speed win).
+    if "ALL_DATA" in by_role:
+        runlog["all_data"] = ("present: not loaded (forward-only engine; "
+                              "run Unreconcile2 for the backward re-audit)")
+
     loaded = load_and_bind(by_role, runlog)
     runlog["stages"].append("bind")
-
-    # ALL_DATA (multi-sheet) loaded separately for the backward engine.
-    all_data = None
-    if "ALL_DATA" in by_role:
-        all_data = load_all_data(_pick_newest(by_role["ALL_DATA"], "ALL_DATA"), account)
-        loaded["ALL_DATA"] = all_data
 
     pool = build_pool(loaded, account, runlog)
     runlog["stages"].append("pool")
@@ -2407,20 +1973,12 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     placements = forward_reconcile(bsls, pool, loaded, account, runlog)
     runlog["stages"].append("forward")
 
-    # Backward 10.x
-    recs = backward_reconcile(loaded, account, pool, runlog)
-    runlog["stages"].append("backward")
-
-    # Writers
+    # Writer
     os.makedirs(output_dir, exist_ok=True)
     recon_path = os.path.join(output_dir, f"{account}_reconciliation.xlsx")
-    unwind_path = os.path.join(output_dir, f"{account}_unwind.xlsx")
     recon_summary = write_reconciliation_workbook(recon_path, account, placements)
-    unwind_summary = write_unwind_workbook(unwind_path, account, recs)
     runlog["recon_workbook"] = recon_path
-    runlog["unwind_workbook"] = unwind_path
     runlog["recon_summary"] = recon_summary
-    runlog["unwind_summary"] = unwind_summary
     runlog["stages"].append("write")
 
     # Conservation ledger (Section 15.3): input == Matches + Candidates + Review.
@@ -2489,7 +2047,6 @@ def main(argv=None):
         "account": runlog.get("account"),
         "bsl_count": runlog.get("bsl_count"),
         "recon_summary": runlog.get("recon_summary"),
-        "unwind_summary": runlog.get("unwind_summary"),
         "audit": (runlog.get("audit") or {}).get("status"),
         "runlog": runlog.get("runlog_path"),
     }, indent=2))

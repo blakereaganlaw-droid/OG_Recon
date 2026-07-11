@@ -4,14 +4,15 @@ Auto-loaded every Claude Code session. Read before touching the engine.
 
 ## What this is
 
-A deterministic, "on-rails" reconciliation engine for University of Tennessee
-(UT) bank accounts in Oracle Cash Management (DASH). Two engines in one program:
+A deterministic, "on-rails" **forward-only** reconciliation engine for
+University of Tennessee (UT) bank accounts in Oracle Cash Management (DASH):
+match open bank statement lines (BSL) to open system transactions (ST) →
+**Match / Candidate / Review**. The pool draws on every available source —
+ST, Receivables receipts, and the MET/ORT chain.
 
-- **Forward** (`recon_engine.forward_reconcile`, passes P0–P10): match open bank
-  statement lines (BSL) to open system transactions (ST) → **Match / Candidate /
-  Review**.
-- **Backward** (`recon_engine.backward_reconcile`): re-audit already-reconciled
-  groups against doctrine → recommend **unwinds**.
+The **backward** engine (re-audit reconciled groups → recommend unwinds) was
+split into the separate **Unreconcile2** repo for speed. An `*All_Data*`
+workbook is recognized here but never loaded — do not reintroduce it.
 
 The binding behavioral contract is **`UT_Recon_Engine_BUILD_SPEC.md`**. When code
 and spec disagree, the spec wins — fix the code.
@@ -20,7 +21,7 @@ and spec disagree, the spec wins — fix the code.
 
 | File | Role |
 |---|---|
-| `recon_engine.py` | Self-contained engine + CLI. Primitives (§7), router (§4), binder (§5), pool (§8), forward P0–P10 (§9), backward (§10), writers (§13/§10.6), `run()` + JSON run log (§15). |
+| `recon_engine.py` | Self-contained forward engine + CLI. Primitives (§7), router (§4), binder (§5), pool (§8), forward P0–P10 (§9), writer (§13), `run()` + JSON run log (§15). Backward (§10) lives in Unreconcile2. |
 | `recon_audit.py` | Independent audit (§14). **Imports nothing** from the engine — keep it that way. Re-parses raw sources with its own binder; enforces C1–C10; gates delivery. |
 | `run_recon.py` | Per-run (per-upload) wrapper. Stages one upload into an immutable `runs/<run_id>/` folder (strips 8-hex upload prefixes; keeps plausible `YYYYMMDD` date prefixes), pre-flights routing (fails loud on no-BSL / any mixed-account token / case-insensitive staged-name collisions, and removes the failed folder so the run-id stays free), writes a SHA-256 provenance `manifest.json`, then calls `recon_engine.run`. Exit 0 = audit PASS; 2 = audit FAIL (outputs quarantined — written for forensics, not approved for delivery); 1 = unusable upload. |
 | `test_recon.py` | Unit + synthetic end-to-end tests (engine and per-run wrapper). |
@@ -31,7 +32,7 @@ and spec disagree, the spec wins — fix the code.
 ```bash
 python3 run_recon.py <upload_dir_or_files>          # one upload = one run folder
 python3 recon_engine.py <input_dir> -o ./outputs    # direct engine invocation
-python3 -m unittest test_recon -v                   # 48 tests
+python3 -m unittest test_recon -v                   # 47 tests
 ```
 
 Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
@@ -76,9 +77,9 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   `TestColumnRobustness`.
 - Output cells starting with `=` get a leading space (no formula injection);
   workbooks are **static values only**, zero formula cells.
-- Output format is locked by §13: Carlito 11pt, navy `FF1F4E78` header (dark-red
-  `FF7A1F1F` for the forensic/unwind book), freeze `A4`, 9 fixed columns, no
-  provenance rows. The audit's C9/C10 will fail you if you drift.
+- Output format is locked by §13: Carlito 11pt, navy `FF1F4E78` header,
+  freeze `A4`, 9 fixed columns, no provenance rows. The audit's C9/C10 will
+  fail you if you drift. (The dark-red forensic/unwind book is Unreconcile2's.)
 
 ## Working rules
 

@@ -1,17 +1,21 @@
 # OG_Recon — UT Cash Management Reconciliation Engine
 
-A production-grade, deterministic reconciliation engine for University of
-Tennessee (UT) bank accounts in Oracle Cash Management (DASH). It runs two
-engines over one account's export files:
+A production-grade, deterministic **forward matching engine** for University
+of Tennessee (UT) bank accounts in Oracle Cash Management (DASH): it matches
+open bank statement lines (BSL) to open system transactions (ST), classifying
+each line **Match / Candidate / Review**. Every available source feeds the
+candidate pool — ST exports, Receivables receipts, and the MET/ORT chain
+(the `d:`/`r:` deposit-receipt bridge).
 
-- **Forward reconciliation** — matches open bank statement lines (BSL) to open
-  system transactions (ST), classifying each line **Match / Candidate /
-  Review**.
-- **Backward un-reconciliation** — re-audits already-reconciled groups against
-  doctrine and recommends **unwinding** the unsound ones.
+The **backward un-reconciliation engine** (re-audit reconciled groups →
+recommend unwinds) lives in its own project,
+[Unreconcile2](https://github.com/blakereaganlaw-droid/Unreconcile2), so this
+engine stays fast: an `*All_Data*` workbook is recognized but never loaded
+here (~4x faster on history-heavy accounts).
 
 The full behavioral contract is the build spec
-(`UT_Recon_Engine_BUILD_SPEC.md`); this codebase implements it.
+(`UT_Recon_Engine_BUILD_SPEC.md`); this codebase implements its forward half
+(§10, the backward engine, is implemented by Unreconcile2).
 
 ## Design temperament (on rails)
 
@@ -30,7 +34,7 @@ The full behavioral contract is the build spec
 
 | File | Purpose |
 |---|---|
-| `recon_engine.py` | Self-contained engine: primitives → router → binder → pool → forward P0–P10 → backward → workbook writers → `run()` orchestrator + JSON run log. |
+| `recon_engine.py` | Self-contained forward engine: primitives → router → binder → pool → forward P0–P10 → workbook writer → `run()` orchestrator + JSON run log. |
 | `recon_audit.py` | Independent audit (imports nothing from the engine; re-parses raw sources with its own binder and enforces C1–C10). |
 | `run_recon.py` | Per-run (per-upload) wrapper: stages one upload into an immutable run folder, pre-flights the routing, records a provenance manifest, then runs the engine + audit. |
 | `test_recon.py` | Unit tests for primitives, router, binder, pool dedup, the per-run wrapper, plus a synthetic end-to-end run gated by the audit. |
@@ -65,7 +69,7 @@ Each run produces `runs/<run_id>/` containing:
 - `manifest.json` — provenance: every file's origin, size, SHA-256, and router
   role; unrouted files and warnings; the SHA-256 of the engine/audit code and
   git commit that processed the run.
-- `outputs/` — the two workbooks and the JSON run log (below).
+- `outputs/` — the reconciliation workbook and the JSON run log (below).
 
 Pre-flight fails loud **before** the engine runs on an unusable upload: no
 spreadsheets, no BSL file, a mixed-account upload (any two files naming
@@ -86,11 +90,11 @@ Outputs written to `./outputs/`:
 
 - `<ACCOUNT>_reconciliation.xlsx` — tabs **Matches**, **Candidate Matches**,
   **Review Notes** (navy headers, Carlito 11pt, freeze A4, static values only).
-- `<ACCOUNT>_unwind.xlsx` — tab **Unwind Recommendations** (dark-red forensic
-  header).
 - `<ACCOUNT>_runlog.json` — files routed, roles/columns bound, pool sizes by
-  source and status, per-pass placements, backward defects by code, and the
-  audit result. This is the on-rails proof that no step was skipped.
+  source and status, per-pass placements, and the audit result. This is the
+  on-rails proof that no step was skipped.
+
+For the unwind/forensic workbook, run **Unreconcile2** on the same folder.
 
 The `run()` orchestrator gates delivery on the audit: if the independent audit
 does not pass, it raises and the workbooks are withheld (override for debugging
@@ -136,9 +140,8 @@ When layout genuinely cannot be resolved, the run fails loud, never guesses:
   `InvalidSourceData` (no rightmost-column-wins).
 
 Known audit-scope limitation: the audit re-parses the standalone BSL and MET
-sources; it does not yet independently re-parse `ALL_DATA` sheets or audit the
-unwind workbook (backward-engine inputs are validated by the engine's own
-binder and the unit tests instead).
+sources; other pool sources (ST, Receipts) are validated by the engine's own
+fail-loud binder and the unit tests rather than an independent re-parse.
 
 ## Tests
 
@@ -154,11 +157,12 @@ which are not committed here; drop them into an input folder and run the CLI.
 
 ## Scope status
 
-Every spec section is implemented: primitives (§7), router (§4), binder (§5),
-pool with keep-largest dedup (§8), forward passes P0–P10 (§9), backward engine
-with defect codes (§10), date doctrine (§11), workbook standard (§13),
-independent audit C1–C10 (§14), and the `run()` orchestrator with JSON run log
-(§15). Optional lanes (State/Edison, Merchant/MID, SPN, named-payer) activate
-when their source files are present and otherwise record a typed "not-run"
-reason in the run log, routing affected BSLs to Review — the pipeline never
-silently continues as if a stage succeeded.
+Every forward spec section is implemented: primitives (§7), router (§4),
+binder (§5), pool with keep-largest dedup (§8), forward passes P0–P10 (§9),
+date doctrine (§11), workbook standard (§13), independent audit C1–C10 (§14),
+and the `run()` orchestrator with JSON run log (§15). The backward engine
+(§10) is implemented by the separate Unreconcile2 project. The State/Edison lane activates when its Edison source files are present
+and otherwise records a typed "not-run" reason in the run log, routing
+affected BSLs to Review; the Merchant/MID, SPN, and named-payer lanes run
+over the always-loaded pool. The pipeline never silently continues as if a
+stage succeeded.

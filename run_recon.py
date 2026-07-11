@@ -23,11 +23,11 @@ this script:
      size, sha256, and router role of every file, plus the sha256 of the
      engine and audit code that will process them and the git commit if
      available.
-  5. RUNS the engine (`recon_engine.run`): route -> bind -> pool -> forward
-     P0-P10 -> backward -> write workbooks -> independent audit. Outputs land
+  5. RUNS the forward engine (`recon_engine.run`): route -> bind -> pool ->
+     forward P0-P10 -> write workbook -> independent audit. Outputs land
      in ``<runs-root>/<run-id>/outputs/``.
-  6. REPORTS a human-readable summary (account, placements, unwind
-     recommendations, audit status, output paths) and exits:
+  6. REPORTS a human-readable summary (account, placements, audit status,
+     output paths) and exits:
          0  engine ran and the independent audit PASSed
          2  engine ran but the audit FAILed — treat outputs/ as quarantined:
             the workbooks are on disk for forensics but are NOT approved
@@ -326,10 +326,8 @@ def perform_run(paths, runs_root="./runs", run_id=None, strip_prefix=True,
         "account": runlog.get("account"),
         "bsl_count": runlog.get("bsl_count"),
         "recon_summary": runlog.get("recon_summary"),
-        "unwind_summary": runlog.get("unwind_summary"),
         "audit": audit_status,
         "recon_workbook": runlog.get("recon_workbook"),
-        "unwind_workbook": runlog.get("unwind_workbook"),
         "runlog": os.path.join(output_dir, f"{runlog.get('account')}_runlog.json"),
     }
     return (2 if audit_failed else 0), report

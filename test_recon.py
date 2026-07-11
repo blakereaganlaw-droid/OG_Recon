@@ -3,8 +3,8 @@
 Unit tests for the reconciliation engine.
 
 Covers Section 7 primitives, Section 4 router, Section 5 binder, Section 8
-pool dedup, and an end-to-end synthetic run through the forward/backward
-pipeline + independent audit (Section 16 build order steps 1-8, validated on
+pool dedup, and an end-to-end synthetic run through the forward pipeline
++ independent audit (Section 16 build order steps 1-8, validated on
 a synthetic account since real UT source files are not present here).
 
 Run:  python3 -m unittest test_recon -v
@@ -324,29 +324,6 @@ class TestColumnRobustness(unittest.TestCase):
         with self.assertRaises(E.InvalidSourceData):
             E.run(self.b, self.ob, present=True)
 
-    def test_backward_group_row_order_invariant(self):
-        # A many-to-one Recon Grp (two REC bank lines, one receipt) must
-        # balance against the group TOTAL, in either sheet row order.
-        line1 = {"date": date(2024, 3, 1), "amount_cents": 40000, "line_key": "1",
-                 "rec_status": "REC", "rec_grp": "G1", "reference": "R100",
-                 "line_info": "1 dep", "lane": E.LANE_GENERAL}
-        line2 = {"date": date(2024, 3, 1), "amount_cents": 60000, "line_key": "2",
-                 "rec_status": "REC", "rec_grp": "G1", "reference": "R100",
-                 "line_info": "2 dep", "lane": E.LANE_GENERAL}
-        receipt = {"id": "R100", "amount_cents": 100000, "reference": "R100",
-                   "rec_grp": "G1", "deposit_id": "", "status": "REC",
-                   "date": date(2024, 3, 1), "source": "EXT", "is_mid": False,
-                   "account": "FHB_UTC"}
-        for order in ([line1, line2], [line2, line1]):
-            all_data = {"bank_statement_lines": list(order),
-                        "misc_receipts": [receipt], "ar_matched": [],
-                        "recon_history": {"G1": {"ref_match": "Y"}}}
-            groups = E._assemble_reconciled_groups(all_data, "FHB_UTC")
-            self.assertEqual(len(groups), 1)
-            self.assertEqual(groups[0]["bsl_amount_cents"], 100000)
-            self.assertEqual(groups[0]["bsl_line_info"], "1 dep")  # deterministic rep
-            defects, _lag = E._reverify_group(groups[0])
-            self.assertNotIn(E.DEFECT_AMOUNT, defects)
 
     def test_column_shuffle_end_to_end_identical(self):
         # The core guarantee: permuted columns + preamble rows + a decoy
@@ -383,6 +360,55 @@ class TestColumnRobustness(unittest.TestCase):
         ta, _ = A._read_output_tabs(base["recon_workbook"])
         tb, _ = A._read_output_tabs(mut["recon_workbook"])
         self.assertEqual(ta, tb)
+
+    def test_all_data_never_loaded_and_never_crashes(self):
+        # ALL_DATA is recognized but not loaded (forward-only engine): even
+        # two undated All_Data workbooks (a tie the newest-wins check would
+        # reject for loaded roles) must not abort the forward run.
+        _build_fhb_utc_inputs(self.a)
+        _write_xlsx(os.path.join(self.a, "FHB_UTC_All_Data.xlsx"),
+                    [("Recon History", [("junk",)])])
+        _write_xlsx(os.path.join(self.a, "FHB_UTC_v2_All_Data.xlsx"),
+                    [("Recon History", [("junk",)])])
+        runlog = E.run(self.a, self.oa, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS")
+        self.assertIn("not loaded", runlog["all_data"])
+        self.assertNotIn("ALL_DATA", runlog["roles_bound"])
+
+    def test_p5_state_date_rule(self):
+        # Spec §11 State carve-out: no ceiling when the BSL precedes the
+        # receipt; a receipt preceding the BSL by >20d demotes Match->Candidate.
+        loaded = {
+            "EDISON_PAY": {"rows": [("Reference", "Invoice Number", "Amount"),
+                                    ("EDIREF1", "777888", "100.00")],
+                           "map": {"reference": 0, "invoice_number": 1, "amount": 2},
+                           "header_index": 0},
+            "EDISON_INV": {"rows": [("Invoice Number", "Gross Amount"),
+                                    ("777888", "100.00")],
+                           "map": {"invoice_number": 0, "gross_amount": 1},
+                           "header_index": 0},
+        }
+        cases = [
+            (date(2024, 3, 5), E.MATCH),      # lag 5d: fresh tie
+            (date(2023, 12, 1), E.CANDIDATE),  # lag 100d: stale, demoted
+            (date(2024, 6, 1), E.MATCH),      # BSL precedes receipt: no ceiling
+        ]
+        for rec_date, expected in cases:
+            bsl = E.make_bsl(line_key="1", dt=date(2024, 3, 10),
+                             amount_cents=10000, reference="EDIREF1",
+                             account_servicer_reference="EDIREF1",
+                             additional_info="", transaction_type="",
+                             transaction_code="")
+            bsl.lane = E.LANE_STATE
+            receipt = E._mk_entry("REC777888", 10000, rec_date, "INV 777888",
+                                  "STATE", "AR", "UNR", True, "RECEIPTS")
+            placed = []
+            E._p5_state(lambda: [bsl],
+                        lambda b, tab, conf, entries, flags, expl, pn:
+                            placed.append(tab),
+                        [receipt], E.Ledger(), loaded, {})
+            self.assertEqual(placed, [expected],
+                             msg=f"receipt date {rec_date}")
 
     def test_audit_binds_same_columns_as_engine(self):
         # 'Post Date' header plus an inserted date-parseable decoy column:
@@ -456,7 +482,6 @@ class TestPerRunScript(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(
             run_dir, "input", "20240101_FHB_UTC_BSL_UNR.xlsx")))
         self.assertTrue(os.path.exists(report["recon_workbook"]))
-        self.assertTrue(os.path.exists(report["unwind_workbook"]))
         self.assertTrue(os.path.exists(report["runlog"]))
 
         import json
