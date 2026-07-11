@@ -327,7 +327,10 @@ ROUTER_TABLE = [
     # "_st" alone is too greedy: it matches All_Status / Rosetta_Stone /
     # _Statement.  Require a separator (or end) after the token.
     RouterRule("ST", [], [], ["_st_", "_st.", "account_st"], "first", False),
-    RouterRule("RECEIPTS", [], [], ["receivables_receipts", "receipts_all", "oracle_receipts"], "Export to Excel", False),
+    # 'ar_matched' excluded: "AR_Matched_Invoice_Receipts_AR_Deposit_Receipts_
+    # All_NonMisc" embeds 'receipts_all' but is the receipt-APPLICATION feed
+    # (ACRA/ABA), not a receipts export — it routes to AR_MATCHED below.
+    RouterRule("RECEIPTS", [], ["ar_matched"], ["receivables_receipts", "receipts_all", "oracle_receipts"], "Export to Excel", False),
     RouterRule("DEPT_INFO", [], [], ["ort_department", "department_info"], "Report", False),
     RouterRule("CHART_OF_ACCOUNTS", ["chart_of_accounts"], [], [], "Report", False),
     RouterRule("ORT_AR", ["ort", "_ar"], [], [], "Report", False),
@@ -836,6 +839,18 @@ DEPT_INFO_ROLES = {
 
 
 
+AR_MATCHED_ROLES = {
+    # ACRA/ABA receipt-application feed (AR_Matched_Invoice_Receipts...):
+    # per-receipt bank-deposit dates and application context.
+    "receipt_number": _rs(True, ["ACRA Receipt Number", "Receipt Number"], pred_reference),
+    "amount": _rs(True, ["ACRA Amount", "Amount"], pred_signed_amount),
+    "receipt_date": _rs(False, ["ACRA Receipt Date", "Receipt Date"], pred_date),
+    "deposit_date": _rs(False, ["ACRA Deposit Date", "Deposit Date"], pred_date),
+    "status": _rs(False, ["ACRA Status", "Status"], pred_any),
+    "bank_account_name": _rs(False, ["CBA Bank Account Name", "Bank Account Name"], pred_any),
+    "comments": _rs(False, ["ACRA Comments", "Comments"], pred_any),
+}
+
 APPLIED_UNAPPLIED_ROLES = {
     "trx_number": _rs(True, ["Trx Number", "Transaction Number"], pred_reference),
     "receipt_number": _rs(True, ["Receipt Number"], pred_reference),
@@ -1097,11 +1112,12 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 origin="ST",
                 transaction_type=_cell(r, m.get("transaction_type")),
             )
-            # The RECEIPTS export is authoritative for Receivables rows
-            # (Section 8.2) — but only when it exists; with no receipts file
-            # the ST export's AR rows are the only Receivables data we have.
-            if src_norm == "AR" and loaded.get("RECEIPTS"):
-                continue
+            # ST AR rows always enter the pool; when a RECEIPTS export also
+            # exists it MERGES onto them below (authoritative for lifecycle
+            # status) instead of replacing them — the ST export often carries
+            # reference/SPR/counterparty detail the receipts export lacks
+            # (real FHB Master case: a 7-receipt reference group whose ties
+            # lived only in the ST export).
             raw.append(e)
         deduped = _dedup_keep_largest(raw, lambda e: e.id)
         pool.extend(deduped)
@@ -1132,8 +1148,36 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
             )
             raw.append(e)
         deduped = _dedup_keep_largest(raw, lambda e: e.id)
-        pool.extend(deduped)
-        counts["RECEIPTS"] = len(deduped)
+        by_id = {}
+        for p in pool:
+            if p.source == "AR":
+                by_id.setdefault(p.base_id or p.id, []).append(p)
+        merged_rc = appended = 0
+        for e in deduped:
+            group = by_id.get(e.base_id or e.id) or []
+            # Merge by equal signed cents only — same label, different amount
+            # is a distinct receipt (mirrors the MET bridge rule).
+            equal = [p for p in group if p.amount_cents == e.amount_cents]
+            prev = equal[0] if len(equal) == 1 else None
+            if prev is not None:
+                prev.status = e.status or prev.status
+                prev.available = e.available
+                if not prev.counterparty and e.counterparty:
+                    prev.counterparty = e.counterparty
+                    prev.payer_tokens = prev.payer_tokens | payer_tokens(e.counterparty)
+                if (not prev.reference or prev.reference == prev.id) and \
+                        e.reference and e.reference != e.id:
+                    prev.reference = e.reference
+                    prev.znref = znorm(e.reference)
+                    prev.digits = digit_runs(e.reference)
+                if prev.date is None:
+                    prev.date = e.date
+                merged_rc += 1
+            else:
+                pool.append(e)
+                appended += 1
+        counts["RECEIPTS"] = appended
+        runlog["receipts_merged_to_st"] = merged_rc
 
     # 3. ORT receipts from MET for the ECT chain (index by d: and reference).
     met = loaded.get("MET")
@@ -1235,6 +1279,45 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
         runlog["met_bridged_to_st"] = merged
         if dropped_mismatch:
             runlog["met_bridge_amount_mismatch_dropped"] = dropped_mismatch
+
+    # AR receipt-application enrichment (AR_MATCHED): join by receipt number
+    # (scoped to this account's bank name) to backfill missing dates with the
+    # BANK deposit date and missing counterparties with the receipt comments.
+    am = loaded.get("AR_MATCHED")
+    if am:
+        rows, m, hi = am["rows"], am["map"], am["header_index"]
+        by_recno = {}
+        for r in rows[hi + 1:]:
+            bank = account_of_bank_name(_cell(r, m.get("bank_account_name")))
+            if bank and account and account != "UNKNOWN" and bank != account:
+                continue
+            recno = clean_ref(_cell(r, m.get("receipt_number")))
+            if not recno:
+                continue
+            by_recno.setdefault(recno, r)
+        enriched = 0
+        for e in pool:
+            if e.source != "AR":
+                continue
+            r = by_recno.get(clean_ref(e.base_id or e.id)) or by_recno.get(clean_ref(e.reference))
+            if r is None:
+                continue
+            touched = False
+            if e.date is None:
+                d = parse_date(_cell(r, m.get("deposit_date"))) or                     parse_date(_cell(r, m.get("receipt_date")))
+                if d is not None:
+                    e.date = d
+                    touched = True
+            if not e.counterparty:
+                c = N(_cell(r, m.get("comments")))
+                if c:
+                    e.counterparty = c
+                    e.payer_tokens = e.payer_tokens | payer_tokens(c)
+                    touched = True
+            if touched:
+                enriched += 1
+        runlog["ar_matched_enriched"] = enriched
+        runlog["ar_matched_rows"] = len(by_recno)
 
     runlog["pool_sizes"] = counts
     runlog["pool_total"] = len(pool)
@@ -2713,6 +2796,7 @@ def load_and_bind(by_role, runlog):
         "BAI2": BAI2_ROLES,
         "DEPT_INFO": DEPT_INFO_ROLES,
         "APPLIED_UNAPPLIED": APPLIED_UNAPPLIED_ROLES,
+        "AR_MATCHED": AR_MATCHED_ROLES,
         "ORT_AR": {"trx_id": _rs(False, ["Transaction Number"], pred_reference),
                    "parked_receipt_id": _rs(False, ["Parked Receipt ID"], pred_number),
                    "bank_name": _rs(False, ["BANK_NAME", "Bank Account Name"], pred_any)},
