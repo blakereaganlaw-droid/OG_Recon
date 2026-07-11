@@ -701,7 +701,7 @@ BSL_ROLES = {
 ST_ROLES = {
     "date": _rs(True, ["Transaction Date", "Date", "Accounting Date", "GL Date"], pred_date),
     "amount": _rs(True, ["Amount", "Transaction Amount", "Signed Amount"], pred_signed_amount),
-    "transaction_number": _rs(True, ["Transaction Number", "Trx Number", "Transaction Num", "Number"], pred_reference),
+    "transaction_number": _rs(True, ["Transaction Number", "Transaction", "Trx Number", "Transaction Num", "Number"], pred_reference),
     "source": _rs(True, ["Source", "Transaction Source", "Origin"], pred_any),
     "reference": _rs(False, ["Reference", "Recon Match Reference", "Match Reference"], pred_reference),
     "structured_payment_reference": _rs(False, ["Structured Payment Reference", "Strc Pay Ref"], pred_reference),
@@ -1442,6 +1442,19 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     def place(bsl, kind, confidence, entries, codes, explanation, pass_name):
         if bsl.line_key in placements:
             return  # a later pass never overrides an earlier one
+        # HARD GUARDRAIL (owner doctrine, 2026-07-11): a Match or Candidate
+        # without STs, or whose cited STs do not sum exactly to the BSL in
+        # signed cents, must not exist.  Engine invariant — fail loud.
+        if kind in (MATCH, CANDIDATE):
+            if not entries:
+                raise ReconError(
+                    f"engine bug: {kind} for BSL {bsl.line_key} cites no ST "
+                    f"({pass_name})")
+            cited = sum(e.amount_cents for e in entries)
+            if cited != bsl.amount_cents:
+                raise ReconError(
+                    f"engine bug: {kind} for BSL {bsl.line_key} cites STs "
+                    f"summing {cited} != BSL {bsl.amount_cents} ({pass_name})")
         ids = [e.id for e in entries]
         if kind == MATCH:
             ledger.consume_match(ids)
@@ -1472,9 +1485,6 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             if not reference_equal(bsl.recon_reference, e.reference) and \
                not reference_equal(bsl.recon_reference, e.id):
                 continue
-            lag = signed_lag(bsl.date, e.date)
-            if not date_ok_general(lag):
-                continue
             # Guardrails: journal never matches; MID-into-non-merchant
             # conflict; deterministic type gate (Credit Card ST never pairs
             # with a Check/Miscellaneous line).
@@ -1485,6 +1495,9 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             if not _type_gate_ok(bsl, e):
                 continue
             cands.append(e)
+        ties = cands
+        cands = [e for e in ties
+                 if date_ok_general(signed_lag(bsl.date, e.date))]
         if len(cands) == 1:
             e = cands[0]
             lag = signed_lag(bsl.date, e.date)
@@ -1492,9 +1505,23 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   [], f"Exact amount + reference tie (lag {lag}d, band {date_band(lag)}); source {e.source}.",
                   "P3_exact_1to1")
         elif len(cands) > 1:
-            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(cands),
+            ordered = _sorted(cands)
+            place(bsl, CANDIDATE, CONF_MEDIUM, [ordered[0]],
                   ["MULTIPLE_EQUAL_CANDIDATES"],
-                  f"{len(cands)} open entries match amount+reference; conservative Candidate.",
+                  f"{len(cands)} open entries match amount+reference; citing "
+                  f"{ordered[0].id}, alternates: "
+                  + ", ".join(e.id for e in ordered[1:5]) + ".",
+                  "P3_exact_1to1")
+        elif ties:
+            # Date supports a Match; its absence DEMOTES an exact
+            # amount+reference tie to Candidate — never destroys it
+            # (owner doctrine: never lose an exact BSL<->ST pairing).
+            e = _sorted(ties)[0]
+            lag = signed_lag(bsl.date, e.date)
+            place(bsl, CANDIDATE, CONF_MEDIUM, [e],
+                  ["DATE_CONFLICT"],
+                  f"Exact amount + reference tie to {e.id} but date is out "
+                  f"of band (lag {lag}d, band {date_band(lag)}).",
                   "P3_exact_1to1")
 
     # ---- P4 1:M ECT / ORT reference group (the workhorse) -----------
@@ -1506,6 +1533,14 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             continue
         total = sum(e.amount_cents for e in group)
         plausible = any(date_ok_general(signed_lag(bsl.date, e.date)) for e in group)
+        if total == bsl.amount_cents and not plausible and not closed_members \
+                and not competing:
+            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                  ["DATE_CONFLICT"],
+                  f"1:M reference group of {len(group)} receipt(s) sums to BSL "
+                  "but no member date is in band (demoted, never dropped).",
+                  "P4_ref_group")
+            continue
         if total == bsl.amount_cents and plausible:
             if closed_members:
                 place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
@@ -1578,9 +1613,24 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 closed = [e for e in gated if not e.available]
                 if closed:
                     split_groups.append((dep, gated, closed))
-        # Date plausibility: at least one member inside the +-15 window.
-        exact_open = [(d, g) for d, g in exact_open
-                      if any(date_ok_general(signed_lag(bsl.date, e.date)) for e in g)]
+        # Date plausibility: at least one member inside the +-15 window
+        # qualifies for Match; a corroborated exact sum with every member
+        # out of window DEMOTES to Candidate (never dropped).
+        dated = [(d, g) for d, g in exact_open
+                 if any(date_ok_general(signed_lag(bsl.date, e.date)) for e in g)]
+        if not dated and exact_open:
+            corro = [(d, g) for d, g in exact_open if _deposit_corroboration(bsl, g)]
+            if corro:
+                dep, group = sorted(corro)[0]
+                why = _deposit_corroboration(bsl, group)
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                      ["DATE_CONFLICT"],
+                      f"ORT deposit d:{dep} sums to BSL with {why} but no "
+                      "member date is in band"
+                      + (f"; {len(corro)} such deposit(s)." if len(corro) > 1 else "."),
+                      "P4_deposit_group")
+                continue
+        exact_open = dated
         if len(exact_open) == 1:
             dep, group = exact_open[0]
             why = _deposit_corroboration(bsl, group)
@@ -1641,9 +1691,13 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   [], "Negative BSL matched to single reference-tied open Payables ST.",
                   "P9_payables")
         elif cands:
-            place(bsl, CANDIDATE, CONF_LOW, _sorted(cands),
+            ordered = _sorted(cands)
+            place(bsl, CANDIDATE, CONF_LOW, [ordered[0]],
                   ["MISSING_REFERENCE"],
-                  "Payables amount match without a clean reference tie.",
+                  "Payables amount match without a clean reference tie; citing "
+                  f"{ordered[0].id}"
+                  + (", alternates: " + ", ".join(e.id for e in ordered[1:4])
+                     if len(ordered) > 1 else "") + ".",
                   "P9_payables")
 
     # ---- P10 Residual -> Review -------------------------------------
@@ -1902,9 +1956,23 @@ def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account=None):
                   "Stale (>30d) same-MID group; likely auto-rec artifact."
                   + _mid_note(bsl, mid_dir, account), "P6_merchant")
         elif group:
-            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
-                  ["GROUPING_CONFLICT"],
-                  "Same-MID receipts present but window/sum ambiguous.", "P6_merchant")
+            whole = sum(e.amount_cents for e in group)
+            singles = [e for e in group if e.amount_cents == bsl.amount_cents]
+            if whole == bsl.amount_cents:
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                      ["GROUPING_CONFLICT"],
+                      "Same-MID receipts sum to settlement but not inside the 1-4d window.",
+                      "P6_merchant")
+            elif singles:
+                best = _sorted(singles)[0]
+                place(bsl, CANDIDATE, CONF_MEDIUM, [best],
+                      ["GROUPING_CONFLICT"],
+                      f"Same-MID receipt {best.id} equals the settlement out of window; "
+                      f"{len(group)} same-MID receipt(s) present.", "P6_merchant")
+            else:
+                place(bsl, REVIEW, CONF_LOW, [], ["GROUPING_CONFLICT"],
+                      f"Same-MID receipts present ({len(group)}) but no subset sums "
+                      "to the settlement.", "P6_merchant")
         # else: no card receipt -> defer to P7/P10.
     runlog["p6_merchant"] = "ran"
 
