@@ -1512,16 +1512,23 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   f"{ordered[0].id}, alternates: "
                   + ", ".join(e.id for e in ordered[1:5]) + ".",
                   "P3_exact_1to1")
-        elif ties:
-            # Date supports a Match; its absence DEMOTES an exact
-            # amount+reference tie to Candidate — never destroys it
-            # (owner doctrine: never lose an exact BSL<->ST pairing).
-            e = _sorted(ties)[0]
+        elif len(ties) == 1:
+            # Owner doctrine (2026-07-11): a UNIQUE exact amount+reference
+            # tie is a Match regardless of date — the lag is disclosed, the
+            # confidence lowered, never the pairing destroyed.
+            e = ties[0]
             lag = signed_lag(bsl.date, e.date)
-            place(bsl, CANDIDATE, CONF_MEDIUM, [e],
-                  ["DATE_CONFLICT"],
-                  f"Exact amount + reference tie to {e.id} but date is out "
-                  f"of band (lag {lag}d, band {date_band(lag)}).",
+            place(bsl, MATCH, CONF_MEDIUM, [e],
+                  [], f"Exact amount + reference tie; date out of band "
+                  f"(lag {lag}d, band {date_band(lag)}); source {e.source}.",
+                  "P3_exact_1to1")
+        elif ties:
+            ordered = _sorted(ties)
+            place(bsl, CANDIDATE, CONF_MEDIUM, [ordered[0]],
+                  ["MULTIPLE_EQUAL_CANDIDATES", "DATE_CONFLICT"],
+                  f"{len(ties)} out-of-band amount+reference ties; citing "
+                  f"{ordered[0].id}, alternates: "
+                  + ", ".join(e.id for e in ordered[1:5]) + ".",
                   "P3_exact_1to1")
 
     # ---- P4 1:M ECT / ORT reference group (the workhorse) -----------
@@ -1535,10 +1542,10 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         plausible = any(date_ok_general(signed_lag(bsl.date, e.date)) for e in group)
         if total == bsl.amount_cents and not plausible and not closed_members \
                 and not competing:
-            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
-                  ["DATE_CONFLICT"],
-                  f"1:M reference group of {len(group)} receipt(s) sums to BSL "
-                  "but no member date is in band (demoted, never dropped).",
+            place(bsl, MATCH, CONF_MEDIUM, _sorted(group),
+                  [],
+                  f"1:M reference group of {len(group)} receipt(s) sums to BSL; "
+                  "reference tie holds; no member date in band (lag disclosed).",
                   "P4_ref_group")
             continue
         if total == bsl.amount_cents and plausible:
@@ -1620,14 +1627,21 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                  if any(date_ok_general(signed_lag(bsl.date, e.date)) for e in g)]
         if not dated and exact_open:
             corro = [(d, g) for d, g in exact_open if _deposit_corroboration(bsl, g)]
+            if len(corro) == 1:
+                dep, group = corro[0]
+                why = _deposit_corroboration(bsl, group)
+                place(bsl, MATCH, CONF_MEDIUM, _sorted(group), [],
+                      f"ORT deposit d:{dep} — {len(group)} open receipt(s) "
+                      f"sum to BSL; {why}; no member date in band (lag disclosed).",
+                      "P4_deposit_group")
+                continue
             if corro:
                 dep, group = sorted(corro)[0]
                 why = _deposit_corroboration(bsl, group)
                 place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
-                      ["DATE_CONFLICT"],
-                      f"ORT deposit d:{dep} sums to BSL with {why} but no "
-                      "member date is in band"
-                      + (f"; {len(corro)} such deposit(s)." if len(corro) > 1 else "."),
+                      ["DATE_CONFLICT", "MULTIPLE_EQUAL_CANDIDATES"],
+                      f"{len(corro)} corroborated out-of-band deposits sum to "
+                      f"BSL; citing d:{dep} ({why}).",
                       "P4_deposit_group")
                 continue
             # Owner call (2026-07-11): stale amount-only deposit sums surface

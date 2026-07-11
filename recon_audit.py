@@ -457,27 +457,32 @@ def audit(input_dir, recon_path, account):
             failures.append(f"C7: MID guardrail suspected on non-merchant Match: {r[:2]}")
     checks["C7"] = "PASS" if c7_ok else "FAIL"
 
-    # C8 date ceiling with State carve-out — fail a State Match whose cited ST
-    #    precedes the BSL by >20 days; no ceiling when BSL precedes ST.
+    # C8 date ceiling with the State carve-out — owner doctrine 2026-07-11:
+    #    a non-State Match outside the ±15-day band is permitted ONLY when
+    #    the row's explanation discloses the lag ("out of band"/"lag
+    #    disclosed"); an undisclosed stale Match still FAILS.  A State Match
+    #    whose cited ST precedes the BSL by >20 days keeps failing; no
+    #    ceiling when the BSL precedes the ST.
     c8_ok = True
     for r in match_rows:
         bdt = _parse_date(r[0])
         info = _N(r[1]).upper()
+        expl = _N(r[8]).lower()
+        disclosed = ("out of band" in expl) or ("lag disclosed" in expl)
         is_state = "STATE-TN" in info or "STATE OF TENN" in info
         st_dates = [_parse_date(x) for x in _split_multi(r[3])]
         st_dates = [d for d in st_dates if d]
         if bdt is None or not st_dates:
             continue
-        for sdt in st_dates:
-            lag = (bdt - sdt).days
-            if is_state:
-                if lag > 20:  # ST precedes BSL by >20d
-                    c8_ok = False
-                    failures.append(f"C8: STATE Match ST precedes BSL by {lag}d (>20): {r[:2]}")
-            else:
-                if abs(lag) > 15:
-                    c8_ok = False
-                    failures.append(f"C8: non-STATE Match lag {lag}d exceeds ±15: {r[:2]}")
+        lags = [(bdt - d).days for d in st_dates]
+        if is_state:
+            if all(lag > 20 for lag in lags):
+                c8_ok = False
+                failures.append(f"C8: State Match with all lags > 20d: {r[:3]}")
+        else:
+            if all(abs(lag) > 15 for lag in lags) and not disclosed:
+                c8_ok = False
+                failures.append(f"C8: undisclosed out-of-band Match: {r[:3]}")
     checks["C8"] = "PASS" if c8_ok else "FAIL"
 
     # C9 formatting — Carlito, navy header fill, freeze A4, zero formulas, structure.
