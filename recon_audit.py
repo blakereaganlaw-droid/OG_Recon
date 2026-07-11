@@ -132,12 +132,26 @@ def _find_col(rows, header_index, aliases, predicate, sample=50):
     header = rows[header_index]
     ncols = max(len(r) for r in rows)
     data = rows[header_index + 1: header_index + 1 + sample]
+    # Content sampling spans the whole sheet (first `sample` NON-BLANK values
+    # per column), mirroring the engine: sparse columns must be scored on the
+    # values they actually carry.
+    col_samples = {c: [] for c in range(ncols)}
+    unfilled = set(col_samples)
+    for r in rows[header_index + 1:]:
+        if not unfilled:
+            break
+        for c in list(unfilled):
+            if c < len(r) and not _blankish(r[c]):
+                bucket = col_samples[c]
+                bucket.append(r[c])
+                if len(bucket) >= sample:
+                    unfilled.discard(c)
     alias_norms = [_norm_header(a) for a in aliases]
     scored = []
     for col in range(ncols):
         hnorm = _norm_header(header[col]) if col < len(header) else ""
         hscore = 3 if hnorm in alias_norms else (2 if any(a and a in hnorm for a in alias_norms) else 0)
-        sampled = [r[col] for r in data if col < len(r) and not _blankish(r[col])]
+        sampled = col_samples[col]
         cscore = (sum(1 for c in sampled if predicate(c)) / len(sampled)) if sampled else 0.0
         scored.append((cscore, hscore, col))
     scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
@@ -145,8 +159,20 @@ def _find_col(rows, header_index, aliases, predicate, sample=50):
     if best[0] == 0 and best[1] == 0:
         return None
     if len(scored) > 1 and (best[0], best[1]) == (scored[1][0], scored[1][1]) and best[0] > 0:
-        raise AuditBindError(
-            f"columns {best[2]} and {scored[1][2]} tie for aliases {aliases}")
+        tied = [t[2] for t in scored if (t[0], t[1]) == (best[0], best[1])]
+        # Verbatim-duplicated columns (identical values over the sample) are
+        # not a real ambiguity — bind the leftmost deterministically.
+        ref, identical = None, True
+        for c in tied:
+            vals = tuple(_N(r[c]) if c < len(r) else "" for r in data)
+            if ref is None:
+                ref = vals
+            elif vals != ref:
+                identical = False
+                break
+        if identical:
+            return min(tied)
+        raise AuditBindError(f"columns {tied} tie for aliases {aliases}")
     return best[2]
 
 

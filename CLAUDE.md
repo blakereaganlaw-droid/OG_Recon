@@ -58,9 +58,17 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
 7. **Guardrails:** Journal-source STs never match bank lines. A MID receipt
    reconciles only through the merchant lane. Sibling references (equal-length
    numerics differing in the last 1–2 digits) are **conflicts**, never ties.
-8. **Dedup before summing.** Keep the largest-magnitude row (the total, not an
-   invoice split); borrow counterparty from a dropped split. Engine and audit
-   apply the same keep-largest dedup independently.
+8. **Dedup before summing.** Keep-largest applies only to the
+   total-plus-splits signature (largest == sum(rest), signed cents); borrow
+   counterparty from a dropped split. Same-key rows that don't sum that way
+   are distinct receipts sharing a label — ALL kept, ids disambiguated
+   `<id> [<amount>]` with `base_id` preserving the MET bridge join. Engine
+   and audit dedup independently.
+8b. **Payer contradiction (owner, 2026-07-11).** Zero-corroboration
+   (amount-only) pairings are barred — even as Candidates — when both sides
+   carry payer tokens and share none ("City of Chattanooga has nothing to do
+   with Israel"). Reference ties outrank payer text; silence never
+   contradicts.
 9. **Determinism.** No randomness, no clock. `Date.now`/serials excepted where
    parsing Excel. Sort candidate sets by (amount, date, id) before choosing.
 
@@ -69,9 +77,12 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
 - `datetime` is checked **before** `date` (`datetime` subclasses `date`).
 - Falsy-zero guard: test `is not None`, never truthiness (0 cents is valid).
 - **Position never binds.** Columns bind by content-first scoring over all
-  columns; the header row is located, never assumed row 0; optional roles stay
-  unbound on zero evidence or a blind tie; newest-file ties, ambiguous sheet
-  substring matches, and MID-master GL conflicts fail loud. The audit re-binds
+  columns; content samples the first 50 NON-BLANK values per column across
+  the whole sheet (sparse columns score on what they carry); the header row
+  is located, never assumed row 0; optional roles stay unbound on zero
+  evidence or a blind tie — except verbatim-duplicate columns (bind leftmost)
+  and signed/unsigned amount twins (bind the signed one); newest-file ties,
+  ambiguous sheet substring matches, and MID-master GL conflicts fail loud. The audit re-binds
   with the same alias vocabulary (duplicated literals — still imports nothing
   from the engine). Column rearrangement is pinned identical-output by
   `TestColumnRobustness`.

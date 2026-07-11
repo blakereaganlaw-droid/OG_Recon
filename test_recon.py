@@ -155,12 +155,27 @@ class TestBinder(unittest.TestCase):
 
 class TestPoolDedup(unittest.TestCase):
     def test_keep_largest_and_borrow_counterparty(self):
+        # Classic total-plus-invoice-splits repeat: largest == sum(rest).
         e_total = E._mk_entry("T1", 10000, date(2024, 3, 5), "REF1", "", "AR", "UNR", True, "RECEIPTS")
-        e_split = E._mk_entry("T1", 4000, date(2024, 3, 5), "REF1", "ACME CORP", "AR", "UNR", True, "RECEIPTS")
-        out = E._dedup_keep_largest([e_split, e_total], lambda e: e.id)
+        e_split1 = E._mk_entry("T1", 4000, date(2024, 3, 5), "REF1", "ACME CORP", "AR", "UNR", True, "RECEIPTS")
+        e_split2 = E._mk_entry("T1", 6000, date(2024, 3, 5), "REF1", "", "AR", "UNR", True, "RECEIPTS")
+        out = E._dedup_keep_largest([e_split1, e_total, e_split2], lambda e: e.id)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].amount_cents, 10000)          # kept the total
         self.assertEqual(out[0].counterparty, "ACME CORP")     # borrowed
+
+    def test_distinct_receipts_sharing_label_all_kept(self):
+        # Real FHB Master case: two receipts share one transaction-number
+        # label but do NOT fit the total-plus-splits signature — both stay,
+        # ids disambiguated by amount (base_id preserves the bridge join).
+        a = E._mk_entry("SPN070326 ACH HRSA", 1820327, date(2026, 7, 3), "SPN070326 ACH HRSA", "HRSA", "AR", "UNR", True, "ST")
+        b = E._mk_entry("SPN070326 ACH HRSA", 10241147, date(2026, 7, 3), "SPN070326 ACH HRSA", "HRSA", "AR", "UNR", True, "ST")
+        out = E._dedup_keep_largest([a, b], lambda e: e.id)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(sorted(e.id for e in out),
+                         ["SPN070326 ACH HRSA [102411.47]",
+                          "SPN070326 ACH HRSA [18203.27]"])
+        self.assertTrue(all(e.base_id == "SPN070326 ACH HRSA" for e in out))
 
 
 # ---- synthetic end-to-end fixture ------------------------------------

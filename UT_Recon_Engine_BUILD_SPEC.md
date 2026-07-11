@@ -382,3 +382,43 @@ A separate module that **imports nothing** from the engine and re-parses every r
 8. Validate against a fully-reconciled account (e.g., FHB UTC): the forward engine must reproduce the known Oracle groups (target ≥ the 4,057 exact-sum groups seen), and the backward engine must surface only genuine defects. Only then run open accounts.
 
 *End of specification.*
+
+---
+
+## Addendum (2026-07-11, answer-key reverse-engineering — owner-approved behavior)
+
+Validated against the owner-supplied FHB Master reference reconciliation
+(`FHB_Master_Reconciliation_FY26_Full_v2`). These refinements are binding:
+
+1. **§5 sampling.** Content scoring samples the first 50 **non-blank** values
+   per column across the whole sheet, not the first 50 rows. (A Structured
+   Payment Reference column blank on every recent Journal row must still be
+   scored on the values it carries, or reference-shaped neighbors blind-tie
+   it out of binding and silently gut the 4×4 cross-reference screen.)
+2. **§5 tie resolution.** A required-role tie among columns whose sampled
+   content is value-for-value identical binds the leftmost (verbatim
+   duplicate columns are not a real ambiguity). A signed/unsigned amount twin
+   (equal absolute cents everywhere; exactly one column carries negatives)
+   binds the signed column. Everything else still fails loud.
+3. **§8.1 dedup signature.** Keep-largest applies only when the same-key
+   group fits the total-plus-splits signature: largest == sum(rest) in signed
+   cents. Same-key rows that do not sum that way are **distinct receipts
+   sharing a label** — all are kept, ids disambiguated as
+   `<id> [<amount>]` (comma-free), `base_id` preserving the MET bridge join
+   (which then merges by equal signed cents, never by guess).
+4. **§9 ordering.** Out-of-band (stale-ST) exact 1:1 reference ties defer
+   from P3 to a post-group pass (P8b): a stale coincidence never pre-empts a
+   live ORT deposit-chain, merchant, or SPN group for the same BSL.
+5. **§9 P9b amount-only singles.** An unplaced BSL with open exact-cents
+   ST(s) surfaces as a LOW Candidate (`AMOUNT_ONLY`, one cited ST, alternates
+   named); stale-only exact-cents STs with at least a digit-run tie surface
+   as `DATE_GATE` LOW Candidates. Zero-evidence stale coincidences stay
+   Review. The hard guardrail (no Match without corroboration; cited STs sum
+   exactly) is unchanged.
+6. **Payer contradiction (owner directive).** When both sides carry payer
+   tokens (BSL side BAI2-enriched; ST side from MET `CET_DESCRIPTION` /
+   counterparty) and they share none, a **zero-corroboration** pairing is
+   barred even as a Candidate ("City of Chattanooga has nothing to do with
+   Israel"). Reference ties always outrank payer text; silence on either
+   side never contradicts.
+
