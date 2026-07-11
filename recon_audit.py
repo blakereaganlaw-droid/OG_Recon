@@ -159,15 +159,29 @@ def _locate_header(rows, aliases, scan=12):
 
 def _read_xlsx(path, sheet_substr=None):
     from openpyxl import load_workbook
-    wb = load_workbook(path, read_only=False, data_only=True)
+    # Streaming read with reset_dimensions() (never trust stated dimensions
+    # on Oracle BI exports); fall back to the slow full parse if the fast
+    # path yields nothing.  Independent twin of the engine's reader.
+    wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.worksheets[0]
     if sheet_substr:
         for cand in wb.worksheets:
             if sheet_substr.lower() in cand.title.lower():
                 ws = cand
                 break
+    ws.reset_dimensions()
     rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
     wb.close()
+    if len(rows) <= 1:
+        wb = load_workbook(path, read_only=False, data_only=True)
+        ws = wb.worksheets[0]
+        if sheet_substr:
+            for cand in wb.worksheets:
+                if sheet_substr.lower() in cand.title.lower():
+                    ws = cand
+                    break
+        rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
+        wb.close()
     return rows
 
 
@@ -267,13 +281,16 @@ def _reparse_met_pairs(input_dir):
             path = os.path.join(input_dir, name)
             rows = _read_csv(path) if path.lower().endswith(".csv") else _read_xlsx(path)
             for r in rows:
-                joined = " ".join(_N(c) for c in r)
-                d = re.search(r"d:\s*(\d+)", joined, re.IGNORECASE)
-                rr = re.search(r"r:\s*(\d+)", joined, re.IGNORECASE)
-                if d:
-                    pairs.add(("d", d.group(1)))
-                if rr:
-                    pairs.add(("r", rr.group(1)))
+                for c in r:
+                    # fast pre-check: regex only cells that can carry a token
+                    if not isinstance(c, str) or (":" not in c):
+                        continue
+                    d = re.search(r"d:\s*(\d+)", c, re.IGNORECASE)
+                    rr = re.search(r"r:\s*(\d+)", c, re.IGNORECASE)
+                    if d:
+                        pairs.add(("d", d.group(1)))
+                    if rr:
+                        pairs.add(("r", rr.group(1)))
     return pairs
 
 

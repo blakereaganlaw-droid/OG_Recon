@@ -288,9 +288,9 @@ class TestColumnRobustness(unittest.TestCase):
 
     def test_pred_met_description(self):
         self.assertTrue(E.pred_met_description("d:8812345 | r:991 | UT FOUNDATION"))
-        self.assertTrue(E.pred_met_description("something | else"))
+        self.assertFalse(E.pred_met_description("d:63363 | r:197960"))  # ID-column stub
+        self.assertFalse(E.pred_met_description("something | else"))
         self.assertFalse(E.pred_met_description("see attached"))
-        self.assertFalse(E.pred_met_description("word:123"))
 
     def test_mid_master_multi_mid_and_conflict(self):
         gl = "01-1234567-123456-123456"
@@ -651,6 +651,157 @@ class TestPerRunScript(unittest.TestCase):
         _build_fhb_utc_inputs(self.upload)
         self.assertEqual(
             R.main([self.upload, "--runs-root", self.runs, "--run-id", "r2"]), 0)
+
+
+class TestRealDataShapes(unittest.TestCase):
+    """Regression tests for the real FHB Master export shapes (2026-07-10
+    validation run): router tokens, integer cells, NA placeholders, the MET
+    scope join + ST bridge, and the ORT deposit-group pass."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.out = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+        shutil.rmtree(self.out, ignore_errors=True)
+
+    def test_router_real_filenames(self):
+        # "_st" must not swallow All_Status / Rosetta_Stone.
+        cases = {
+            "20260710_Oracle_CM_FHB_Master_BSL_UNR.xlsx": "BSL",
+            "20260710_Oracle_CM_FHB_Master_ST_UNR.xlsx": "ST",
+            "20260710_Oracle_OTBI_MET_All_Accounts_All_Status.xlsx": "MET",
+            "20260710_FHB_Master_BAI2.xlsx": "BAI2",
+            "ORT_Misc_All.xlsb": "ORT_MISC",
+            "UT_Recon_SPN_Receivables_Rosetta_Stone_Part2_1.xlsx": "RELATIONSHIP_MAP",
+            "UT_Recon_Data_Relationship_Map_20260702_1.xlsx": "RELATIONSHIP_MAP",
+        }
+        for name, want in cases.items():
+            self.assertEqual(E.classify_file(name), want, msg=name)
+        self.assertEqual(E.infer_account("20260710_FHB_Master_BAI2.xlsx"),
+                         "FHB_MASTER")
+
+    def test_integer_reference_cells_bind(self):
+        # Oracle exports deliver references/ids as raw ints; parse_date must
+        # not swallow small ints as Excel serials and poison the binder.
+        self.assertTrue(E.pred_reference(1390))
+        self.assertTrue(E.pred_reference("852256"))
+        self.assertFalse(E.pred_reference("2026-07-09"))
+        from datetime import datetime as _dt
+        self.assertFalse(E.pred_reference(_dt(2026, 7, 9)))
+        rows = [
+            ("Date", "Amount (USD)", "Reference", "Transaction Number", "Source",
+             "Payment Reference Number"),
+            ("2026-07-10", "10.00", 1390, 17, "External", ""),
+            ("2026-07-09", "20.00", 104000120, 1027519, "External", 260238),
+        ]
+        m, _hi = E.bind_columns(rows, E.ST_ROLES, filename="st.xlsx")
+        self.assertEqual(m["transaction_number"], 3)
+        self.assertEqual(m["reference"], 2)
+
+    def test_na_placeholder_never_ties(self):
+        self.assertEqual(E.clean_ref("NA"), "")
+        self.assertEqual(E.clean_ref("n/a"), "")
+        self.assertEqual(E.clean_ref("852256"), "852256")
+        a = E._mk_entry("T1", 100, date(2026, 7, 1), "NA", "", "EXT", "UNR", True, "ST")
+        self.assertEqual(a.reference, "")
+        self.assertFalse(E.reference_equal("NA", a.reference))
+
+    def test_account_of_bank_name(self):
+        self.assertEqual(E.account_of_bank_name("FHB - Master Account"), "FHB_MASTER")
+        self.assertEqual(E.account_of_bank_name("Regions - UTM"), "REGIONS_UTM")
+        self.assertIsNone(E.account_of_bank_name("TRUIST BANK - Chattanooga"))
+
+    def _met_rows(self):
+        return [
+            ("CBE_BANK_ACCOUNT_NAME", "CET_REFERENCE_TEXT", "CET_STATUS",
+             "CET_TRANSACTION_DATE", "CET_TRANSACTION_ID", "AMOUNT",
+             "TRANSACTION_DATE", "CET_DESCRIPTION", "DEPOSIT_ID", "RECEIPT_ID"),
+            # our account: deposit 900 = two open receipts 400 + 600
+            ("FHB - Master Account", "DEPREF77", "UNR", "2026-07-01", 501,
+             "400.00", "2026-07-01", "d:900 | r:11 | PAYER A", 900, 11),
+            ("FHB - Master Account", "DEPREF77", "UNR", "2026-07-01", 502,
+             "600.00", "2026-07-01", "d:900 | r:12 | PAYER A", 900, 12),
+            # same trx id as the ST export -> must bridge, not duplicate
+            ("FHB - Master Account", "REF100200", "UNR", "2026-07-02", 601,
+             "150.00", "2026-07-02", "d:901 | r:13 | VENDOR", 901, 13),
+            # other account: identical amounts — must never enter the pool
+            ("FHB - UTC", "DEPREF77", "UNR", "2026-07-01", 701,
+             "1000.00", "2026-07-01", "d:902 | r:14 | PAYER A", 902, 14),
+        ]
+
+    def _build(self, bsl_rows):
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl_rows)])
+        st = [
+            ("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Counterparty"),
+            ("2026-07-02", "150.00", "REF100200", 601, "External", "VENDOR INC"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        _write_xlsx(os.path.join(self.d, "20260710_MET_All_Accounts.xlsx"),
+                    [("Miscellaneous External Transact", self._met_rows())])
+
+    def test_met_scope_bridge_and_deposit_group(self):
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            # bundled deposit line: no reference, sums d:900 (400+600)
+            ("2026-07-03", "1000.00", "NA", "DEPOSIT 011", "NA",
+             "Miscellaneous", "Line 1 , 2026-07-03", "174"),
+            # exact 1:1 to the bridged ST
+            ("2026-07-03", "150.00", "REF100200", "ACH CREDIT", "REF100200",
+             "Automated clearing house", "Line 2 , 2026-07-03", "142"),
+        ]
+        self._build(bsl)
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        # scope: 3 of 4 MET rows are ours; the FHB-UTC row is excluded
+        self.assertEqual(runlog["met_scope"], {"rows_total": 4, "rows_in_account": 3})
+        # bridge: trx 601 exists in both ST and MET -> one pool entry
+        self.assertEqual(runlog["met_bridged_to_st"], 1)
+        self.assertEqual(runlog["pool_total"], 3)
+        # deposit line -> Match via deposit group; ACH line -> P3 exact
+        self.assertEqual(runlog["recon_summary"],
+                         {"matches": 2, "candidates": 0, "reviews": 0})
+        self.assertEqual(runlog["forward_pass_counts"].get("P4_deposit_group"), 1)
+        # the bridged entry carries the ORT coordinates
+        tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
+        match_rows = [r for r in tabs["Matches"][3:] if any(A._N(c) for c in r)]
+        by_amount = {A._N(r[2]): r for r in match_rows}
+        self.assertEqual(A._N(by_amount["150.00"][6]), "901")  # ORT d:
+        self.assertEqual(A._N(by_amount["150.00"][7]), "13")   # ORT r:
+
+    def test_deposit_auto_rec_split_is_candidate(self):
+        rows = self._met_rows()
+        rows[2] = ("FHB - Master Account", "DEPREF77", "REC", "2026-07-01", 502,
+                   "600.00", "2026-07-01", "d:900 | r:12 | PAYER A", 900, 12)
+        _write_xlsx(os.path.join(self.d, "20260710_MET_All_Accounts.xlsx"),
+                    [("Miscellaneous External Transact", rows)])
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-03", "1000.00", "NA", "DEPOSIT 011", "NA",
+             "Miscellaneous", "Line 1 , 2026-07-03", "174"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["recon_summary"]["candidates"], 1)
+        tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
+        cand = [r for r in tabs["Candidate Matches"][3:] if any(A._N(c) for c in r)]
+        self.assertIn("already-closed", A._N(cand[0][8]))
+
+    def test_type_gate(self):
+        b = E.make_bsl("1", date(2026, 7, 1), 1000, "R", "R", "", "Miscellaneous", "399")
+        cc = E._mk_entry("S1", 1000, date(2026, 7, 1), "R", "", "EXT", "UNR",
+                         True, "ST", transaction_type="Credit Card")
+        eft = E._mk_entry("S2", 1000, date(2026, 7, 1), "R", "", "EXT", "UNR",
+                          True, "ST", transaction_type="EFT")
+        self.assertFalse(E._type_gate_ok(b, cc))
+        self.assertTrue(E._type_gate_ok(b, eft))
 
 
 if __name__ == "__main__":

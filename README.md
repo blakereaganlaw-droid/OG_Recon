@@ -42,7 +42,7 @@ The full behavioral contract is the build spec
 ## Requirements
 
 - Python 3.10+
-- `openpyxl` (`pip install openpyxl`)
+- `openpyxl` (`pip install openpyxl`); `pyxlsb` for `.xlsb` binary exports
 - Standard library + `decimal` only. **No pandas** (it float-coerces
   zero-padded references and merchant IDs and silently corrupts keys).
 
@@ -150,10 +150,14 @@ python3 -m unittest test_recon -v
 ```
 
 The end-to-end test builds a synthetic FHB_UTC account, runs the full pipeline,
-and asserts the audit passes and conservation holds. **Validating against real
-UT data** (per spec Section 16 step 8 — reproducing the known Oracle groups on
-a fully-reconciled account such as FHB UTC) requires the actual export files,
-which are not committed here; drop them into an input folder and run the CLI.
+and asserts the audit passes and conservation holds. **Real-data validated**
+(2026-07-10) against the FHB Master UNR exports (283 bank lines, 13,872 STs,
+226k-row all-accounts MET, ORT `.xlsb`): the run completes with audit PASS and
+`TestRealDataShapes` pins every real export shape synthetically (the real
+files are never committed). The MET export spans every UT account and is
+filtered by the §4.6 scope join; MET↔ST transactions bridge 1:1 and are never
+double-pooled; the ORT deposit-group chain (`d:` sums with reference/payer/
+deposit-type corroboration) is P4 phase 2.
 
 ## Scope status
 

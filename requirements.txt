@@ -2,3 +2,5 @@
 # Standard library + decimal + openpyxl only (NO pandas — it float-coerces
 # zero-padded references and merchant IDs and silently corrupts keys).
 openpyxl>=3.1
+# .xlsb (binary workbook) exports, e.g. ORT_Misc_All.xlsb.
+pyxlsb>=1.0
