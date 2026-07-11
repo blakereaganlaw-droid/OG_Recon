@@ -430,15 +430,10 @@ def audit(input_dir, recon_path, account):
             failures.append(f"C5: dual-fire ST in a Match row: {sts}")
     checks["C5"] = "PASS" if c5_ok else "FAIL"
 
-    # C6 STATE lane isolation — no ORT citation on a State Match.
-    c6_ok = True
-    for r in match_rows:
-        info = _N(r[1]).upper()
-        is_state = info.startswith("STATE-TN") or "STATE-TN" in info or "STATE OF TENN" in info
-        if is_state and (_N(r[6]) or _N(r[7])):
-            c6_ok = False
-            failures.append(f"C6: STATE Match cites ORT d:/r:: {r[:2]}")
-    checks["C6"] = "PASS" if c6_ok else "FAIL"
+    # C6 retired (owner doctrine 2026-07-11): the Edison/State pass was
+    # eliminated; State lines reconcile through the same ORT/reference
+    # chain as every other line.
+    checks["C6"] = "SKIP (retired 2026-07-11)"
 
     # C7 MID guardrail — a MID reference should not appear on a non-merchant Match.
     c7_ok = True
@@ -457,25 +452,22 @@ def audit(input_dir, recon_path, account):
             failures.append(f"C7: MID guardrail suspected on non-merchant Match: {r[:2]}")
     checks["C7"] = "PASS" if c7_ok else "FAIL"
 
-    # C8 directional date rule (owner doctrine): the BSL may precede its
-    #    cited STs by any amount (receipt-entry lag, no ceiling); a Match
-    #    whose BSL TRAILS every cited ST by more than 15 days is a stale-ST
-    #    pairing and FAILS.  State Matches keep the >20-day rule.
+    # C8 directional date rule (owner doctrine, final): the gate applies
+    #    ONLY when the ST precedes the BSL by 8+ days; an ST after the BSL
+    #    (by any amount) is valid.  A Match whose BSL trails EVERY cited ST
+    #    by 8+ days fails.
     c8_ok = True
     for r in match_rows:
         bdt = _parse_date(r[0])
-        info = _N(r[1]).upper()
-        is_state = "STATE-TN" in info or "STATE OF TENN" in info
         st_dates = [_parse_date(x) for x in _split_multi(r[3])]
         st_dates = [d for d in st_dates if d]
         if bdt is None or not st_dates:
             continue
         lags = [(bdt - d).days for d in st_dates]
-        limit = 20 if is_state else 15
-        if all(lag > limit for lag in lags):
+        if all(lag >= 8 for lag in lags):
             c8_ok = False
             failures.append(
-                f"C8: Match trails every cited ST by > {limit}d (stale-ST): {r[:3]}")
+                f"C8: Match trails every cited ST by >= 8d (stale-ST): {r[:3]}")
     checks["C8"] = "PASS" if c8_ok else "FAIL"
 
     # C9 formatting — Carlito, navy header fill, freeze A4, zero formulas, structure.
