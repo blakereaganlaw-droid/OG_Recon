@@ -421,4 +421,23 @@ Validated against the owner-supplied FHB Master reference reconciliation
    barred even as a Candidate ("City of Chattanooga has nothing to do with
    Israel"). Reference ties always outrank payer text; silence on either
    side never contradicts.
+7. **Deposit-type consistency retired; merchant & correction guardrails
+   (owner directive, false-match review).** "Deposit-type consistency"
+   confers NOTHING — neither Match nor Candidate rank; an exact-sum deposit
+   group without a reference or payer tie is a plain amount-only Candidate.
+   A merchant-lane (MID) bank line corroborates a deposit group ONLY through
+   a reference/MID tie — payer text and deposit type prove nothing there.
+   Deposit-correction lines (text contains CORRECTION/CORRECTED) are manual
+   fixes: they may surface as Candidates flagged `MANUAL_ECT`, never as
+   Matches from amount-sum passes; edge cases err toward Candidate rather
+   than rejection. The audit's C7 enforces all three. Convera lines are
+   international wires and ALWAYS Payables — they never pair with a
+   non-Payables ST (enforced in the central type gate).
+8. **Distinctive-amount exception (owner directive).** Amount-only and
+   transaction-type-only evidence are never sufficient — EXCEPT a
+   statistically rare exact amount: non-zero cents AND >= $1,000 magnitude,
+   unique on both sides (exactly one open pool counterpart or exact-sum ORT
+   deposit group, exactly one bank line at that amount).  Such a pairing is
+   a Medium-confidence Match coded `DISTINCTIVE_AMOUNT`; corrections stay
+   excluded and payer contradiction still bars it.
 
