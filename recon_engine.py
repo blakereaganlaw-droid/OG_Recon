@@ -333,7 +333,7 @@ ROUTER_TABLE = [
     RouterRule("AR_INVOICES", ["ar_invoices"], [], [], "first", False),
     RouterRule("AR_MATCHED", [], [], ["ar_matched", "deposit_receipts"], "first", False),
     RouterRule("AR_UNAPPLIED_SUMMARY", [], [], ["ar_063", "unapplied_receipts_summary"], "first", False),
-    RouterRule("GMS_SPONSOR_MAP", ["rpt_gms_00"], [], [], "first", False),
+    RouterRule("GMS_SPONSOR_MAP", ["rpt_gms_0"], [], [], "first", False),
     RouterRule("CFG_MATCHING", ["matching_rules"], [], [], "first", False),
     RouterRule("CFG_PARSE", ["parse_rules"], [], [], "first", False),
     RouterRule("CFG_TOLERANCE", ["tolerance_rules"], [], [], "first", False),
@@ -1845,11 +1845,14 @@ def _p5_state(unplaced, place, pool, ledger, loaded, runlog):
 
 
 def _state_receipts(invoices, pool, ledger):
-    """Receipts whose reference/id contains one of the bundle invoice numbers,
-    open and available.  Never a card-batch (MID) receipt."""
+    """RECEIVABLES receipts whose reference/id contains one of the bundle
+    invoice numbers, open and available.  State lines match Receivables
+    receipts ONLY (lane isolation, ORT doc section 5.1): never a card-batch
+    (MID) receipt and never an ORT-chain (EXT) entry — the audit's C6 rejects
+    any State Match citing ORT d:/r: coordinates."""
     out = []
     for e in pool:
-        if not ledger.is_available(e) or e.is_mid or e.source == "GL":
+        if not ledger.is_available(e) or e.is_mid or e.source != "AR":
             continue
         if any(inv and (inv in znorm(e.reference) or inv in znorm(e.id)) for inv in invoices):
             out.append(e)
