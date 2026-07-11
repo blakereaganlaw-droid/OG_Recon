@@ -589,6 +589,49 @@ def pred_any(v):  # non-empty
     return N(v) != ""
 
 
+def _cols_identical(data_rows, cols):
+    """True when every listed column carries value-for-value identical content
+    over the sampled data rows (normalized text).  A bank export that repeats
+    a column verbatim (e.g. BAI2 with two 'Amount' columns) is not a real
+    ambiguity: either binding yields identical output, so the leftmost is
+    chosen deterministically instead of failing loud."""
+    ref = None
+    for c in cols:
+        vals = tuple(N(r[c]) if c < len(r) else "" for r in data_rows)
+        if ref is None:
+            ref = vals
+        elif vals != ref:
+            return False
+    return True
+
+
+def _signed_twin(data_rows, cols):
+    """Disambiguate a signed/unsigned amount twin: some bank exports carry the
+    same amount twice — once signed, once as magnitude with the sign in a
+    separate Debit/Credit column.  When every sampled row agrees in absolute
+    cents across the tied columns and exactly one column carries a negative
+    value, that signed column is the real amount role.  Returns its index or
+    None when the pattern doesn't hold."""
+    has_negative = {c: False for c in cols}
+    for r in data_rows:
+        mags = set()
+        for c in cols:
+            v = r[c] if c < len(r) else None
+            if _blankish(v):
+                return None
+            try:
+                cts = cents(v)
+            except Exception:
+                return None
+            mags.add(abs(cts))
+            if cts < 0:
+                has_negative[c] = True
+        if len(mags) != 1:
+            return None
+    signed = [c for c in cols if has_negative[c]]
+    return signed[0] if len(signed) == 1 else None
+
+
 def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50):
     """Bind each role to a column index by scanning content first, header as
     tiebreak (Section 5.1).  Returns (mapping {role: col_index}, header_index).
@@ -637,6 +680,25 @@ def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50)
     ncols = max(len(r) for r in rows)
     data_rows = rows[header_index + 1: header_index + 1 + sample]
 
+    # Content sampling spans the WHOLE sheet, not the first `sample` rows:
+    # a sparsely-populated column (e.g. Structured Payment Reference blank on
+    # every recent Journal row) must be scored on the values it actually
+    # carries, or reference-shaped neighbor columns blind-tie it out of
+    # binding (real FHB Master lesson, 2026-07-11: an unbound SPR column
+    # silently gutted the 4x4 cross-reference screen).  Up to `sample`
+    # non-blank values are collected per column in one pass.
+    col_samples = {c: [] for c in range(ncols)}
+    unfilled = set(col_samples)
+    for r in rows[header_index + 1:]:
+        if not unfilled:
+            break
+        for c in list(unfilled):
+            if c < len(r) and not _blankish(r[c]):
+                bucket = col_samples[c]
+                bucket.append(r[c])
+                if len(bucket) >= sample:
+                    unfilled.discard(c)
+
     # 2/3. Score every column for every role; content decides, header breaks ties.
     mapping = {}
     for role, spec in role_specs.items():
@@ -651,7 +713,7 @@ def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50)
                 header_score = 2
             else:
                 header_score = 0
-            sampled = [r[col] for r in data_rows if col < len(r) and not _blankish(r[col])]
+            sampled = col_samples[col]
             if sampled:
                 content_score = sum(1 for c in sampled if spec.predicate(c)) / len(sampled)
             else:
@@ -663,7 +725,15 @@ def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50)
         if spec.required and len(scored) > 1:
             second = scored[1]
             if (best[0], best[1]) == (second[0], second[1]) and best[0] > 0:
-                raise AmbiguousColumn(filename, role, [best[2], second[2]])
+                tied = [t[2] for t in scored if (t[0], t[1]) == (best[0], best[1])]
+                if _cols_identical(data_rows, tied):
+                    best = (best[0], best[1], min(tied))
+                else:
+                    signed = _signed_twin(data_rows, tied)
+                    if signed is not None:
+                        best = (best[0], best[1], signed)
+                    else:
+                        raise AmbiguousColumn(filename, role, tied)
         if spec.required and best[0] == 0:
             raise InvalidSourceData(
                 filename, role,
@@ -675,7 +745,11 @@ def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50)
             if best[0] == 0 and best[1] == 0:
                 continue
             if len(scored) > 1 and (best[0], best[1]) == (scored[1][0], scored[1][1]):
-                continue
+                tied = [t[2] for t in scored if (t[0], t[1]) == (best[0], best[1])]
+                if _cols_identical(data_rows, tied):
+                    best = (best[0], best[1], min(tied))
+                else:
+                    continue
         mapping[role] = best[2]
     return mapping, header_index
 
@@ -915,6 +989,7 @@ class PoolEntry:
     receipt_id: str = ""    # ORT r:
     transaction_type: str = ""  # Credit Card / Check / EFT (type gate)
     spr: str = ""           # Structured Payment Reference (screened separately)
+    base_id: str = ""       # undisambiguated id when distinct rows share one label
 
 
 def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
@@ -946,7 +1021,15 @@ def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
 def _dedup_keep_largest(entries, keyfn):
     """Dedup by keyfn keeping the largest-magnitude amount (the total, not a
     split).  When the kept total lacks a counterparty, borrow it from a dropped
-    split (Section 8.1)."""
+    split (Section 8.1).
+
+    The keep-largest doctrine targets total-plus-invoice-split repeats, whose
+    signature is largest == sum(rest) in signed cents (a lone verbatim repeat
+    also satisfies it).  Same-key rows that do NOT sum that way are distinct
+    receipts sharing a transaction-number label (real FHB Master case: two
+    'SPN070326 ACH HRSA' receipts whose SUM is the bank line) — all are kept,
+    with the display id disambiguated by amount so the ledger, conservation
+    assert, and audit C3 treat them as separate consumables."""
     groups = {}
     for e in entries:
         groups.setdefault(keyfn(e), []).append(e)
@@ -958,8 +1041,16 @@ def _dedup_keep_largest(entries, keyfn):
             reverse=True,
         )
         keep = members_sorted[0]
+        rest = members_sorted[1:]
+        if rest and keep.amount_cents != sum(m.amount_cents for m in rest):
+            # Distinct receipts sharing a label — keep every one.
+            for m in members_sorted:
+                m.base_id = m.id
+                m.id = f"{m.id} [{m.amount_cents / 100:.2f}]"
+                out.append(m)
+            continue
         if not keep.counterparty:
-            for m in members_sorted[1:]:
+            for m in rest:
                 if m.counterparty:
                     keep.counterparty = m.counterparty
                     keep.payer_tokens = keep.payer_tokens | payer_tokens(m.counterparty)
@@ -1104,13 +1195,29 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
         # twice, or reference groups double-count.  The ST export row is
         # canonical; borrow the bridge fields the MET copy carries.  MET-only
         # transactions join the pool as their own entries.
-        by_id = {e.id: e for e in pool}
+        by_id = {}
+        for p in pool:
+            by_id.setdefault(p.base_id or p.id, []).append(p)
         merged = 0
+        dropped_mismatch = 0
         for e in deduped:
-            prev = by_id.get(e.id)
-            if prev is None:
+            group = by_id.get(e.base_id or e.id)
+            if not group:
                 pool.append(e)
                 continue
+            prev = None
+            if len(group) == 1:
+                prev = group[0]
+            else:
+                # Disambiguated same-label STs: the MET copy of the same
+                # transaction carries the same signed cents — merge into that
+                # member; never guess among unequal ones.
+                equal = [p for p in group if p.amount_cents == e.amount_cents]
+                if len(equal) == 1:
+                    prev = equal[0]
+                else:
+                    dropped_mismatch += 1
+                    continue
             merged += 1
             if not prev.deposit_id:
                 prev.deposit_id = e.deposit_id
@@ -1126,6 +1233,8 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 prev.digits = digit_runs(e.reference)
                 prev.is_mid = prev.is_mid or e.is_mid
         runlog["met_bridged_to_st"] = merged
+        if dropped_mismatch:
+            runlog["met_bridge_amount_mismatch_dropped"] = dropped_mismatch
 
     runlog["pool_sizes"] = counts
     runlog["pool_total"] = len(pool)
@@ -1430,6 +1539,88 @@ def cross_reference_tie(bsl, e):
     return False
 
 
+def cross_digit_tie(bsl, e):
+    """Weak digit-run corroboration over the same 4x4 field grid as
+    cross_reference_tie: a shared >=5-digit run anywhere between the BSL's
+    identifier fields and the ST's.  Supports a DATE_GATE Candidate, never a
+    Match."""
+    bsl_vals = (bsl.reference_raw, bsl.additional_info, bsl.customer_reference,
+                bsl.account_servicer_reference, bsl.recon_reference)
+    st_vals = (e.reference, e.id, e.spr, e.counterparty)
+    for b in bsl_vals:
+        if not b:
+            continue
+        for s in st_vals:
+            if s and reference_tie(b, s):
+                return True
+    return False
+
+
+_PAYER_LABEL_RE = re.compile(
+    r"(?:CO(?:MPANY)?\s+NAME|CUSTOMER\s+NAME|INDIVIDUAL\s+NAME)"
+    r"\s*:?\s*([A-Za-z0-9 &.,'\-]{3,40})", re.I)
+_CONTRA_STOP = {"THE", "AND", "FOR", "FROM", "WITH", "INC", "LLC", "CORP",
+                "CO", "OF"}
+
+
+def _contra_tokens(text):
+    return {w.upper() for w in _ALPHA_TOKEN_RE.findall(N(text))
+            if len(w) >= 3 and w.upper() not in _CONTRA_STOP}
+
+
+def _bsl_payer_name_tokens(bsl):
+    """Tokens of the payer NAMES the bank line actually discloses: the
+    Customer Reference field plus 'CO NAME:' / 'CUSTOMER NAME:' labeled
+    segments of the (BAI2-enriched) addenda.  Deliberately NOT the filtered
+    payer_tokens set — common words like STATE/PAYMENTS are stopworded there
+    for tie purposes, which would fabricate contradictions between identical
+    payers ('STATE-TN PAYMNTS' vs 'State of TN Payments')."""
+    toks = set()
+    cr = N(bsl.customer_reference)
+    if cr and not _blankish(cr):
+        toks |= _contra_tokens(cr)
+    for m in _PAYER_LABEL_RE.finditer(N(bsl.additional_info)):
+        toks |= _contra_tokens(m.group(1))
+    return toks
+
+
+def _token_overlap(a, b):
+    """Shared token, tolerating bank-side truncation (prefix, len >= 4)."""
+    if a & b:
+        return True
+    for x in a:
+        for y in b:
+            if len(x) >= 4 and len(y) >= 4 and (x.startswith(y) or y.startswith(x)):
+                return True
+    return False
+
+
+def payer_contradiction(bsl, entries):
+    """Owner directive (2026-07-11, answer-key review): an amount-only pairing
+    whose payer texts actively disagree is wrong — 'City of Chattanooga has
+    nothing to do with Israel.'  When the bank line names a payer (labeled
+    addenda name / Customer Reference) AND the ST side carries counterparty
+    text (ST export or MET CET_DESCRIPTION) and the two share no token, the
+    pairing is contradicted.  Consulted only by zero-corroboration
+    placements — a reference tie always outranks payer text; silence on
+    either side never contradicts.
+
+    Credits only: on a debit the bank line names the payment CHANNEL
+    (Convera, card processor) while the ST counterparty names the
+    BENEFICIARY — different roles, not comparable, never a contradiction."""
+    if bsl.amount_cents <= 0:
+        return False
+    bt = _bsl_payer_name_tokens(bsl)
+    if not bt:
+        return False
+    st = set()
+    for e in entries:
+        st |= _contra_tokens(e.counterparty)
+    if not st:
+        return False
+    return not _token_overlap(bt, st)
+
+
 def _type_gate_ok(bsl, e):
     """Deterministic type gate (ORT doc section 5.2): a Credit Card ST never
     pairs with a Check or Miscellaneous bank line.  EFT is never rejected on
@@ -1495,6 +1686,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     runlog.setdefault("p2_data_feed_errors", len(feed_errors))
 
     # ---- P3 Exact reference 1:1 (Amount + Reference) ----------------
+    stale_1to1 = {}          # line_key -> out-of-band ties, placed after P4
     for bsl in unplaced():
         cands = []
         for e in _open_entries(pool, ledger):
@@ -1533,24 +1725,14 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   f"{ordered[0].id}, alternates: "
                   + ", ".join(e.id for e in ordered[1:5]) + ".",
                   "P3_exact_1to1")
-        elif len(ties) == 1:
-            # Directional doctrine: the only remaining ties here TRAIL the
-            # ST beyond the band (stale-ST) — Candidate, never Match.
-            e = ties[0]
-            lag = signed_lag(bsl.date, e.date)
-            place(bsl, CANDIDATE, CONF_MEDIUM, [e],
-                  ["DATE_CONFLICT"],
-                  f"Exact amount + reference tie to {e.id}, but the BSL "
-                  f"trails the ST by {lag}d — stale-ST pairing, never a Match.",
-                  "P3_exact_1to1")
         elif ties:
-            ordered = _sorted(ties)
-            place(bsl, CANDIDATE, CONF_MEDIUM, [ordered[0]],
-                  ["MULTIPLE_EQUAL_CANDIDATES", "DATE_CONFLICT"],
-                  f"{len(ties)} out-of-band amount+reference ties; citing "
-                  f"{ordered[0].id}, alternates: "
-                  + ", ".join(e.id for e in ordered[1:5]) + ".",
-                  "P3_exact_1to1")
+            # Directional doctrine: the only ties here TRAIL the ST beyond
+            # the band (stale-ST) — Candidate, never Match.  DEFERRED until
+            # after P4: a stale 1:1 coincidence must not pre-empt a live ORT
+            # deposit-chain group for the same BSL (real FHB Master case:
+            # a 77d-stale reference tie shadowed deposit d:128369's exact
+            # 4-receipt sum).
+            stale_1to1[bsl.line_key] = ties
 
     # ---- P4 1:M ECT / ORT reference group (the workhorse) -----------
     for bsl in unplaced():
@@ -1585,6 +1767,44 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 place(bsl, MATCH, CONF_HIGH, _sorted(group),
                       [], f"1:M reference group of {len(group)} deduped receipt(s) sums to BSL; reference tie holds.",
                       "P4_ref_group")
+
+    # ---- P4 phase 1b: Receivables counterparty group -----------------
+    # Reverse-engineered from the reference reconciliation (2026-07-11):
+    # combined federal remittances land as ONE bank line covering several
+    # Receivables receipts that share a counterparty and each individually
+    # cross-tie the BSL (e.g. two 'SPN070326 ACH HRSA' receipts under one
+    # HHS TREAS deposit).  The whole tie-set can never sum — a truncated
+    # shared reference prefix fans the 4x4 screen out to thousands of
+    # entries — so the sum is taken per (AR, counterparty) group.
+    for bsl in unplaced():
+        groups = {}
+        for e in pool:
+            if e.source != "AR" or not e.counterparty:
+                continue
+            if not ledger.is_available(e):
+                continue
+            if not _type_gate_ok(bsl, e):
+                continue
+            if not cross_reference_tie(bsl, e):
+                continue
+            groups.setdefault(znorm(e.counterparty), []).append(e)
+        exact = [(cp, g) for cp, g in groups.items()
+                 if len(g) >= 2 and sum(x.amount_cents for x in g) == bsl.amount_cents]
+        if len(exact) == 1:
+            cp, group = exact[0]
+            place(bsl, MATCH, CONF_HIGH, _sorted(group), [],
+                  f"Receivables counterparty group '{group[0].counterparty}' — "
+                  f"{len(group)} receipt(s) sum exactly to BSL; every member "
+                  "cross-reference-tied.",
+                  "P4_cp_group")
+        elif len(exact) > 1:
+            ordered = sorted(exact)
+            cp, group = ordered[0]
+            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                  ["MULTIPLE_EQUAL_CANDIDATES"],
+                  f"{len(exact)} equal-sum tied counterparty groups; citing "
+                  f"'{group[0].counterparty}'.",
+                  "P4_cp_group")
 
     # ---- P4 phase 2: ORT deposit group (d: chain) --------------------
     # Primary ORT path (relationship doc §3): index MET rows by DEPOSIT_ID;
@@ -1666,14 +1886,19 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 continue
             # Owner call (2026-07-11): stale amount-only deposit sums surface
             # as LOW-confidence Candidates (double-flagged) rather than
-            # vanishing into Review — the reviewer decides.
-            dep, group = sorted(exact_open)[0]
+            # vanishing into Review — the reviewer decides.  A payer
+            # contradiction bars even the Candidate.
+            uncontra = [(d, g) for d, g in exact_open
+                        if not payer_contradiction(bsl, g)]
+            if not uncontra:
+                continue
+            dep, group = sorted(uncontra)[0]
             place(bsl, CANDIDATE, CONF_LOW, _sorted(group),
                   ["AMOUNT_ONLY_GROUP", "DATE_CONFLICT"],
                   f"ORT deposit d:{dep} sums to BSL but carries no reference/"
                   "payer/deposit-type corroboration and no member date in band"
-                  + (f"; {len(exact_open)} equal-sum deposit(s)."
-                     if len(exact_open) > 1 else "."),
+                  + (f"; {len(uncontra)} equal-sum deposit(s)."
+                     if len(uncontra) > 1 else "."),
                   "P4_deposit_group")
             continue
         exact_open = dated
@@ -1685,6 +1910,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                       f"ORT deposit d:{dep} — {len(group)} open receipt(s) sum to BSL; {why}.",
                       "P4_deposit_group")
             else:
+                if payer_contradiction(bsl, group):
+                    continue
                 place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
                       ["AMOUNT_ONLY_GROUP"],
                       f"ORT deposit d:{dep} sums to BSL but carries no reference/payer/deposit-type corroboration.",
@@ -1697,11 +1924,15 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                       f"ORT deposit d:{dep} uniquely corroborated among {len(exact_open)} equal-sum deposits.",
                       "P4_deposit_group")
             else:
-                dep, group = sorted(exact_open)[0]
+                uncontra = [(d, g) for d, g in exact_open
+                            if not payer_contradiction(bsl, g)]
+                if not uncontra:
+                    continue
+                dep, group = sorted(uncontra)[0]
                 place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
                       ["MULTIPLE_EQUAL_CANDIDATES"],
-                      f"{len(exact_open)} deposits sum to BSL: "
-                      + ", ".join(f"d:{d}" for d, _ in sorted(exact_open)[:6]) + ".",
+                      f"{len(uncontra)} deposits sum to BSL: "
+                      + ", ".join(f"d:{d}" for d, _ in sorted(uncontra)[:6]) + ".",
                       "P4_deposit_group")
         elif split_groups:
             dep, group, closed = sorted(split_groups)[0]
@@ -1723,6 +1954,32 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     # ---- P8 Named-payer rules (Amount + Payer) ----------------------
     _p8_named_payer(unplaced, place, pool, ledger, runlog)
 
+    # ---- P8b Deferred stale 1:1 (out-of-band amount+reference ties) --
+    # Held back from P3 so a stale coincidence never shadows a live ORT
+    # chain / merchant / SPN group; whatever survives the group passes is
+    # placed here with the same wording P3 used.
+    for bsl in unplaced():
+        ties = stale_1to1.get(bsl.line_key)
+        if not ties:
+            continue
+        live = [e for e in ties if ledger.is_available(e)]
+        if len(live) == 1:
+            e = live[0]
+            lag = signed_lag(bsl.date, e.date)
+            place(bsl, CANDIDATE, CONF_MEDIUM, [e],
+                  ["DATE_CONFLICT"],
+                  f"Exact amount + reference tie to {e.id}, but the BSL "
+                  f"trails the ST by {lag}d — stale-ST pairing, never a Match.",
+                  "P8b_stale_1to1")
+        elif live:
+            ordered = _sorted(live)
+            place(bsl, CANDIDATE, CONF_MEDIUM, [ordered[0]],
+                  ["MULTIPLE_EQUAL_CANDIDATES", "DATE_CONFLICT"],
+                  f"{len(live)} out-of-band amount+reference ties; citing "
+                  f"{ordered[0].id}, alternates: "
+                  + ", ".join(e.id for e in ordered[1:5]) + ".",
+                  "P8b_stale_1to1")
+
     # ---- P9 Payables debit ------------------------------------------
     for bsl in unplaced():
         if bsl.amount_cents >= 0:
@@ -1736,6 +1993,9 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   [], "Negative BSL matched to single reference-tied open Payables ST.",
                   "P9_payables")
         elif cands:
+            cands = [e for e in cands if not payer_contradiction(bsl, [e])]
+            if not cands:
+                continue
             ordered = _sorted(cands)
             place(bsl, CANDIDATE, CONF_LOW, [ordered[0]],
                   ["MISSING_REFERENCE"],
@@ -1744,6 +2004,55 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   + (", alternates: " + ", ".join(e.id for e in ordered[1:4])
                      if len(ordered) > 1 else "") + ".",
                   "P9_payables")
+
+    # ---- P9b Amount-only singles -> LOW candidates -------------------
+    # Reverse-engineered from the reference reconciliation (2026-07-11): an
+    # unplaced BSL with open exact-cents ST(s) surfaces as a LOW Candidate
+    # naming them — the hard guardrail still bars a Match without
+    # corroboration, and a payer contradiction bars even the Candidate.
+    for bsl in unplaced():
+        elig = []
+        for e in _open_entries(pool, ledger):
+            if not _amount_matches(bsl, e):
+                continue
+            if e.source in JOURNAL_SOURCES:
+                continue
+            if e.is_mid and bsl.lane != LANE_MERCHANT:
+                continue
+            if not _type_gate_ok(bsl, e):
+                continue
+            if payer_contradiction(bsl, [e]):
+                continue
+            elig.append(e)
+        if not elig:
+            continue
+        inband = [e for e in elig
+                  if date_ok_directional(signed_lag(bsl.date, e.date))]
+        if inband:
+            ordered = _sorted(inband)
+            place(bsl, CANDIDATE, CONF_LOW, [ordered[0]],
+                  ["AMOUNT_ONLY"],
+                  f"AMOUNT_ONLY: {len(inband)} open ST(s) at exact cents but "
+                  f"zero cross-reference corroboration; citing {ordered[0].id}"
+                  + (", alternates: " + ", ".join(e.id for e in ordered[1:5])
+                     if len(ordered) > 1 else "")
+                  + ". Hard guardrail bars Match without corroboration.",
+                  "P9b_amount_only")
+            continue
+        # Only stale exact-cents STs remain: surface as a DATE_GATE Candidate
+        # when at least a digit-run tie corroborates; a zero-evidence stale
+        # coincidence stays Review.
+        evid = [e for e in elig if cross_digit_tie(bsl, e)]
+        if evid:
+            ordered = _sorted(evid)
+            lag = signed_lag(bsl.date, ordered[0].date)
+            place(bsl, CANDIDATE, CONF_LOW, [ordered[0]],
+                  ["DATE_GATE"],
+                  f"DATE_GATE: only exact-cents ST(s) precede the BSL by 8+ "
+                  f"days (lag {lag}d); digit-run evidence only; citing "
+                  f"{ordered[0].id}. Revised gate bars Match.",
+                  "P9b_amount_only")
+    runlog["p9b_amount_only"] = "ran"
 
     # ---- P10 Residual -> Review -------------------------------------
     for bsl in unplaced():
