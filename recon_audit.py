@@ -351,8 +351,22 @@ def _read_output_tabs(recon_path):
 
 # ---- the audit --------------------------------------------------------
 
-RECON_HEADER = ["BSL Date", "BSL Line Info", "BSL Amount", "ST Date(s)",
-                "ST Number(s)", "Confidence", "ORT d:", "ORT r:", "Explanation"]
+# HARD GUARDRAIL (owner, 2026-07-11): the 19-column layout carrying ALL BSL
+# identifier fields and ALL ST detail fields is pinned — C9 fails any drift.
+RECON_HEADER = [
+    "BSL Date", "BSL Line Info", "BSL Amount",
+    "BSL Reference", "BSL Additional Information", "BSL Customer Reference",
+    "BSL Account Servicer Reference", "BSL Transaction Type",
+    "ST Date(s)", "ST Number(s)", "ST Amount(s)", "ST Reference(s)",
+    "ST Structured Payment Reference(s)", "ST Counterparty(ies)",
+    "ST Source(s)",
+    "Confidence", "ORT d:", "ORT r:", "Explanation",
+]
+NCOLS = len(RECON_HEADER)
+# Column indexes (audit-side view of the pinned layout).
+COL_DATE, COL_INFO, COL_AMT = 0, 1, 2
+COL_ST_DATES, COL_ST_NUMS, COL_ST_AMTS = 8, 9, 10
+COL_DEP, COL_REC, COL_EXPL = 16, 17, 18
 
 
 def audit(input_dir, recon_path, account):
@@ -402,12 +416,12 @@ def audit(input_dir, recon_path, account):
     #  and a BSL amount; deep re-sum requires the pool, out of audit scope.)
     c2_ok = True
     for r in match_rows:
-        if _cents(r[2]) is None or not _N(r[4]):
+        if _cents(r[COL_AMT]) is None or not _N(r[COL_ST_NUMS]):
             c2_ok = False
             failures.append(f"C2: Match row missing amount or ST number: {r[:5]}")
     # Owner doctrine: a Candidate without an ST citation must not exist.
     for r in cand_rows:
-        if not _N(r[4]):
+        if not _N(r[COL_ST_NUMS]):
             c2_ok = False
             failures.append(f"C2: Candidate row cites no ST: {r[:3]}")
     checks["C2"] = "PASS" if c2_ok else "FAIL"
@@ -417,7 +431,7 @@ def audit(input_dir, recon_path, account):
     c3_ok = True
     for label, rows in (("Match", match_rows), ("Candidate", cand_rows)):
         for r in rows:
-            for st in _split_multi(r[4]):
+            for st in _split_multi(r[COL_ST_NUMS]):
                 if st in seen:
                     c3_ok = False
                     failures.append(f"C3: ST {st} reused ({seen[st]} and {label})")
@@ -430,13 +444,13 @@ def audit(input_dir, recon_path, account):
     met_pairs = _reparse_met_pairs(input_dir)
     c4_ok, cited = True, False
     for r in all_out:
-        for dep in _split_multi(r[6]):
+        for dep in _split_multi(r[COL_DEP]):
             if dep:
                 cited = True
                 if ("d", dep) not in met_pairs:
                     c4_ok = False
                     failures.append(f"C4: cited d:{dep} not a real MET deposit")
-        for rec in _split_multi(r[7]):
+        for rec in _split_multi(r[COL_REC]):
             if rec:
                 cited = True
                 if ("r", rec) not in met_pairs:
@@ -450,7 +464,7 @@ def audit(input_dir, recon_path, account):
     # C5 dual-fire excluded from Matches (a Match may not cite the same ST twice).
     c5_ok = True
     for r in match_rows:
-        sts = _split_multi(r[4])
+        sts = _split_multi(r[COL_ST_NUMS])
         if len(sts) != len(set(sts)):
             c5_ok = False
             failures.append(f"C5: dual-fire ST in a Match row: {sts}")
@@ -473,7 +487,7 @@ def audit(input_dir, recon_path, account):
         # non-merchant description with an ORT/ST cross that shouldn't be MID.
         # Conservative: pass unless a MID appears with no merchant context AND
         # the explanation names a non-merchant lane.
-        if has_mid and not merchant and "card" not in _N(r[8]).lower() and "MID" in _N(r[8]):
+        if has_mid and not merchant and "card" not in _N(r[COL_EXPL]).lower() and "MID" in _N(r[COL_EXPL]):
             c7_ok = False
             failures.append(f"C7: MID guardrail suspected on non-merchant Match: {r[:2]}")
     checks["C7"] = "PASS" if c7_ok else "FAIL"
@@ -485,7 +499,7 @@ def audit(input_dir, recon_path, account):
     c8_ok = True
     for r in match_rows:
         bdt = _parse_date(r[0])
-        st_dates = [_parse_date(x) for x in _split_multi(r[3])]
+        st_dates = [_parse_date(x) for x in _split_multi(r[COL_ST_DATES])]
         st_dates = [d for d in st_dates if d]
         if bdt is None or not st_dates:
             continue
@@ -516,9 +530,9 @@ def audit(input_dir, recon_path, account):
             failures.append(f"C9: {t} freeze {fmt['freeze']} != A4")
         # header row (row index 2 == spreadsheet row 3) must equal RECON_HEADER
         rows = tabs[t]
-        if len(rows) < 3 or [_N(c) for c in rows[2][:9]] != RECON_HEADER:
+        if len(rows) < 3 or [_N(c) for c in rows[2][:NCOLS]] != RECON_HEADER:
             c9_ok = False
-            failures.append(f"C9: {t} header row does not match the 9-column standard")
+            failures.append(f"C9: {t} header row does not match the pinned {NCOLS}-column standard")
         # zero formula cells
         for r in rows:
             for c in r:
@@ -532,7 +546,7 @@ def audit(input_dir, recon_path, account):
     c10_ok = True
     for t in expected_tabs:
         for r in data_rows(t):
-            if len([c for c in r if _N(c)]) > 9 and any(_N(c) for c in r[9:]):
+            if any(_N(c) for c in r[NCOLS:]):
                 c10_ok = False
                 failures.append(f"C10: extra provenance column in {t}: {r}")
     checks["C10"] = "PASS" if c10_ok else "FAIL"
