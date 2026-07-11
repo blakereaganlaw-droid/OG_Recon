@@ -32,7 +32,7 @@ and spec disagree, the spec wins — fix the code.
 ```bash
 python3 run_recon.py <upload_dir_or_files>          # one upload = one run folder
 python3 recon_engine.py <input_dir> -o ./outputs    # direct engine invocation
-python3 -m unittest test_recon -v                   # 47 tests
+python3 -m unittest test_recon -v                   # 56 tests
 ```
 
 Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
@@ -85,6 +85,16 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
 
 - Any change to matching logic must keep `python3 -m unittest test_recon` green
   and the synthetic end-to-end audit at `status: PASS`.
-- Real-data validation (spec §16 step 8: reproduce known Oracle groups on a
-  fully-reconciled account like FHB UTC) needs the actual export files, which
-  are **not** in the repo. The synthetic fixture stands in until they are.
+- **Real-data validated (2026-07-10, FHB Master UNR exports):** router,
+  binder, MET scope join (all-accounts export filtered by long→short bank
+  name), MET↔ST 1:1 bridge (13,715/13,863 bridged; never duplicated), native
+  `DEPOSIT_ID`/`RECEIPT_ID` columns preferred over `d:/r:` description parse,
+  ORT deposit-group pass (P4 phase 2), NA-placeholder nulling, integer
+  reference cells (an int is a reference, not an Excel date serial), `.xlsb`
+  via pyxlsb. Real exports are NOT committed; `TestRealDataShapes` pins their
+  shapes synthetically. The relationship docs
+  (`UT_Recon_ORT_Data_Relationships.md`, SPN companion) are the domain
+  authority for joins/gates alongside the spec.
+- UNR-only exports are residuals: Oracle already took the easy matches, so
+  low Match counts with precise Candidate/Review causes are CORRECT there,
+  not a defect. Receipts/Edison/GMS exports enrich what can match.

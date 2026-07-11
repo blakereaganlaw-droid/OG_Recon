@@ -35,6 +35,7 @@ in recon_audit.py and imports nothing from here.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -194,6 +195,7 @@ def parse_date(v):
     return None
 
 
+@functools.lru_cache(maxsize=1 << 18)
 def znorm(s) -> str:
     """Uppercase, strip non-alphanumerics (for reference equality)."""
     return _NON_ALNUM_RE.sub("", N(s)).upper()
@@ -254,21 +256,26 @@ def signed_lag(bsl_date, st_date):
 
 # ---- Reference equality / tie (Section 7 trailer) --------------------
 
+_NULL_REF_TOKENS = {"NA", "NONE", "NULL", "UNKNOWN"}
+
+
+def clean_ref(v):
+    """Null out placeholder reference tokens: a literal 'NA' must never tie
+    another literal 'NA' (37 of 283 real FHB Master BSL references are 'NA')."""
+    s = N(v)
+    return "" if znorm(s) in _NULL_REF_TOKENS else s
+
+
 def reference_equal(a, b) -> bool:
     """znorm equality OR full containment of one znorm token inside the other
     for length >= 6.  A sibling pair is a conflict, never equal."""
     za, zb = znorm(a), znorm(b)
     if not za or not zb:
         return False
-    if sibling(a, b):
+    hit = (za == zb) or (len(za) >= 6 and za in zb) or (len(zb) >= 6 and zb in za)
+    if not hit:
         return False
-    if za == zb:
-        return True
-    if len(za) >= 6 and za in zb:
-        return True
-    if len(zb) >= 6 and zb in za:
-        return True
-    return False
+    return not sibling(a, b)
 
 
 def reference_tie(a, b) -> bool:
@@ -305,9 +312,11 @@ class RouterRule:
 # shapes"; `excludes` handles the "not All_Data" style negative constraints.
 ROUTER_TABLE = [
     RouterRule("BSL", ["bsl"], ["all_data"], [], "first", True),
-    RouterRule("ST", [], [], ["_st", "account_st"], "first", False),
     RouterRule("ALL_DATA", ["all_data"], [], [], "multi", False),
     RouterRule("MET", ["met"], [], [], "first", False),
+    # "_st" alone is too greedy: it matches All_Status / Rosetta_Stone /
+    # _Statement.  Require a separator (or end) after the token.
+    RouterRule("ST", [], [], ["_st_", "_st.", "account_st"], "first", False),
     RouterRule("RECEIPTS", [], [], ["receivables_receipts", "receipts_all"], "Export to Excel", False),
     RouterRule("ORT_AR", ["ort", "ar"], [], [], "Report", False),
     RouterRule("ORT_MISC", ["ort", "misc"], [], [], "Report", False),
@@ -385,6 +394,17 @@ def infer_account(filename) -> str | None:
     return None
 
 
+def account_of_bank_name(name):
+    """Map a long bank-account name ("FHB - Master Account") to the short
+    engine account (FHB_MASTER) — the scope join of ORT doc section 4.6.
+    Returns None for names belonging to no configured account."""
+    low = N(name).lower()
+    for short, tokens in _ACCOUNT_TOKENS:
+        if _tokens_present(low, tokens):
+            return short
+    return None
+
+
 def _leading_date_key(filename):
     """Newest plausible YYYYMMDD stamp in the filename ('00000000' if none).
     An 8-digit run that does not parse as a calendar date (an account or
@@ -448,6 +468,7 @@ class RoleSpec:
     predicate: object  # fn(cell) -> bool
 
 
+@functools.lru_cache(maxsize=1 << 17)
 def _norm_header(h) -> str:
     return re.sub(r"[^A-Z0-9]", "", N(h).upper())
 
@@ -466,7 +487,13 @@ def pred_reference(v):
     s = N(v)
     if not s:
         return False
-    if parse_date(v) is not None:
+    # Reject only genuinely date-shaped values.  A bare integer is a
+    # plausible reference: real Oracle exports deliver references and
+    # transaction numbers as ints (1390, 852256), which parse_date would
+    # otherwise swallow as Excel serials and poison the content score.
+    if isinstance(v, (datetime, date)):
+        return False
+    if isinstance(v, str) and not s.isdigit() and parse_date(s) is not None:
         return False
     return bool(re.search(r"[A-Za-z0-9]", s))
 
@@ -519,10 +546,12 @@ _MET_DESC_RE = re.compile(r"(?i)\b[dr]\s*:\s*\d+")
 
 
 def pred_met_description(v):
-    """MET CET_DESCRIPTION carries d:/r: citations and/or pipe segments; a
-    generic text column satisfies neither, so content can decide the bind."""
-    s = N(v)
-    return bool(_MET_DESC_RE.search(s)) or "|" in s
+    """MET CET_DESCRIPTION carries 'd:N | r:N | payer/purpose...' — at least
+    two pipe segments.  The composite ID column ('d:N | r:N', one pipe) and
+    generic text columns must not satisfy this, so content scoring cannot
+    prefer a stub column over the real description (real FHB Master lesson:
+    the ID column scored 1.0 and hid every payer string)."""
+    return N(v).count("|") >= 2
 
 
 def pred_any(v):  # non-empty
@@ -629,7 +658,7 @@ def _rs(required, aliases, pred):
 BSL_ROLES = {
     "date": _rs(True, ["Transaction Date", "Booking Date", "Value Date", "Date", "Post Date"], pred_date),
     "amount": _rs(True, ["Amount", "Transaction Amount", "Signed Amount"], pred_signed_amount),
-    "line_key": _rs(True, ["Line Number", "Statement Line", "Line", "Bank Statement Line", "Sequence"], pred_number),
+    "line_key": _rs(True, ["Line Number", "Statement Line", "Statement", "Line", "Bank Statement Line", "Sequence"], pred_number),
     "reference": _rs(False, ["Reference", "Bank Reference", "Recon Reference"], pred_reference),
     "account_servicer_reference": _rs(False, ["Account Servicer Reference", "Servicer Reference"], pred_reference),
     "customer_reference": _rs(False, ["Customer Reference"], pred_reference),
@@ -665,8 +694,15 @@ MET_ROLES = {
     "trx_id": _rs(True, ["CET Transaction ID", "Transaction Number", "Trx Id", "Transaction Id"], pred_reference),
     "amount": _rs(True, ["Amount", "Transaction Amount"], pred_signed_amount),
     "transaction_date": _rs(True, ["Transaction Date", "Date"], pred_date),
-    "status": _rs(True, ["Status", "State"], pred_any),
-    "description": _rs(True, ["CET Description", "Description", "Desc"], pred_met_description),
+    "status": _rs(True, ["CET Status", "Status", "State"], pred_any),
+    # Optional: the real OTBI export carries native DEPOSIT_ID / RECEIPT_ID
+    # columns (authoritative; the d:/r: description parse is the fallback).
+    "description": _rs(False, ["CET Description", "Description", "Desc"], pred_met_description),
+    "deposit_id": _rs(False, ["Deposit ID"], pred_number),
+    "receipt_id": _rs(False, ["Receipt ID"], pred_number),
+    "reference_text": _rs(False, ["CET Reference Text", "Reference Text"], pred_reference),
+    "bank_account_name": _rs(False, ["CBE Bank Account Name", "Bank Account Name", "Bank Account"], pred_any),
+    "transaction_type": _rs(False, ["CET Transaction Type", "Transaction Type"], pred_any),
     "cleared_date": _rs(False, ["Cleared Date"], pred_date),
     "offset": _rs(False, ["Offset Concatenated Segments", "Offset", "GL"], pred_any),
 }
@@ -705,13 +741,25 @@ def _read_sheet_rows(path, sheet_hint):
     Returns (rows, sheet_title).  sheet_hint 'first' or a title substring."""
     from openpyxl import load_workbook
     try:
-        wb = load_workbook(path, read_only=False, data_only=True)
+        wb = load_workbook(path, read_only=True, data_only=True)
+        ws = _pick_sheet(wb, sheet_hint, os.path.basename(path))
+        ws.reset_dimensions()  # never trust stated dimensions (Oracle BI)
+        rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
+        title = ws.title
+        wb.close()
     except Exception as e:
         raise InvalidSourceData(os.path.basename(path), "WORKBOOK", f"load failed: {e}")
-    ws = _pick_sheet(wb, sheet_hint, os.path.basename(path))
-    rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
-    title = ws.title
-    wb.close()
+    if len(rows) <= 1:
+        # Pathological export the streaming reader cannot see — take the
+        # slow full-parse path before concluding the sheet is empty.
+        try:
+            wb = load_workbook(path, read_only=False, data_only=True)
+        except Exception as e:
+            raise InvalidSourceData(os.path.basename(path), "WORKBOOK", f"load failed: {e}")
+        ws = _pick_sheet(wb, sheet_hint, os.path.basename(path))
+        rows = [tuple(r) for r in ws.iter_rows(values_only=True)]
+        title = ws.title
+        wb.close()
     return rows, title
 
 
@@ -752,13 +800,45 @@ def _read_csv_rows(path):
     return [tuple(r) for r in rows]
 
 
+def _read_xlsb_rows(path, sheet_hint):
+    """Binary workbook reader (pyxlsb).  Dates arrive as Excel serials, which
+    parse_date already accepts."""
+    try:
+        from pyxlsb import open_workbook
+    except ImportError:
+        raise InvalidSourceData(
+            os.path.basename(path), "WORKBOOK",
+            ".xlsb requires the pyxlsb package (pip install pyxlsb) — or "
+            "re-export the file as .xlsx")
+    with open_workbook(path) as wb:
+        names = wb.sheets
+        target = names[0]
+        if sheet_hint not in ("first", "multi", "all", "reference", "stream", None):
+            low = sheet_hint.lower().strip()
+            matches = [n for n in names if low in n.lower()]
+            exact = [n for n in matches if n.lower().strip() == low]
+            if exact:
+                target = exact[0]
+            elif len(matches) > 1:
+                raise InvalidSourceData(
+                    os.path.basename(path), sheet_hint,
+                    f"multiple sheets match {sheet_hint!r}: {matches}")
+            elif matches:
+                target = matches[0]
+        with wb.get_sheet(target) as ws:
+            rows = [tuple(c.v for c in row) for row in ws.rows()]
+    return rows, target
+
+
 def read_rows(routed_file: RoutedFile):
-    """Dispatch to xlsx or csv loader based on extension.  Wraps failures in
-    InvalidSourceData (Section 15.5)."""
+    """Dispatch to xlsx/xlsb/csv loader based on extension.  Wraps failures
+    in InvalidSourceData (Section 15.5)."""
     ext = os.path.splitext(routed_file.path)[1].lower()
     try:
         if ext == ".csv":
             return _read_csv_rows(routed_file.path), "csv"
+        if ext == ".xlsb":
+            return _read_xlsb_rows(routed_file.path, routed_file.sheet_hint)
         return _read_sheet_rows(routed_file.path, routed_file.sheet_hint)
     except InvalidSourceData:
         raise
@@ -793,11 +873,12 @@ class PoolEntry:
     origin: str = ""        # which file/role produced it (for run log)
     deposit_id: str = ""    # ORT d:
     receipt_id: str = ""    # ORT r:
+    transaction_type: str = ""  # Credit Card / Check / EFT (type gate)
 
 
 def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
-              available, origin, deposit_id="", receipt_id=""):
-    ref = N(reference)
+              available, origin, deposit_id="", receipt_id="", transaction_type=""):
+    ref = clean_ref(reference)
     return PoolEntry(
         id=N(id),
         amount_cents=amount_cents,
@@ -815,6 +896,7 @@ def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
         origin=origin,
         deposit_id=N(deposit_id),
         receipt_id=N(receipt_id),
+        transaction_type=N(transaction_type),
     )
 
 
@@ -878,9 +960,12 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 status="UNR",
                 available=(src_norm not in JOURNAL_SOURCES),  # journals kept but ineligible
                 origin="ST",
+                transaction_type=_cell(r, m.get("transaction_type")),
             )
-            # Do not add Receivables rows from the ST export (Section 8.2).
-            if src_norm == "AR":
+            # The RECEIPTS export is authoritative for Receivables rows
+            # (Section 8.2) — but only when it exists; with no receipts file
+            # the ST export's AR rows are the only Receivables data we have.
+            if src_norm == "AR" and loaded.get("RECEIPTS"):
                 continue
             raw.append(e)
         deduped = _dedup_keep_largest(raw, lambda e: e.id)
@@ -920,22 +1005,42 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
     if met:
         rows, m, hi = met["rows"], met["map"], met["header_index"]
         raw = []
+        met_total = 0
+        scoped = m.get("bank_account_name") is not None and account and account != "UNKNOWN"
         for r in rows[hi + 1:]:
+            met_total += 1
+            # Scope join (ORT doc section 4.6): the MET export spans EVERY
+            # account; keep only rows whose long bank-account name maps to
+            # the account being reconciled.  Cross-account rows never enter
+            # the pool — a cross-account amount hit must not become a Match.
+            if scoped and account_of_bank_name(_cell(r, m.get("bank_account_name"))) != account:
+                continue
             amt = cents(_cell(r, m.get("amount")))
             trx = N(_cell(r, m.get("trx_id")))
             if amt is None or not trx:
                 continue
             desc = N(_cell(r, m.get("description")))
-            dep_id, rec_id, _payer = parse_met_description(desc)
+            dep_desc, rec_desc, _payer = parse_met_description(desc)
+            # Native DEPOSIT_ID / RECEIPT_ID columns are authoritative; the
+            # d:/r: description parse is the fallback (they agree on 160,692
+            # of 160,692 overlapping real rows).
+            dep_id = N(_cell(r, m.get("deposit_id"))) or dep_desc
+            rec_id = N(_cell(r, m.get("receipt_id"))) or rec_desc
+            ref_text = clean_ref(_cell(r, m.get("reference_text")))
             cleared = parse_date(_cell(r, m.get("cleared_date")))
             status_raw = _norm_header(_cell(r, m.get("status")))
-            # cleared_date present => closed (Section 8.3).
-            closed = cleared is not None or status_raw in CLOSED_RECEIPT_STATUSES
+            # Status is authoritative when present; the cleared-date=>closed
+            # inference (Section 8.3) applies only when status is absent —
+            # the real OTBI export stamps CET_CLEARED_DATE on UNR rows too.
+            if status_raw:
+                closed = status_raw in CLOSED_RECEIPT_STATUSES
+            else:
+                closed = cleared is not None
             e = _mk_entry(
                 id=trx,
                 amount_cents=amt,
                 dt=parse_date(_cell(r, m.get("transaction_date"))),
-                reference=_met_reference(desc) or trx,
+                reference=ref_text or _met_reference(desc) or trx,
                 counterparty=_payer,
                 source="EXT",
                 status=status_raw or ("REC" if closed else "UNR"),
@@ -943,11 +1048,40 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 origin="MET",
                 deposit_id=dep_id,
                 receipt_id=rec_id,
+                transaction_type=_cell(r, m.get("transaction_type")),
             )
             raw.append(e)
         deduped = _dedup_keep_largest(raw, lambda e: e.id)
-        pool.extend(deduped)
         counts["MET"] = len(deduped)
+        if scoped:
+            runlog["met_scope"] = {"rows_total": met_total, "rows_in_account": len(raw)}
+        # MET <-> ST bridge (CET_TRANSACTION_ID == ST Transaction Number, a
+        # 1:1 bijection): the same transaction must never sit in the pool
+        # twice, or reference groups double-count.  The ST export row is
+        # canonical; borrow the bridge fields the MET copy carries.  MET-only
+        # transactions join the pool as their own entries.
+        by_id = {e.id: e for e in pool}
+        merged = 0
+        for e in deduped:
+            prev = by_id.get(e.id)
+            if prev is None:
+                pool.append(e)
+                continue
+            merged += 1
+            if not prev.deposit_id:
+                prev.deposit_id = e.deposit_id
+            if not prev.receipt_id:
+                prev.receipt_id = e.receipt_id
+            if not prev.counterparty and e.counterparty:
+                prev.counterparty = e.counterparty
+                prev.payer_tokens = prev.payer_tokens | payer_tokens(e.counterparty)
+            if (not prev.reference or prev.reference == prev.id) and \
+                    e.reference and e.reference != e.id:
+                prev.reference = e.reference
+                prev.znref = znorm(e.reference)
+                prev.digits = digit_runs(e.reference)
+                prev.is_mid = prev.is_mid or e.is_mid
+        runlog["met_bridged_to_st"] = merged
 
     runlog["pool_sizes"] = counts
     runlog["pool_total"] = len(pool)
@@ -1054,8 +1188,9 @@ class BSL:
 def build_recon_reference(reference, account_servicer_reference, transaction_code):
     """RECON_REFERENCE is the whole Account Servicer Reference for the FHB
     whole-ref transaction codes (Parse Rules (X~)); fall back to reference."""
-    asr = N(account_servicer_reference)
+    asr = clean_ref(account_servicer_reference)
     code = N(transaction_code)
+    reference = clean_ref(reference)
     if code in FHB_WHOLE_REF_CODES and asr:
         return asr
     if asr:
@@ -1227,6 +1362,18 @@ class Placement:
 # Section 9 — FORWARD pipeline (fixed order; later never overrides earlier)
 # ======================================================================
 
+def _type_gate_ok(bsl, e):
+    """Deterministic type gate (ORT doc section 5.2): a Credit Card ST never
+    pairs with a Check or Miscellaneous bank line.  EFT is never rejected on
+    the label alone."""
+    et = _norm_header(e.transaction_type)
+    if "CREDITCARD" in et:
+        bt = _norm_header(bsl.transaction_type)
+        if "CHECK" in bt or "MISC" in bt:
+            return False
+    return True
+
+
 def _open_entries(pool, ledger):
     return [e for e in pool if ledger.is_available(e)]
 
@@ -1263,7 +1410,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         return [b for b in bsls if b.line_key not in placements]
 
     # ---- P2 DATA_FEED_ERROR sweep -----------------------------------
-    feed_errors = _p2_data_feed_errors(loaded)
+    feed_errors = _p2_data_feed_errors(loaded, account)
     runlog.setdefault("p2_data_feed_errors", len(feed_errors))
 
     # ---- P3 Exact reference 1:1 (Amount + Reference) ----------------
@@ -1278,10 +1425,14 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             lag = signed_lag(bsl.date, e.date)
             if not date_ok_general(lag):
                 continue
-            # Guardrails: journal never matches; MID-into-non-merchant conflict.
+            # Guardrails: journal never matches; MID-into-non-merchant
+            # conflict; deterministic type gate (Credit Card ST never pairs
+            # with a Check/Miscellaneous line).
             if e.source in JOURNAL_SOURCES:
                 continue
             if e.is_mid and bsl.lane != LANE_MERCHANT:
+                continue
+            if not _type_gate_ok(bsl, e):
                 continue
             cands.append(e)
         if len(cands) == 1:
@@ -1322,6 +1473,98 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 place(bsl, MATCH, CONF_HIGH, _sorted(group),
                       [], f"1:M reference group of {len(group)} deduped receipt(s) sums to BSL; reference tie holds.",
                       "P4_ref_group")
+
+    # ---- P4 phase 2: ORT deposit group (d: chain) --------------------
+    # Primary ORT path (relationship doc §3): index MET rows by DEPOSIT_ID;
+    # the deposit's deduped open receipts sum to one BSL.  An exact sum is
+    # necessary, never sufficient — corroborate by (a) reference tie,
+    # (b) payer tie, or (c) deposit-type consistency for bundled DEPOSIT
+    # lines.  All-status context: closed members completing the sum mean an
+    # auto-rec split -> Candidate naming them.
+    deposit_index = {}
+    for e in pool:
+        if e.deposit_id and e.source not in JOURNAL_SOURCES:
+            deposit_index.setdefault(e.deposit_id, []).append(e)
+    # Dedup each deposit by receipt_id (dual-fire) and by id, deterministically.
+    for dep, members in deposit_index.items():
+        seen_id, seen_rid, uniq = set(), set(), []
+        for e in _sorted(members):
+            if e.id in seen_id:
+                continue
+            if e.receipt_id:
+                if e.receipt_id in seen_rid:
+                    continue
+                seen_rid.add(e.receipt_id)
+            seen_id.add(e.id)
+            uniq.append(e)
+        deposit_index[dep] = uniq
+
+    def _deposit_corroboration(bsl, members):
+        for e in members:
+            if reference_equal(bsl.recon_reference, e.reference) or                reference_equal(bsl.recon_reference, e.id) or                reference_tie(bsl.recon_reference, e.reference):
+                return "reference tie"
+        for e in members:
+            if e.payer_tokens & bsl.payer_tokens:
+                return "payer tie"
+        bt = _norm_header(bsl.transaction_type) + _norm_header(bsl.additional_info)
+        if "DEPOSIT" in bt or N(bsl.transaction_code) in ("174", "195"):
+            return "deposit-type consistency"
+        return ""
+
+    for bsl in unplaced():
+        if bsl.lane == LANE_STATE:
+            continue
+        exact_open, split_groups = [], []
+        for dep, members in deposit_index.items():
+            gated = [e for e in members if _type_gate_ok(bsl, e)]
+            if not gated:
+                continue
+            open_m = [e for e in gated if ledger.is_available(e)]
+            if not open_m:
+                continue
+            if sum(e.amount_cents for e in open_m) == bsl.amount_cents:
+                exact_open.append((dep, open_m))
+            elif sum(e.amount_cents for e in gated) == bsl.amount_cents:
+                closed = [e for e in gated if not e.available]
+                if closed:
+                    split_groups.append((dep, gated, closed))
+        # Date plausibility: at least one member inside the +-15 window.
+        exact_open = [(d, g) for d, g in exact_open
+                      if any(date_ok_general(signed_lag(bsl.date, e.date)) for e in g)]
+        if len(exact_open) == 1:
+            dep, group = exact_open[0]
+            why = _deposit_corroboration(bsl, group)
+            if why:
+                place(bsl, MATCH, CONF_HIGH, _sorted(group), [],
+                      f"ORT deposit d:{dep} — {len(group)} open receipt(s) sum to BSL; {why}.",
+                      "P4_deposit_group")
+            else:
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                      ["AMOUNT_ONLY_GROUP"],
+                      f"ORT deposit d:{dep} sums to BSL but carries no reference/payer/deposit-type corroboration.",
+                      "P4_deposit_group")
+        elif len(exact_open) > 1:
+            corroborated = [(d, g) for d, g in exact_open if _deposit_corroboration(bsl, g)]
+            if len(corroborated) == 1:
+                dep, group = corroborated[0]
+                place(bsl, MATCH, CONF_HIGH, _sorted(group), [],
+                      f"ORT deposit d:{dep} uniquely corroborated among {len(exact_open)} equal-sum deposits.",
+                      "P4_deposit_group")
+            else:
+                dep, group = sorted(exact_open)[0]
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                      ["MULTIPLE_EQUAL_CANDIDATES"],
+                      f"{len(exact_open)} deposits sum to BSL: "
+                      + ", ".join(f"d:{d}" for d, _ in sorted(exact_open)[:6]) + ".",
+                      "P4_deposit_group")
+        elif split_groups:
+            dep, group, closed = sorted(split_groups)[0]
+            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                  ["POSSIBLE_AUTO_REC_SPLIT"],
+                  f"ORT deposit d:{dep} sums to BSL only with already-closed member(s): "
+                  + ", ".join(sorted(m.id for m in closed))
+                  + " (auto-rec split; run Unreconcile2).",
+                  "P4_deposit_group")
 
     # ---- P5 STATE / Edison bundle -----------------------------------
     state_ran = _p5_state(unplaced, place, pool, ledger, loaded, runlog)
@@ -1378,14 +1621,28 @@ def _sorted(entries):
                                           e.id))
 
 
-def _p2_data_feed_errors(loaded):
-    """Open ORT parked receipt ids (r:) absent from MET => DATA_FEED_ERROR."""
+def _norm_id(v):
+    """Normalize a numeric id cell: ints/floats from Excel/xlsb ('64017.0')
+    become bare digit strings."""
+    s = N(v)
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
+def _p2_data_feed_errors(loaded, account=None):
+    """Open ORT parked receipt ids absent from MET => DATA_FEED_ERROR.
+    Prefers the ORT export's bound Parked Receipt ID column (scoped to the
+    account's bank name); falls back to the r:-token text scan."""
     met = loaded.get("MET")
     if not met:
         return []
     met_receipt_ids = set()
     rows, m, hi = met["rows"], met["map"], met["header_index"]
     for r in rows[hi + 1:]:
+        rid = _norm_id(_cell(r, m.get("receipt_id")))
+        if rid:
+            met_receipt_ids.add(rid)
         desc = N(_cell(r, m.get("description")))
         _, rec_id, _ = parse_met_description(desc)
         if rec_id:
@@ -1396,8 +1653,19 @@ def _p2_data_feed_errors(loaded):
         if not src:
             continue
         rows, m, hi = src["rows"], src["map"], src["header_index"]
+        prid = m.get("parked_receipt_id")
+        bank = m.get("bank_name")
+        if prid is not None:
+            for r in rows[hi + 1:]:
+                if bank is not None and account and account != "UNKNOWN" and \
+                        account_of_bank_name(_cell(r, bank)) != account:
+                    continue
+                rid = _norm_id(_cell(r, prid))
+                if rid and rid not in met_receipt_ids:
+                    errors.append(rid)
+            continue
         for r in rows[hi + 1:]:
-            # heuristic: any r:<id> token appearing in a description-like cell
+            # fallback heuristic: any r:<id> token in a description-like cell
             joined = " ".join(N(c) for c in r)
             for mm in re.finditer(r"r:\s*(\d+)", joined, re.IGNORECASE):
                 rid = mm.group(1)
@@ -1416,6 +1684,8 @@ def _p4_reference_group(bsl, pool, ledger):
     for e in pool:
         if e.source in JOURNAL_SOURCES:
             continue
+        if not _type_gate_ok(bsl, e):
+            continue
         if reference_equal(ref, e.reference) or reference_equal(ref, e.id):
             members.append(e)
     if not members:
@@ -1428,6 +1698,16 @@ def _p4_reference_group(bsl, pool, ledger):
             continue
         seen.add(e.id)
         uniq.append(e)
+    # Dual-fire guard (ORT doc section 6.3): one ORT receipt id spawning two
+    # identical STs — dedup by receipt_id before summing, deterministic keep.
+    seen_rid, deduped = set(), []
+    for e in _sorted(uniq):
+        if e.receipt_id:
+            if e.receipt_id in seen_rid:
+                continue
+            seen_rid.add(e.receipt_id)
+        deduped.append(e)
+    uniq = deduped
     open_members = [e for e in uniq if ledger.is_available(e)]
     closed_members = [e for e in uniq if not e.available]
     # A group needs at least one open member to be actionable.
@@ -1441,6 +1721,13 @@ def _p4_reference_group(bsl, pool, ledger):
     if total_all == bsl.amount_cents and closed_members:
         return uniq, closed_members, False
     return None, [], False
+
+
+def _edison_key(v):
+    """Edison references are zero-padded 10-digit strings; the BSL reference
+    is not (BSL 7182042 = Edison 0007182042).  Compare zero-stripped."""
+    z = znorm(v)
+    return z.lstrip("0") or z
 
 
 def _p5_state(unplaced, place, pool, ledger, loaded, runlog):
@@ -1465,7 +1752,7 @@ def _p5_state(unplaced, place, pool, ledger, loaded, runlog):
     ref_amount = {}
     rows, m, hi = edison_pay["rows"], edison_pay["map"], edison_pay["header_index"]
     for r in rows[hi + 1:]:
-        ref = znorm(_cell(r, m.get("reference")))
+        ref = _edison_key(_cell(r, m.get("reference")))
         inv = znorm(_cell(r, m.get("invoice_number")))
         amt = cents(_cell(r, m.get("amount")))
         if not ref:
@@ -1479,7 +1766,7 @@ def _p5_state(unplaced, place, pool, ledger, loaded, runlog):
     for bsl in unplaced():
         if bsl.lane != LANE_STATE:
             continue
-        eref = znorm(bsl.recon_reference)
+        eref = _edison_key(bsl.recon_reference)
         invoices = ref_invoices.get(eref)
         if not invoices:
             place(bsl, REVIEW, CONF_LOW, [], ["STATE_LANE_ISOLATION", "NO_MATCH_FOUND"],
@@ -1625,6 +1912,8 @@ def _p8_named_payer(unplaced, place, pool, ledger, runlog):
             for e in _open_entries(pool, ledger):
                 if not _amount_matches(bsl, e):
                     continue
+                if not _type_gate_ok(bsl, e):
+                    continue
                 lag = signed_lag(bsl.date, e.date)
                 if not date_ok_general(lag):
                     continue
@@ -1646,24 +1935,46 @@ def _p8_named_payer(unplaced, place, pool, ledger, runlog):
 
 
 def _p10_review_cause(bsl, pool, feed_errors):
-    """Name the dominant Review cause (Section 9 P10)."""
+    """Name the dominant Review cause (Section 9 P10), distinguishing open
+    counterparts from already-reconciled ones and testing the ties it names."""
     exact = [e for e in pool if e.amount_cents == bsl.amount_cents]
+    open_exact = [e for e in exact if e.available]
+    closed_exact = [e for e in exact if not e.available]
+
+    def _tied(entries):
+        return [e for e in entries
+                if reference_tie(bsl.recon_reference, e.reference)
+                or reference_equal(bsl.recon_reference, e.reference)
+                or (e.payer_tokens & bsl.payer_tokens)]
+
     codes = []
     if not exact:
         codes.append("NO_MATCH_FOUND")
         expl = "No exact-amount counterpart in the pool."
-    else:
-        # exact amount exists but no corroboration survived.
-        ref_tie = [e for e in exact if reference_tie(bsl.recon_reference, e.reference)]
-        if bsl.lane == LANE_MERCHANT:
-            codes.append("MID_GUARDRAIL")
-            expl = "Merchant line with exact amount but no in-window card group."
-        elif ref_tie:
+    elif bsl.lane == LANE_MERCHANT and open_exact:
+        codes.append("MID_GUARDRAIL")
+        expl = "Merchant line with exact amount but no in-window card group."
+    elif open_exact:
+        tied = _tied(open_exact)
+        if tied:
             codes.append("DATE_CONFLICT")
-            expl = "Exact amount + reference tie exists but date is out of band."
+            expl = "Exact amount + reference/payer tie exists but date is out of band."
         else:
             codes.append("MISSING_REFERENCE")
-            expl = "Exact amount exists but no reference/payer corroboration."
+            expl = ("Exact-amount open entry exists but shares no reference "
+                    "or payer tie.")
+    else:
+        tied = _tied(closed_exact)
+        codes.append("ALREADY_RECONCILED_COUNTERPART")
+        if tied:
+            expl = ("Only already-reconciled counterpart(s) at this amount — "
+                    + ("payer/reference tie " if tied else "")
+                    + "suggests an auto-rec error: "
+                    + ", ".join(sorted(e.id for e in tied)[:4])
+                    + ". Run Unreconcile2.")
+        else:
+            expl = ("Only already-reconciled (closed) counterpart(s) at this "
+                    "amount; no open entry. Run Unreconcile2 if misdirected.")
     if not bsl.recon_reference:
         codes.append("MISSING_REFERENCE")
     return list(dict.fromkeys(codes)), expl
@@ -1863,20 +2174,24 @@ def load_and_bind(by_role, runlog):
         "EDISON_PAY": EDISON_PAY_ROLES,
         "EDISON_INV": EDISON_INV_ROLES,
         "APPLIED_UNAPPLIED": APPLIED_UNAPPLIED_ROLES,
-        "ORT_AR": {"trx_id": _rs(False, ["Transaction Number"], pred_reference)},
-        "ORT_MISC": {"trx_id": _rs(False, ["Transaction Number"], pred_reference)},
+        "ORT_AR": {"trx_id": _rs(False, ["Transaction Number"], pred_reference),
+                   "parked_receipt_id": _rs(False, ["Parked Receipt ID"], pred_number),
+                   "bank_name": _rs(False, ["BANK_NAME", "Bank Account Name"], pred_any)},
+        "ORT_MISC": {"trx_id": _rs(False, ["Transaction Number"], pred_reference),
+                     "parked_receipt_id": _rs(False, ["Parked Receipt ID"], pred_number),
+                     "bank_name": _rs(False, ["BANK_NAME", "Bank Account Name"], pred_any)},
     }
     bound_report = {}
     for role, files in by_role.items():
         if role == "ALL_DATA":
             continue  # recognized but never loaded (Unreconcile2 owns it)
+        specs = role_specs.get(role)
+        if specs is None and role != "MID_MASTER":
+            continue  # recognized; no binding required at this layer
         rf = _pick_newest(files, role)  # newest YYYYMMDD stamp wins
         if role == "MID_MASTER":
             loaded["MID_MASTER"] = load_mid_master(rf)
             continue
-        specs = role_specs.get(role)
-        if specs is None:
-            continue  # optional file with no binding required at this layer
         try:
             rows, _title = read_rows(rf)
         except InvalidSourceData:
