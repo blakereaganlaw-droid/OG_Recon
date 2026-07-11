@@ -1333,6 +1333,14 @@ def date_band(lag):
     return "REJECT"
 
 
+def date_ok_directional(lag):
+    """Owner doctrine (directional): the BSL may PRECEDE the ST by any
+    amount — receipt-entry lag has no ceiling (lag <= 0 always valid).  The
+    BSL may TRAIL the ST by at most 15 days; a BSL trailing its ST beyond
+    the band is a stale-ST pairing and is never a Match."""
+    return lag is not None and lag <= DATE_CEILING
+
+
 def date_ok_general(lag):
     return lag is not None and abs(lag) <= DATE_CEILING
 
@@ -1497,12 +1505,16 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             cands.append(e)
         ties = cands
         cands = [e for e in ties
-                 if date_ok_general(signed_lag(bsl.date, e.date))]
+                 if date_ok_directional(signed_lag(bsl.date, e.date))]
         if len(cands) == 1:
             e = cands[0]
             lag = signed_lag(bsl.date, e.date)
-            place(bsl, MATCH, CONF_HIGH, [e],
-                  [], f"Exact amount + reference tie (lag {lag}d, band {date_band(lag)}); source {e.source}.",
+            conf = CONF_HIGH if abs(lag) <= DATE_CEILING else CONF_MEDIUM
+            note = "" if abs(lag) <= DATE_CEILING else \
+                f" (receipt-entry lag {-lag}d — BSL precedes ST; no ceiling)"
+            place(bsl, MATCH, conf, [e],
+                  [], f"Exact amount + reference tie (lag {lag}d, band {date_band(lag)})"
+                  f"{note}; source {e.source}.",
                   "P3_exact_1to1")
         elif len(cands) > 1:
             ordered = _sorted(cands)
@@ -1513,14 +1525,14 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   + ", ".join(e.id for e in ordered[1:5]) + ".",
                   "P3_exact_1to1")
         elif len(ties) == 1:
-            # Owner doctrine (2026-07-11): a UNIQUE exact amount+reference
-            # tie is a Match regardless of date — the lag is disclosed, the
-            # confidence lowered, never the pairing destroyed.
+            # Directional doctrine: the only remaining ties here TRAIL the
+            # ST beyond the band (stale-ST) — Candidate, never Match.
             e = ties[0]
             lag = signed_lag(bsl.date, e.date)
-            place(bsl, MATCH, CONF_MEDIUM, [e],
-                  [], f"Exact amount + reference tie; date out of band "
-                  f"(lag {lag}d, band {date_band(lag)}); source {e.source}.",
+            place(bsl, CANDIDATE, CONF_MEDIUM, [e],
+                  ["DATE_CONFLICT"],
+                  f"Exact amount + reference tie to {e.id}, but the BSL "
+                  f"trails the ST by {lag}d — stale-ST pairing, never a Match.",
                   "P3_exact_1to1")
         elif ties:
             ordered = _sorted(ties)
@@ -1539,13 +1551,14 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         if group is None:
             continue
         total = sum(e.amount_cents for e in group)
-        plausible = any(date_ok_general(signed_lag(bsl.date, e.date)) for e in group)
+        plausible = all(date_ok_directional(signed_lag(bsl.date, e.date))
+                        for e in group)
         if total == bsl.amount_cents and not plausible and not closed_members \
                 and not competing:
-            place(bsl, MATCH, CONF_MEDIUM, _sorted(group),
-                  [],
-                  f"1:M reference group of {len(group)} receipt(s) sums to BSL; "
-                  "reference tie holds; no member date in band (lag disclosed).",
+            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                  ["DATE_CONFLICT"],
+                  f"1:M reference group of {len(group)} receipt(s) sums to BSL "
+                  "but the BSL trails a member ST beyond the band (stale-ST).",
                   "P4_ref_group")
             continue
         if total == bsl.amount_cents and plausible:
@@ -1620,19 +1633,21 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 closed = [e for e in gated if not e.available]
                 if closed:
                     split_groups.append((dep, gated, closed))
-        # Date plausibility: at least one member inside the +-15 window
-        # qualifies for Match; a corroborated exact sum with every member
-        # out of window DEMOTES to Candidate (never dropped).
+        # Directional date gate: every member may precede the BSL by at
+        # most 15 days OR be entered after it by any amount (entry lag has
+        # no ceiling); a deposit the BSL trails beyond the band is stale.
         dated = [(d, g) for d, g in exact_open
-                 if any(date_ok_general(signed_lag(bsl.date, e.date)) for e in g)]
+                 if all(date_ok_directional(signed_lag(bsl.date, e.date))
+                        for e in g)]
         if not dated and exact_open:
             corro = [(d, g) for d, g in exact_open if _deposit_corroboration(bsl, g)]
             if len(corro) == 1:
                 dep, group = corro[0]
                 why = _deposit_corroboration(bsl, group)
-                place(bsl, MATCH, CONF_MEDIUM, _sorted(group), [],
-                      f"ORT deposit d:{dep} — {len(group)} open receipt(s) "
-                      f"sum to BSL; {why}; no member date in band (lag disclosed).",
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                      ["DATE_CONFLICT"],
+                      f"ORT deposit d:{dep} sums to BSL with {why}, but the "
+                      "BSL trails the deposit beyond the band (stale-ST).",
                       "P4_deposit_group")
                 continue
             if corro:
@@ -2069,7 +2084,7 @@ def _p8_named_payer(unplaced, place, pool, ledger, runlog):
                 if not _type_gate_ok(bsl, e):
                     continue
                 lag = signed_lag(bsl.date, e.date)
-                if not date_ok_general(lag):
+                if not date_ok_directional(lag):
                     continue
                 cp_z = znorm(e.counterparty)
                 if any(tok in cp_z for tok in cp_tokens):

@@ -887,6 +887,17 @@ class TestRealDataShapes(unittest.TestCase):
         self.assertEqual(n_entries, 0)
         self.assertIn("RECEIPT_ENTRY_BACKLOG", flags)
 
+
+    def test_directional_date_doctrine(self):
+        # BSL may PRECEDE the ST by any amount (entry lag, no ceiling);
+        # BSL trailing the ST beyond the band is stale — never a Match.
+        self.assertTrue(E.date_ok_directional(-300))   # entry lag: valid
+        self.assertTrue(E.date_ok_directional(0))
+        self.assertTrue(E.date_ok_directional(15))
+        self.assertFalse(E.date_ok_directional(16))    # stale-ST: invalid
+        self.assertFalse(E.date_ok_directional(300))
+        self.assertFalse(E.date_ok_directional(None))
+
     def test_type_gate(self):
         b = E.make_bsl("1", date(2026, 7, 1), 1000, "R", "R", "", "Miscellaneous", "399")
         cc = E._mk_entry("S1", 1000, date(2026, 7, 1), "R", "", "EXT", "UNR",
