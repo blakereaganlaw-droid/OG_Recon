@@ -345,8 +345,8 @@ Every non-Match row carries ≥1 exception code from: `AMBIGUOUS_GROUP, MISSING_
 
 ## 13. Output workbook standard (binding)
 
-One reconciliation workbook per account. Tabs: **Matches**, **Candidate Matches**, **Review Notes**. Nine columns:
-`BSL Date · BSL Line Info · BSL Amount · ST Date(s) · ST Number(s) · Confidence · ORT d: · ORT r: · Explanation`.
+One reconciliation workbook per account. Tabs: **Matches**, **Candidate Matches**, **Review Notes**. **HARD GUARDRAIL (owner, 2026-07-11): every row carries ALL BSL identifier fields and ALL ST detail fields — they are essential for reconciliation — and ST lists are NEVER truncated (the ST Number(s) cell lists every cited ST; explanations name every alternate; no ST is ever reused across Matches+Candidates).** Nineteen columns:
+`BSL Date · BSL Line Info · BSL Amount · BSL Reference · BSL Additional Information · BSL Customer Reference · BSL Account Servicer Reference · BSL Transaction Type · ST Date(s) · ST Number(s) · ST Amount(s) · ST Reference(s) · ST Structured Payment Reference(s) · ST Counterparty(ies) · ST Source(s) · Confidence · ORT d: · ORT r: · Explanation`.
 Formatting: Carlito 11pt; header fill **navy FF1F4E78** with white bold text for the forward reconciliation workbook (dark-red **FF7A1F1F** for the backward/forensic workbook and any reference map); title row 1; row 2 blank; headers row 3; data row 4+; freeze panes at A4; dates as `yyyy-mm-dd` text; USD negatives in parentheses; **static values only — zero formula cells** (prepend a space to any value starting with `=`); multi-value cells use comma-space (semicolon-space when a value embeds a thousands-separator comma), dates in the same order as ST numbers. **Every source BSL appears exactly once across the three tabs. No provenance line, band, comment, or extra row anywhere.**
 
 ---

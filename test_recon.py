@@ -750,8 +750,8 @@ class TestRealDataShapes(unittest.TestCase):
         tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
         match_rows = [r for r in tabs["Matches"][3:] if any(A._N(c) for c in r)]
         by_amount = {A._N(r[2]): r for r in match_rows}
-        self.assertEqual(A._N(by_amount["150.00"][6]), "901")  # ORT d:
-        self.assertEqual(A._N(by_amount["150.00"][7]), "13")   # ORT r:
+        self.assertEqual(A._N(by_amount["150.00"][A.COL_DEP]), "901")  # ORT d:
+        self.assertEqual(A._N(by_amount["150.00"][A.COL_REC]), "13")   # ORT r:
 
     def test_deposit_auto_rec_split_is_candidate(self):
         rows = self._met_rows()
@@ -771,7 +771,7 @@ class TestRealDataShapes(unittest.TestCase):
         self.assertEqual(runlog["recon_summary"]["candidates"], 1)
         tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
         cand = [r for r in tabs["Candidate Matches"][3:] if any(A._N(c) for c in r)]
-        self.assertIn("already-closed", A._N(cand[0][8]))
+        self.assertIn("already-closed", A._N(cand[0][A.COL_EXPL]))
 
 
     def test_router_token_hardening(self):

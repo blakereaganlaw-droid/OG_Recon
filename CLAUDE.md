@@ -88,9 +88,11 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   `TestColumnRobustness`.
 - Output cells starting with `=` get a leading space (no formula injection);
   workbooks are **static values only**, zero formula cells.
-- Output format is locked by §13: Carlito 11pt, navy `FF1F4E78` header,
-  freeze `A4`, 9 fixed columns, no provenance rows. The audit's C9/C10 will
-  fail you if you drift. (The dark-red forensic/unwind book is Unreconcile2's.)
+- Output format is locked by §13 (HARD GUARDRAIL, owner 2026-07-11):
+  Carlito 11pt, navy `FF1F4E78` header, freeze `A4`, 19 fixed columns
+  carrying ALL BSL identifier fields and ALL ST detail fields, ST lists
+  never truncated, no ST reused, no provenance rows. The audit's C9/C10
+  will fail you if you drift. (The dark-red forensic/unwind book is Unreconcile2's.)
 
 ## Working rules
 

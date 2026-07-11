@@ -1723,7 +1723,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   ["MULTIPLE_EQUAL_CANDIDATES"],
                   f"{len(cands)} open entries match amount+reference; citing "
                   f"{ordered[0].id}, alternates: "
-                  + ", ".join(e.id for e in ordered[1:5]) + ".",
+                  + ", ".join(e.id for e in ordered[1:]) + ".",
                   "P3_exact_1to1")
         elif ties:
             # Directional doctrine: the only ties here TRAIL the ST beyond
@@ -1932,7 +1932,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
                       ["MULTIPLE_EQUAL_CANDIDATES"],
                       f"{len(uncontra)} deposits sum to BSL: "
-                      + ", ".join(f"d:{d}" for d, _ in sorted(uncontra)[:6]) + ".",
+                      + ", ".join(f"d:{d}" for d, _ in sorted(uncontra)) + ".",
                       "P4_deposit_group")
         elif split_groups:
             dep, group, closed = sorted(split_groups)[0]
@@ -1977,7 +1977,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   ["MULTIPLE_EQUAL_CANDIDATES", "DATE_CONFLICT"],
                   f"{len(live)} out-of-band amount+reference ties; citing "
                   f"{ordered[0].id}, alternates: "
-                  + ", ".join(e.id for e in ordered[1:5]) + ".",
+                  + ", ".join(e.id for e in ordered[1:]) + ".",
                   "P8b_stale_1to1")
 
     # ---- P9 Payables debit ------------------------------------------
@@ -2001,7 +2001,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   ["MISSING_REFERENCE"],
                   "Payables amount match without a clean reference tie; citing "
                   f"{ordered[0].id}"
-                  + (", alternates: " + ", ".join(e.id for e in ordered[1:4])
+                  + (", alternates: " + ", ".join(e.id for e in ordered[1:])
                      if len(ordered) > 1 else "") + ".",
                   "P9_payables")
 
@@ -2034,7 +2034,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   ["AMOUNT_ONLY"],
                   f"AMOUNT_ONLY: {len(inband)} open ST(s) at exact cents but "
                   f"zero cross-reference corroboration; citing {ordered[0].id}"
-                  + (", alternates: " + ", ".join(e.id for e in ordered[1:5])
+                  + (", alternates: " + ", ".join(e.id for e in ordered[1:])
                      if len(ordered) > 1 else "")
                   + ". Hard guardrail bars Match without corroboration.",
                   "P9b_amount_only")
@@ -2385,7 +2385,7 @@ def _p10_review_cause(bsl, pool, feed_errors):
             expl = ("Only already-reconciled counterpart(s) at this amount — "
                     + ("payer/reference tie " if tied else "")
                     + "suggests an auto-rec error: "
-                    + ", ".join(sorted(e.id for e in tied)[:4])
+                    + ", ".join(sorted(e.id for e in tied))
                     + ". Run Unreconcile2.")
         else:
             expl = ("Only already-reconciled (closed) counterpart(s) at this "
@@ -2497,13 +2497,30 @@ def _write_workbook(path, title, tabs, header_fill_hex):
     wb.save(path)
 
 
-RECON_COLUMNS = ["BSL Date", "BSL Line Info", "BSL Amount", "ST Date(s)",
-                 "ST Number(s)", "Confidence", "ORT d:", "ORT r:", "Explanation"]
+# HARD GUARDRAIL (owner, 2026-07-11): the output carries ALL BSL identifier
+# fields and ALL ST detail fields — they are essential for reconciliation.
+# The ST Number(s) cell lists EVERY cited ST, never truncated; the audit's
+# C9 pins this exact 19-column layout and C10 rejects extra columns.
+RECON_COLUMNS = [
+    "BSL Date", "BSL Line Info", "BSL Amount",
+    "BSL Reference", "BSL Additional Information", "BSL Customer Reference",
+    "BSL Account Servicer Reference", "BSL Transaction Type",
+    "ST Date(s)", "ST Number(s)", "ST Amount(s)", "ST Reference(s)",
+    "ST Structured Payment Reference(s)", "ST Counterparty(ies)",
+    "ST Source(s)",
+    "Confidence", "ORT d:", "ORT r:", "Explanation",
+]
 
 
 def _placement_row(p: Placement):
-    st_dates = _join_multi([_fmt_date(e.date) for e in p.st_entries]) if p.st_entries else ""
-    st_numbers = _join_multi([e.id for e in p.st_entries]) if p.st_entries else ""
+    ents = p.st_entries
+    st_dates = _join_multi([_fmt_date(e.date) for e in ents]) if ents else ""
+    st_numbers = _join_multi([e.id for e in ents]) if ents else ""
+    st_amounts = _join_multi([_usd(e.amount_cents) for e in ents]) if ents else ""
+    st_refs = _join_multi([e.reference or "" for e in ents]) if ents else ""
+    st_sprs = _join_multi([e.spr or "" for e in ents]) if ents else ""
+    st_cps = _join_multi([e.counterparty or "" for e in ents]) if ents else ""
+    st_srcs = _join_multi([e.source or "" for e in ents]) if ents else ""
     dep = _join_multi(sorted(set(p.deposit_ids))) if p.deposit_ids else ""
     rec = _join_multi(sorted(set(p.receipt_ids))) if p.receipt_ids else ""
     codes = (" [" + ", ".join(p.codes) + "]") if p.codes else ""
@@ -2511,8 +2528,18 @@ def _placement_row(p: Placement):
         _fmt_date(p.bsl.date),
         p.bsl.line_info,
         _usd(p.bsl.amount_cents),
+        p.bsl.reference_raw,
+        p.bsl.additional_info,
+        p.bsl.customer_reference,
+        p.bsl.account_servicer_reference,
+        p.bsl.transaction_type,
         st_dates,
         st_numbers,
+        st_amounts,
+        st_refs,
+        st_sprs,
+        st_cps,
+        st_srcs,
         p.confidence,
         dep,
         rec,
