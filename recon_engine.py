@@ -1630,6 +1630,18 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                       + (f"; {len(corro)} such deposit(s)." if len(corro) > 1 else "."),
                       "P4_deposit_group")
                 continue
+            # Owner call (2026-07-11): stale amount-only deposit sums surface
+            # as LOW-confidence Candidates (double-flagged) rather than
+            # vanishing into Review — the reviewer decides.
+            dep, group = sorted(exact_open)[0]
+            place(bsl, CANDIDATE, CONF_LOW, _sorted(group),
+                  ["AMOUNT_ONLY_GROUP", "DATE_CONFLICT"],
+                  f"ORT deposit d:{dep} sums to BSL but carries no reference/"
+                  "payer/deposit-type corroboration and no member date in band"
+                  + (f"; {len(exact_open)} equal-sum deposit(s)."
+                     if len(exact_open) > 1 else "."),
+                  "P4_deposit_group")
+            continue
         exact_open = dated
         if len(exact_open) == 1:
             dep, group = exact_open[0]
