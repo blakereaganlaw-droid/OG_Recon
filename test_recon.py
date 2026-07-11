@@ -858,6 +858,35 @@ class TestRealDataShapes(unittest.TestCase):
         self.assertEqual(d["8036121500"]["home_account"], "FHB_UTIA")
         self.assertEqual(len(d), 1)  # N/A row never enters
 
+
+    def test_candidate_without_st_is_impossible(self):
+        # Owner doctrine: a Match/Candidate must cite ST(s) summing exactly
+        # to the BSL.  A State line whose Edison bundle sums but has no
+        # summing receipt set is a Review (RECEIPT_ENTRY_BACKLOG), never an
+        # ST-less Candidate.
+        loaded = {
+            "EDISON_PAY": {"rows": [("Reference", "Invoice Number", "Amount"),
+                                    ("EDIREF1", "777888", "100.00")],
+                           "map": {"reference": 0, "invoice_number": 1, "amount": 2},
+                           "header_index": 0},
+            "EDISON_INV": {"rows": [("Invoice Number", "Gross Amount"),
+                                    ("777888", "100.00")],
+                           "map": {"invoice_number": 0, "gross_amount": 1},
+                           "header_index": 0},
+        }
+        bsl = E.make_bsl("1", date(2024, 3, 10), 10000, "EDIREF1", "EDIREF1",
+                         "", "", "142")
+        bsl.lane = E.LANE_STATE
+        placed = []
+        E._p5_state(lambda: [bsl],
+                    lambda b, tab, conf, entries, flags, expl, pn:
+                        placed.append((tab, len(entries), flags, expl)),
+                    [], E.Ledger(), loaded, {})
+        tab, n_entries, flags, expl = placed[0]
+        self.assertEqual(tab, E.REVIEW)
+        self.assertEqual(n_entries, 0)
+        self.assertIn("RECEIPT_ENTRY_BACKLOG", flags)
+
     def test_type_gate(self):
         b = E.make_bsl("1", date(2026, 7, 1), 1000, "R", "R", "", "Miscellaneous", "399")
         cc = E._mk_entry("S1", 1000, date(2026, 7, 1), "R", "", "EXT", "UNR",

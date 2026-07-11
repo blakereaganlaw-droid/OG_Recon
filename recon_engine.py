@@ -1825,29 +1825,34 @@ def _p5_state(unplaced, place, pool, ledger, loaded, runlog):
         bundle_sum = sum(inv_gross.get(i, 0) for i in invoices if i in inv_gross)
         # Map invoices to Receivables receipts (reference contains invoice num).
         receipts = _state_receipts(invoices, pool, ledger)
-        if bundle_sum == bsl.amount_cents and receipts:
-            # Match when bundle sums and Edison reference ties a receipt.
-            # State date rule (spec §11): a Match-qualifying tie receipt
-            # must pass date_ok_state — no ceiling when the BSL precedes the
-            # receipt, demote to Candidate when the receipt precedes the BSL
-            # by more than 20 days.  A missing date is not ">20d": kept.
+        receipts_sum = sum(e.amount_cents for e in receipts)
+        if bundle_sum == bsl.amount_cents and receipts and \
+                receipts_sum == bsl.amount_cents:
+            # The receipt set itself must sum to the BSL (owner doctrine:
+            # BSL - sum(STs) == 0 on every listed pairing; Receivables
+            # receipts combine, often many to one BSL).
+            # State date rule (spec §11): no ceiling when the BSL precedes
+            # the receipt; demote when the receipt precedes the BSL by >20d.
             def _state_fresh(e):
                 lag = signed_lag(bsl.date, e.date)
                 return lag is None or date_ok_state(lag)
-            tie = [e for e in receipts
-                   if any(inv in znorm(e.reference) or inv in znorm(e.id)
-                          for inv in invoices) and _state_fresh(e)]
-            chosen = tie or receipts
+            tie = all(_state_fresh(e) and
+                      any(inv in znorm(e.reference) or inv in znorm(e.id)
+                          for inv in invoices)
+                      for e in receipts)
             place(bsl, MATCH if tie else CANDIDATE,
-                  CONF_HIGH if tie else CONF_MEDIUM, _sorted(chosen),
+                  CONF_HIGH if tie else CONF_MEDIUM, _sorted(receipts),
                   [] if tie else ["INCOMPLETE_REFERENCE_SUPPORT"],
                   f"STATE bundle of {len(invoices)} Edison invoice(s) sums to BSL; "
-                  + ("Edison reference ties receipt." if tie else "no receipt reference tie."),
+                  f"{len(receipts)} receipt(s) sum to BSL"
+                  + (" with reference ties." if tie else "; reference/date support incomplete."),
                   "P5_state")
         elif bundle_sum == bsl.amount_cents:
-            place(bsl, CANDIDATE, CONF_MEDIUM, [],
-                  ["INCOMPLETE_REFERENCE_SUPPORT"],
-                  "STATE Edison bundle sums to BSL but no Receivables receipt found.",
+            place(bsl, REVIEW, CONF_LOW, [],
+                  ["RECEIPT_ENTRY_BACKLOG"],
+                  "STATE: Edison confirms the payment identity"
+                  f" ({len(invoices)} invoice(s) sum to BSL) but no DASH "
+                  "receipt/ST set sums to it — receipt-entry backlog.",
                   "P5_state")
         else:
             place(bsl, REVIEW, CONF_LOW, [], ["STATE_LANE_ISOLATION", "PARTIAL_CHAIN"],

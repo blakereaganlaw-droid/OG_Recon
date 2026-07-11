@@ -379,6 +379,11 @@ def audit(input_dir, recon_path, account):
         if _cents(r[2]) is None or not _N(r[4]):
             c2_ok = False
             failures.append(f"C2: Match row missing amount or ST number: {r[:5]}")
+    # Owner doctrine: a Candidate without an ST citation must not exist.
+    for r in cand_rows:
+        if not _N(r[4]):
+            c2_ok = False
+            failures.append(f"C2: Candidate row cites no ST: {r[:3]}")
     checks["C2"] = "PASS" if c2_ok else "FAIL"
 
     # C3 ST non-reuse across Matches + Candidates.
