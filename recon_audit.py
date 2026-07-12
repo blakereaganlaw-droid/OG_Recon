@@ -561,6 +561,24 @@ def audit(input_dir, recon_path, account):
             c8_ok = False
             failures.append(
                 f"C8: Match trails every cited ST by >= 8d (stale-ST): {r[:3]}")
+    # Owner rule (2026-07-12): an External-source ST 12+ days older than the
+    # BSL may not appear even in a CANDIDATE.  ST Date(s) (col 8), ST
+    # Source(s) (col 14) are written in the same entry order.
+    for r in cand_rows:
+        bdt = _parse_date(r[COL_DATE])
+        if bdt is None:
+            continue
+        st_dates = _split_multi(r[COL_ST_DATES])
+        st_srcs = _split_multi(r[14])
+        for i, x in enumerate(st_dates):
+            d = _parse_date(x)
+            src_i = st_srcs[i] if i < len(st_srcs) else ""
+            if d is not None and _N(src_i).upper() == "EXT" and (bdt - d).days >= 12:
+                c8_ok = False
+                failures.append(
+                    f"C8: Candidate cites an External ST {((bdt - d).days)}d "
+                    f"older than the BSL (>=12d bar): {r[:3]}")
+                break
     checks["C8"] = "PASS" if c8_ok else "FAIL"
 
     # C9 formatting — Carlito, navy header fill, freeze A4, zero formulas, structure.

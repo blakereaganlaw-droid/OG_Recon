@@ -201,6 +201,23 @@ class TestPoolDedup(unittest.TestCase):
         self.assertTrue(E._type_gate_ok(b, ap))
         self.assertFalse(E._type_gate_ok(b, ext))
 
+    def test_ext_stale_candidate_bar(self):
+        # Owner rule (2026-07-12): External STs entered 12+ days before the
+        # BSL are barred even as Candidates; 8-11 days may still surface;
+        # BSL-before-ST unbounded; non-EXT sources untouched.
+        class _B:
+            pass
+        b = _B()
+        b.date = date(2026, 6, 12)
+        mk = lambda src_, d: E._mk_entry("X1", 1000, d, "R", "C", src_, "UNR", True, "ST")
+        self.assertTrue(E._ext_stale_barred(b, mk("EXT", date(2026, 5, 31))))   # 12d stale
+        self.assertTrue(E._ext_stale_barred(b, mk("EXT", date(2026, 1, 1))))    # very stale
+        self.assertFalse(E._ext_stale_barred(b, mk("EXT", date(2026, 6, 1))))   # 11d stale
+        self.assertFalse(E._ext_stale_barred(b, mk("EXT", date(2026, 7, 30))))  # ST after BSL
+        self.assertFalse(E._ext_stale_barred(b, mk("AR", date(2025, 1, 1))))    # non-EXT
+        e = mk("EXT", None)
+        self.assertFalse(E._ext_stale_barred(b, e))                             # no date
+
     def test_chargeback_mid_gate(self):
         # Owner rule (2026-07-12): negative chargeback/merchant-fee lines
         # pair ONLY with STs carrying the SAME MID — wrong or absent MID is
