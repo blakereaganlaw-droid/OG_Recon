@@ -27,7 +27,7 @@ YYYYMMDD_<Source>_<Account>_<Role>[_<Status>].xlsx
 |---|---|---|
 | Bank statement lines | `BSL` (not `All_Data`) | `..._FHB_Master_BSL_UNR.xlsx` |
 | System transactions | `_ST_` or `_ST.` or `Account_ST` | `..._FHB_Master_ST_UNR.xlsx` |
-| MET / ORT bridge (OTBI) | `MET` | `..._MET_All_Accounts_All_Status.xlsx` |
+| MET / ORT bridge (OTBI) | `MET` or `Oracle_OTBI` | `..._MET_All_Accounts_All_Status.xlsx` |
 | BAI2 bank detail | `BAI` | `..._FHB_Master_BAI2.xlsx` |
 | Receivables receipts | `Receivables_Receipts` or `Receipts_All` | `20260709_Receivables_Receipts_All.xlsx` |
 | Edison payments / invoices | `Edison_Payments` / `Edison_Invoices` | — |

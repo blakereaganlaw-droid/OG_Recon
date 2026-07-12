@@ -325,7 +325,10 @@ ROUTER_TABLE = [
     # enrichment source (ENRICHED below), not a competing BSL export.
     RouterRule("BSL", ["bsl"], ["all_data", "enriched"], [], "first", True),
     RouterRule("ALL_DATA", ["all_data"], [], [], "multi", False),
-    RouterRule("MET", ["met"], [], [], "first", False),
+    # 'oracle_otbi' also routes here: OTBI is the MET report's source system
+    # and real exports sometimes omit the MET token
+    # (20260711_Oracle_OTBI_Regions_UTIA_All_Status.xlsx).
+    RouterRule("MET", [], [], ["met", "oracle_otbi"], "first", False),
     # "_st" alone is too greedy: it matches All_Status / Rosetta_Stone /
     # _Statement.  Require a separator (or end) after the token.
     RouterRule("ST", [], [], ["_st_", "_st.", "account_st"], "first", False),

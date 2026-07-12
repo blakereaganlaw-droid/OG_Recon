@@ -274,7 +274,8 @@ def _reparse_source_bsls(input_dir):
     candidates = []
     for name in sorted(os.listdir(input_dir)):
         low = name.lower()
-        if "bsl" in low and "all_data" not in low and low.endswith((".xlsx", ".xlsm", ".csv")):
+        if "bsl" in low and "all_data" not in low and "enriched" not in low \
+                and "crossref" not in low and low.endswith((".xlsx", ".xlsm", ".csv")):
             candidates.append(name)
     if not candidates:
         return None
@@ -311,9 +312,27 @@ def _reparse_source_bsls(input_dir):
 def _reparse_met_pairs(input_dir):
     pairs = set()
     for name in sorted(os.listdir(input_dir)):
-        if "met" in name.lower() and name.lower().endswith((".xlsx", ".xlsm", ".csv")):
+        low = name.lower()
+        # 'oracle_otbi' names are MET exports even without the MET token
+        # (mirrors the engine's router).
+        if ("met" in low or "oracle_otbi" in low) and low.endswith((".xlsx", ".xlsm", ".csv")):
             path = os.path.join(input_dir, name)
             rows = _read_csv(path) if path.lower().endswith(".csv") else _read_xlsx(path)
+            # Native DEPOSIT_ID / RECEIPT_ID columns (some exports carry the
+            # ids only there, not in the d:/r: description text).
+            if rows:
+                hdr = rows[0]
+                for i, h in enumerate(hdr):
+                    hn = _norm_header(h)
+                    if hn in ("DEPOSITID", "RECEIPTID"):
+                        kind = "d" if hn == "DEPOSITID" else "r"
+                        for r in rows[1:]:
+                            if i < len(r) and r[i] is not None:
+                                v = _N(r[i])
+                                if v.endswith(".0"):
+                                    v = v[:-2]
+                                if v.isdigit():
+                                    pairs.add((kind, v))
             for r in rows:
                 for c in r:
                     # fast pre-check: regex only cells that can carry a token
