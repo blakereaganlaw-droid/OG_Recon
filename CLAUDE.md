@@ -87,6 +87,13 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    carries a MID, an ST without that same MID is barred even as a
    Candidate ("the MID is the critical matching string"). Audit C7
    enforces it.
+8d. **12-day stale-candidate ceiling (owner, 2026-07-12).** An
+   External-source ST entered 12+ days BEFORE the BSL statement date is
+   almost certainly not the counterpart — barred even as a Candidate
+   (`_ext_stale_barred`, all four stale-candidate sites). 8-11 days stale
+   may still surface as a flagged Candidate; Matches stay barred at 8+;
+   BSL-before-ST stays unbounded-valid; non-EXT sources untouched. Audit
+   C8 enforces it on the Candidate tab.
 9. **Determinism.** No randomness, no clock. `Date.now`/serials excepted where
    parsing Excel. Sort candidate sets by (amount, date, id) before choosing.
 

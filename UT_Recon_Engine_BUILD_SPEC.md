@@ -447,4 +447,11 @@ Validated against the owner-supplied FHB Master reference reconciliation
    2000xxxxxx), only an ST carrying the SAME MID may pair with it — wrong
    or absent MID is barred even as a Candidate. Enforced in the central
    type gate and audited by C7.
+10. **12-day stale-candidate ceiling (owner directive, 2026-07-12).** An
+   External-source ST entered 12 or more days BEFORE the BSL statement
+   date is almost certainly not the counterpart: it may not appear even as
+   a Candidate. STs 8-11 days stale may still surface as flagged
+   Candidates (Matches remain barred at 8+ days); a BSL entered before its
+   ST remains valid at any lag; non-External sources are untouched.
+   Enforced at every stale-candidate site and audited by C8.
 

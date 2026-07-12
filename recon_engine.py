@@ -1759,6 +1759,22 @@ def _is_convera(bsl):
     return "CONVERA" in _norm_header(bsl.additional_info) + _norm_header(bsl.line_info)
 
 
+STALE_CANDIDATE_CEILING = 12
+
+
+def _ext_stale_barred(bsl, e):
+    """Owner rule (2026-07-12): an External-source ST entered 12 or more
+    days BEFORE the BSL statement date is almost certainly not the
+    counterpart — it may not appear even as a Candidate.  (A Match is
+    already barred at 8+ days stale; 8-11 days stale may still surface as a
+    flagged Candidate.  BSL-before-ST stays unbounded-valid, and non-EXT
+    sources are untouched.)"""
+    if e.source != "EXT":
+        return False
+    lag = signed_lag(bsl.date, e.date)
+    return lag is not None and lag >= STALE_CANDIDATE_CEILING
+
+
 @functools.lru_cache(maxsize=1 << 15)
 def _mid_tokens(text):
     """Every MID-shaped 10-digit run in the text (80xxxxxxxx / 2000xxxxxx,
@@ -1924,6 +1940,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                         for e in group)
         if total == bsl.amount_cents and not plausible and not closed_members \
                 and not competing:
+            if any(_ext_stale_barred(bsl, e) for e in group):
+                continue  # 12+ days stale External member: not even a Candidate
             place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
                   ["DATE_CONFLICT"],
                   f"1:M reference group of {len(group)} receipt(s) sums to BSL "
@@ -1932,6 +1950,15 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             continue
         if total == bsl.amount_cents and plausible:
             if closed_members:
+                if any(_ext_stale_barred(bsl, e) for e in group):
+                    place(bsl, REVIEW, CONF_LOW, [],
+                          ["POSSIBLE_AUTO_REC_SPLIT"],
+                          "Reference group sums to BSL only with member(s) "
+                          "12+ days stale (External): "
+                          + ", ".join(sorted(e.id for e in group))
+                          + " — not citable as a Candidate; run Unreconcile2.",
+                          "P4_ref_group")
+                    continue
                 place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
                       ["POSSIBLE_AUTO_REC_SPLIT"],
                       "Reference group sums exactly but includes already-closed member(s): "
@@ -2053,6 +2080,11 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                  if all(date_ok_directional(signed_lag(bsl.date, e.date))
                         for e in g)]
         if not dated and exact_open:
+            # 12+ days stale External members bar the whole group from
+            # candidacy (owner rule, 2026-07-12).
+            exact_open = [(d, g) for d, g in exact_open
+                          if not any(_ext_stale_barred(bsl, e) for e in g)]
+        if not dated and exact_open:
             corro = [(d, g) for d, g in exact_open if _deposit_corroboration(bsl, g)]
             if len(corro) == 1:
                 dep, group = corro[0]
@@ -2165,12 +2197,21 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                       "P4_deposit_group")
         elif split_groups:
             dep, group, closed = sorted(split_groups)[0]
-            place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
-                  ["POSSIBLE_AUTO_REC_SPLIT"],
-                  f"ORT deposit d:{dep} sums to BSL only with already-closed member(s): "
-                  + ", ".join(sorted(m.id for m in closed))
-                  + " (auto-rec split; run Unreconcile2).",
-                  "P4_deposit_group")
+            if any(_ext_stale_barred(bsl, e) for e in group):
+                place(bsl, REVIEW, CONF_LOW, [],
+                      ["POSSIBLE_AUTO_REC_SPLIT"],
+                      f"ORT deposit d:{dep} sums to BSL only with member(s) "
+                      "12+ days stale (External), closed: "
+                      + ", ".join(sorted(m.id for m in closed))
+                      + " — not citable as a Candidate; run Unreconcile2.",
+                      "P4_deposit_group")
+            else:
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+                      ["POSSIBLE_AUTO_REC_SPLIT"],
+                      f"ORT deposit d:{dep} sums to BSL only with already-closed member(s): "
+                      + ", ".join(sorted(m.id for m in closed))
+                      + " (auto-rec split; run Unreconcile2).",
+                      "P4_deposit_group")
 
     runlog["p5_state"] = "retired (owner doctrine 2026-07-11: Edison pass eliminated)"
 
@@ -2191,7 +2232,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         ties = stale_1to1.get(bsl.line_key)
         if not ties:
             continue
-        live = [e for e in ties if ledger.is_available(e)]
+        live = [e for e in ties
+                if ledger.is_available(e) and not _ext_stale_barred(bsl, e)]
         if len(live) == 1:
             e = live[0]
             lag = signed_lag(bsl.date, e.date)
@@ -2287,7 +2329,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         # Only stale exact-cents STs remain: surface as a DATE_GATE Candidate
         # when at least a digit-run tie corroborates; a zero-evidence stale
         # coincidence stays Review.
-        evid = [e for e in elig if cross_digit_tie(bsl, e)]
+        evid = [e for e in elig
+                if cross_digit_tie(bsl, e) and not _ext_stale_barred(bsl, e)]
         if evid:
             ordered = _sorted(evid)
             lag = signed_lag(bsl.date, ordered[0].date)
@@ -2460,10 +2503,13 @@ def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account=None):
                   "Stale (>30d) same-MID group; likely auto-rec artifact."
                   + _mid_note(bsl, mid_dir, account), "P6_merchant")
         elif group:
-            whole = sum(e.amount_cents for e in group)
-            singles = [e for e in group if e.amount_cents == bsl.amount_cents]
-            if whole == bsl.amount_cents:
-                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(group),
+            # 12+ days stale External members may not be cited in a
+            # Candidate (owner rule, 2026-07-12).
+            eligible = [e for e in group if not _ext_stale_barred(bsl, e)]
+            whole = sum(e.amount_cents for e in eligible)
+            singles = [e for e in eligible if e.amount_cents == bsl.amount_cents]
+            if eligible and whole == bsl.amount_cents:
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(eligible),
                       ["GROUPING_CONFLICT"],
                       "Same-MID receipts sum to settlement but not inside the 1-4d window.",
                       "P6_merchant")
