@@ -337,7 +337,7 @@ ROUTER_TABLE = [
     # (ACRA/ABA), not a receipts export — it routes to AR_MATCHED below.
     RouterRule("RECEIPTS", [], ["ar_matched"], ["receivables_receipts", "receipts_all", "oracle_receipts"], "Export to Excel", False),
     RouterRule("DEPT_INFO", [], [], ["ort_department", "department_info"], "Report", False),
-    RouterRule("CHART_OF_ACCOUNTS", ["chart_of_accounts"], [], [], "Report", False),
+    RouterRule("CHART_OF_ACCOUNTS", [], [], ["chart_of_accounts", "gl_departments"], "Report", False),
     RouterRule("ORT_AR", ["ort", "_ar"], [], [], "Report", False),
     RouterRule("ORT_MISC", ["ort", "misc"], [], [], "Report", False),
     RouterRule("BAI2", ["bai"], [], [], "first", False),
