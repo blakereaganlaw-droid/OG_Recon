@@ -94,6 +94,10 @@ PAYER_STOPWORDS = {
     "COMPANY", "CUSTOMER", "ENTRY", "DESCRIPTION", "DESC", "NAME", "ID",
     "SENDING", "REF", "REFERENCE", "ADDENDA", "INFO", "INFORMATION", "NUMBER",
     "ACCOUNT", "TRACE", "BATCH", "INDIVIDUAL", "IDENTIFICATION",
+    # 2026-07-12 (adversarial verification): 'Class Code: CCD' in BAI2
+    # addenda made CLASS overlap 'Restorative Class 6' and fabricated a
+    # payer tie on two UTHSC candidates — structural labels, all of them.
+    "CLASS", "CODE", "CUST", "RECEIVED",
     # channel / generic words
     "ACH", "WIRE", "DEPOSIT", "DEPOSITS", "PAYMENT", "PAYMENTS", "MERCHANT",
     "SERVICE", "SERVICES", "STATE", "TENNESSEE", "TENN", "UNIVERSITY",
@@ -796,6 +800,7 @@ ST_ROLES = {
 
 RECEIPTS_ROLES = {
     "receipt_number": _rs(True, ["Receipt Number", "Receipt Num"], pred_reference),
+    "document_number": _rs(False, ["Document Number", "Doc Number"], pred_reference),
     # 'Status' is the lifecycle (Cleared/Remitted/Reversed); the export's
     # separate 'State' column (Applied/Unapplied) must not tie it.
     "status": _rs(True, ["Status", "Receipt Status"], pred_status),
@@ -1153,6 +1158,13 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
         for r in rows[hi + 1:]:
             amt = cents(_cell(r, m.get("amount")))
             recno = N(_cell(r, m.get("receipt_number")))
+            if _blankish(recno):
+                # 'NA'-numbered receipts are real rows sharing a placeholder —
+                # falling through to keep-largest dedup on the id 'NA' would
+                # collapse them all into one (2026-07-12 finding: two BlueCare
+                # receipts summing to a $246,736.64 bank line vanished).
+                doc = N(_cell(r, m.get("document_number")))
+                recno = f"DOC {doc}" if doc and not _blankish(doc) else ""
             if amt is None or not recno:
                 continue
             status = _norm_header(_cell(r, m.get("status")))
