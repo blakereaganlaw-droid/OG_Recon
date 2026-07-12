@@ -440,4 +440,11 @@ Validated against the owner-supplied FHB Master reference reconciliation
    deposit group, exactly one bank line at that amount).  Such a pairing is
    a Medium-confidence Match coded `DISTINCTIVE_AMOUNT`; corrections stay
    excluded and payer contradiction still bars it.
+9. **Chargeback / merchant-fee MID gate (owner directive, 2026-07-12).**
+   A NEGATIVE bank line for a card chargeback or merchant fee
+   ('chargeback(s)', 'merchant fee(s)' and derivatives) belongs to exactly
+   one merchant: when the line carries a MID-shaped token (80xxxxxxxx /
+   2000xxxxxx), only an ST carrying the SAME MID may pair with it — wrong
+   or absent MID is barred even as a Candidate. Enforced in the central
+   type gate and audited by C7.
 

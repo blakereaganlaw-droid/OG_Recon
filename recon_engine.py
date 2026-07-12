@@ -1759,6 +1759,30 @@ def _is_convera(bsl):
     return "CONVERA" in _norm_header(bsl.additional_info) + _norm_header(bsl.line_info)
 
 
+@functools.lru_cache(maxsize=1 << 15)
+def _mid_tokens(text):
+    """Every MID-shaped 10-digit run in the text (80xxxxxxxx / 2000xxxxxx,
+    Heartland excluded), frozen for set algebra."""
+    return frozenset(run for run in re.findall(r"\d{10}", N(text)) if is_mid(run))
+
+
+def _is_card_fee_debit(bsl):
+    """Owner rule (2026-07-12): a NEGATIVE bank line for a card chargeback or
+    merchant fee ('chargeback(s)', 'merchant fee(s)' and derivatives) belongs
+    to exactly one merchant — the MID is the critical matching string."""
+    if bsl.amount_cents >= 0:
+        return False
+    txt = _norm_header(bsl.additional_info) + _norm_header(bsl.line_info) +         _norm_header(bsl.transaction_type)
+    return "CHARGEBACK" in txt or "MERCHANTFEE" in txt
+
+
+def _bsl_card_mids(bsl):
+    return (_mid_tokens(bsl.reference_raw) | _mid_tokens(bsl.additional_info)
+            | _mid_tokens(bsl.customer_reference)
+            | _mid_tokens(bsl.account_servicer_reference)
+            | _mid_tokens(bsl.line_info))
+
+
 def _type_gate_ok(bsl, e):
     """Deterministic type gate (ORT doc section 5.2): a Credit Card ST never
     pairs with a Check or Miscellaneous bank line.  EFT is never rejected on
@@ -1766,6 +1790,17 @@ def _type_gate_ok(bsl, e):
     wires and ALWAYS Payables — they never pair with a non-Payables ST."""
     if _is_convera(bsl) and e.source != "AP":
         return False
+    # Chargeback / merchant-fee debits (owner, 2026-07-12): when the bank
+    # line carries a MID, ONLY an ST carrying the SAME MID may pair with it —
+    # even as a Candidate.  A chargeback against MID 8028920588 has nothing
+    # to do with an ST for MID 8035758468.
+    if _is_card_fee_debit(bsl):
+        bmids = _bsl_card_mids(bsl)
+        if bmids:
+            emids = (_mid_tokens(e.reference) | _mid_tokens(e.id)
+                     | _mid_tokens(e.spr) | _mid_tokens(e.counterparty))
+            if not (bmids & emids):
+                return False
     et = _norm_header(e.transaction_type)
     if "CREDITCARD" in et:
         bt = _norm_header(bsl.transaction_type)
