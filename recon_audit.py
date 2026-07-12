@@ -522,6 +522,27 @@ def audit(input_dir, recon_path, account):
         if "CORRECTION" in info_txt or "CORRECTED" in info_txt:
             c7_ok = False
             failures.append(f"C7: deposit-correction line placed as a Match: {r[:3]}")
+    # Owner rule (2026-07-12): a negative chargeback / merchant-fee line
+    # pairs ONLY on MID equality — a Match or Candidate citing STs with no
+    # shared MID-shaped token is a defect.
+    def _mids(txt):
+        return {run for run in re.findall(r"\d{10}", _N(txt)) if _is_mid(run)}
+    for label, rows_ in (("Match", match_rows), ("Candidate", cand_rows)):
+        for r in rows_:
+            amt = _cents(r[COL_AMT])
+            info_txt = _norm_header(r[COL_INFO])
+            if amt is None or amt >= 0:
+                continue
+            if "CHARGEBACK" not in info_txt and "MERCHANTFEE" not in info_txt:
+                continue
+            bmids = _mids(r[COL_INFO]) | _mids(r[3]) | _mids(r[6])
+            if not bmids:
+                continue
+            smids = _mids(r[COL_ST_NUMS]) | _mids(r[11]) | _mids(r[12])
+            if not (bmids & smids):
+                c7_ok = False
+                failures.append(
+                    f"C7: chargeback/merchant-fee {label} without MID match: {r[:3]}")
     checks["C7"] = "PASS" if c7_ok else "FAIL"
 
     # C8 directional date rule (owner doctrine, final): the gate applies

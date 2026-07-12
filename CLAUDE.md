@@ -82,7 +82,11 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    flagged `MANUAL_ECT` at best, never amount-sum Matches; edge cases err
    toward Candidate over rejection. Audit C7 enforces all three. Convera
    lines are international wires and ALWAYS Payables — they never pair with
-   a non-Payables ST (central `_type_gate_ok`).
+   a non-Payables ST (central `_type_gate_ok`). Chargeback / merchant-fee
+   DEBITS (owner, 2026-07-12) pair ONLY on MID equality: when the bank line
+   carries a MID, an ST without that same MID is barred even as a
+   Candidate ("the MID is the critical matching string"). Audit C7
+   enforces it.
 9. **Determinism.** No randomness, no clock. `Date.now`/serials excepted where
    parsing Excel. Sort candidate sets by (amount, date, id) before choosing.
 

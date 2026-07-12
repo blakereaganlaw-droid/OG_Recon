@@ -188,14 +188,40 @@ class TestPoolDedup(unittest.TestCase):
 
     def test_convera_payables_only(self):
         class _B:
+            amount_cents = -59690
             additional_info = "CONVERA TENN DEBITS 260703"
             line_info = "Line 59 , 2026-07-03"
             transaction_type = "Wire"
+            reference_raw = ""
+            customer_reference = ""
+            account_servicer_reference = ""
         b = _B()
         ap = E._mk_entry("1394", -59690, date(2026, 7, 2), "1394", "Stichting EHEDG", "AP", "UNR", True, "ST")
         ext = E._mk_entry("999", -59690, date(2026, 7, 2), "999", "Someone", "EXT", "UNR", True, "MET")
         self.assertTrue(E._type_gate_ok(b, ap))
         self.assertFalse(E._type_gate_ok(b, ext))
+
+    def test_chargeback_mid_gate(self):
+        # Owner rule (2026-07-12): negative chargeback/merchant-fee lines
+        # pair ONLY with STs carrying the SAME MID — wrong or absent MID is
+        # barred even as a Candidate.
+        class _B:
+            amount_cents = -6000
+            additional_info = ("MERCHANT SERVICECHARGEBACK2603178028920588"
+                               "ENTRY DESC: CHARGEBACK ID NUMBER: 8028920588")
+            line_info = "Line 129 , 2026-03-17"
+            transaction_type = "Automated clearing house"
+            reference_raw = "8028920588"
+            customer_reference = ""
+            account_servicer_reference = "8028920588"
+        b = _B()
+        wrong = E._mk_entry("1027659", -6000, date(2026, 6, 30), "8035758468", "FY26 CC chargeback", "EXT", "UNR", True, "MET")
+        right = E._mk_entry("999999", -6000, date(2026, 3, 17), "8028920588", "Chargeback", "EXT", "UNR", True, "MET")
+        nomid = E._mk_entry("888888", -6000, date(2026, 3, 17), "REF123456", "Something", "EXT", "UNR", True, "MET")
+        self.assertTrue(E._is_card_fee_debit(b))
+        self.assertFalse(E._type_gate_ok(b, wrong))   # different MID
+        self.assertTrue(E._type_gate_ok(b, right))    # same MID
+        self.assertFalse(E._type_gate_ok(b, nomid))   # no MID at all
 
     def test_distinct_receipts_sharing_label_all_kept(self):
         # Real FHB Master case: two receipts share one transaction-number
