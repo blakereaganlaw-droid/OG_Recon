@@ -378,6 +378,9 @@ _ACCOUNT_TOKENS = [
     ("REGIONS_UTIA", ["regions", "utia"]),
     ("REGIONS_UTIPS", ["regions", "utips"]),
     ("REGIONS_UTM", ["regions", "utm"]),
+    ("REGIONS_MASTER", ["regions", "master"]),
+    ("REGIONS_UTSI", ["regions", "utsi"]),
+    ("REGIONS_UTHSC", ["regions", "uthsc"]),
 ]
 
 _YYYYMMDD_RE = re.compile(r"(\d{8})")
