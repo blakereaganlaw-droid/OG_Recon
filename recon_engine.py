@@ -638,6 +638,8 @@ def _signed_twin(data_rows, cols):
                 cts = cents(v)
             except Exception:
                 return None
+            if cts is None:
+                return None
             mags.add(abs(cts))
             if cts < 0:
                 has_negative[c] = True
