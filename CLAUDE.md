@@ -94,6 +94,12 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    may still surface as a flagged Candidate; Matches stay barred at 8+;
    BSL-before-ST stays unbounded-valid; non-EXT sources untouched. Audit
    C8 enforces it on the Candidate tab.
+8e. **Type incongruence (owner, 2026-07-13).** Transaction type is
+   important but NOT dispositive. An electronic (ACH/EFT) ST paired to a
+   Miscellaneous bank line on amount ALONE — no reference, payer, or MID
+   tie — is almost certainly a coincidence and is barred even as a
+   Candidate (`_type_incongruent_uncorroborated`, the amount-only lanes
+   P9b + P4 deposit groups). ANY tie overrides (type is not dispositive).
 9. **Determinism.** No randomness, no clock. `Date.now`/serials excepted where
    parsing Excel. Sort candidate sets by (amount, date, id) before choosing.
 

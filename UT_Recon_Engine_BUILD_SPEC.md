@@ -454,4 +454,10 @@ Validated against the owner-supplied FHB Master reference reconciliation
    Candidates (Matches remain barred at 8+ days); a BSL entered before its
    ST remains valid at any lag; non-External sources are untouched.
    Enforced at every stale-candidate site and audited by C8.
+11. **Transaction-type incongruence (owner directive, 2026-07-13).**
+   Transaction type is important but not dispositive. An electronic
+   (ACH / EFT) ST paired to a Miscellaneous bank line on amount ALONE —
+   with no reference, payer, or MID tie — is barred even as a Candidate
+   (the amount-only lanes only). ANY corroborating tie overrides the
+   incongruence; corroborated matches are never affected.
 
