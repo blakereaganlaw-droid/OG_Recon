@@ -1801,6 +1801,40 @@ def _bsl_card_mids(bsl):
             | _mid_tokens(bsl.line_info))
 
 
+def _electronic_type(t):
+    z = _norm_header(t)
+    return ("ACH" in z or "AUTOMATEDCLEARINGHOUSE" in z or "EFT" in z
+            or "ELECTRONICFUNDS" in z)
+
+
+def _misc_bsl(bsl):
+    return "MISC" in _norm_header(bsl.transaction_type)
+
+
+def _has_any_tie(bsl, e):
+    """Any corroboration that overrides transaction-type incongruence: a
+    reference tie (the 4x4 screen or a digit-run), a payer-token overlap, or
+    a shared MID."""
+    if cross_reference_tie(bsl, e) or cross_digit_tie(bsl, e):
+        return True
+    if e.payer_tokens & bsl.payer_tokens:
+        return True
+    if _bsl_card_mids(bsl) & (_mid_tokens(e.reference) | _mid_tokens(e.id)
+                              | _mid_tokens(e.counterparty)):
+        return True
+    return False
+
+
+def _type_incongruent_uncorroborated(bsl, e):
+    """Owner rule (2026-07-13): transaction type is important but not
+    dispositive.  Be suspicious of an electronic (ACH/EFT) ST paired to a
+    Miscellaneous bank line on amount ALONE — with no reference, payer, or
+    MID tie it is almost certainly a coincidence and may not surface even as
+    a Candidate.  Any tie overrides (type is not dispositive)."""
+    return (_misc_bsl(bsl) and _electronic_type(e.transaction_type)
+            and not _has_any_tie(bsl, e))
+
+
 def _type_gate_ok(bsl, e):
     """Deterministic type gate (ORT doc section 5.2): a Credit Card ST never
     pairs with a Check or Miscellaneous bank line.  EFT is never rejected on
@@ -2111,7 +2145,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             # vanishing into Review — the reviewer decides.  A payer
             # contradiction bars even the Candidate.
             uncontra = [(d, g) for d, g in exact_open
-                        if not payer_contradiction(bsl, g)]
+                        if not payer_contradiction(bsl, g)
+                        and not all(_type_incongruent_uncorroborated(bsl, e) for e in g)]
             if not uncontra:
                 continue
             dep, group = sorted(uncontra)[0]
@@ -2158,6 +2193,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                           "doctrine).",
                           "P4_deposit_group")
                     continue
+                if all(_type_incongruent_uncorroborated(bsl, e) for e in group):
+                    continue  # Misc BSL vs all-electronic group, amount-only
                 codes = ["AMOUNT_ONLY_GROUP"]
                 note = ""
                 if correction:
@@ -2185,7 +2222,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                           "P4_deposit_group")
             else:
                 uncontra = [(d, g) for d, g in exact_open
-                            if not payer_contradiction(bsl, g)]
+                            if not payer_contradiction(bsl, g)
+                            and not all(_type_incongruent_uncorroborated(bsl, e) for e in g)]
                 if not uncontra:
                     continue
                 dep, group = sorted(uncontra)[0]
@@ -2296,6 +2334,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 continue
             if payer_contradiction(bsl, [e]):
                 continue
+            if _type_incongruent_uncorroborated(bsl, e):
+                continue  # Misc BSL vs electronic ST, amount-only (owner 2026-07-13)
             elig.append(e)
         if not elig:
             continue

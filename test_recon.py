@@ -201,6 +201,31 @@ class TestPoolDedup(unittest.TestCase):
         self.assertTrue(E._type_gate_ok(b, ap))
         self.assertFalse(E._type_gate_ok(b, ext))
 
+    def test_type_incongruent_uncorroborated(self):
+        # Owner rule (2026-07-13): type important but NOT dispositive. A Misc
+        # BSL vs electronic (ACH) ST amount-only pairing is barred; any
+        # reference/payer/MID tie overrides.
+        class _B:
+            transaction_type = "Miscellaneous"
+            reference_raw = "999888"
+            additional_info = "DEPOSIT"
+            customer_reference = ""
+            account_servicer_reference = ""
+            line_info = "Line 1"
+            recon_reference = "999888"
+        b = _B()
+        b.ref_digits = E.digit_runs("999888")
+        b.payer_tokens = E.payer_tokens("ACME WIDGETS")
+        b.mid = ""
+        ach = E._mk_entry("X", 5000, date(2026, 6, 1), "111222", "SomeoneElse", "EXT", "UNR", True, "MET", transaction_type="Automated clearing house")
+        self.assertTrue(E._type_incongruent_uncorroborated(b, ach))       # barred
+        chk = E._mk_entry("Y", 5000, date(2026, 6, 1), "111222", "X", "EXT", "UNR", True, "MET", transaction_type="Check")
+        self.assertFalse(E._type_incongruent_uncorroborated(b, chk))      # Check ST: not electronic
+        tied = E._mk_entry("Z", 5000, date(2026, 6, 1), "999888", "X", "EXT", "UNR", True, "MET", transaction_type="Automated clearing house")
+        self.assertFalse(E._type_incongruent_uncorroborated(b, tied))     # reference tie overrides
+        payer = E._mk_entry("W", 5000, date(2026, 6, 1), "000000", "ACME WIDGETS INC", "EXT", "UNR", True, "MET", transaction_type="ACH")
+        self.assertFalse(E._type_incongruent_uncorroborated(b, payer))    # payer tie overrides
+
     def test_ext_stale_candidate_bar(self):
         # Owner rule (2026-07-12): External STs entered 12+ days before the
         # BSL are barred even as Candidates; 8-11 days may still surface;
