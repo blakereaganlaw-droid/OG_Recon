@@ -2441,6 +2441,18 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         total = sum(e.amount_cents for e in uniq)
         if total == bsl.amount_cents:
             continue  # exact group — P4 owns it (defensive; should not reach here)
+        # Directional plausibility: the open members of a partial deposit are a
+        # SUBSET of the bank total, so they must share the BSL's sign and sum to
+        # STRICTLY LESS than it in magnitude.  A group that is opposite-sign or
+        # exceeds the bank line is not a partial deposit — it is a coincidental
+        # collision on a shared ACH originator / company ID (e.g. a $(1,125)
+        # debit vs 18 positive receipts summing $66k on a shared company id),
+        # never a genuine 1:M deposit.
+        if bsl.amount_cents == 0:
+            continue
+        same_sign = (total > 0) == (bsl.amount_cents > 0) and total != 0
+        if not same_sign or abs(total) >= abs(bsl.amount_cents):
+            continue
         short = bsl.amount_cents - total
         src = uniq[0].source
         ref_shown = sorted(bkeys & set().union(
