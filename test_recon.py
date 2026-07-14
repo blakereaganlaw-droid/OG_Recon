@@ -278,6 +278,39 @@ class TestPoolDedup(unittest.TestCase):
                           "SPN070326 ACH HRSA [18203.27]"])
         self.assertTrue(all(e.base_id == "SPN070326 ACH HRSA" for e in out))
 
+    def test_p9c_partial_reference_group_enriched_review(self):
+        # Owner directive (2026-07-14): the ORT/Receivables 1:M reference
+        # search always runs.  A bank line whose reference EXACTLY matches a
+        # group of >= 2 open Receivables STs that sum SHORT of the BSL (the
+        # rest already auto-reconciled) surfaces as an ENRICHED REVIEW naming
+        # them — never a Match/Candidate (exact-sum guardrail preserved).
+        bsl = E.make_bsl("L1", date(2026, 6, 16), 13275458, "702602081",
+                         "702602081", "DEPOSIT 702602081", "Miscellaneous", "")
+        pool = [
+            E._mk_entry("702602081 [41124.47]", 4112447, date(2026, 6, 10), "702602081", "LSU", "AR", "UNR", True, "ST", spr="SPN113615"),
+            E._mk_entry("702602081 [15336.80]", 1533680, date(2026, 6, 10), "702602081", "Emory", "AR", "UNR", True, "ST", spr="SPN113508"),
+            E._mk_entry("702602081 [9941.07]", 994107, date(2026, 6, 10), "702602081", "Metis", "AR", "UNR", True, "ST", spr="SPN111531"),
+        ]  # open sum 6640234 << BSL 13275458
+        p = E.forward_reconcile([bsl], pool, {}, "FHB_TEST", {})[0]
+        self.assertEqual(p.kind, E.REVIEW)
+        self.assertEqual(p.pass_name, "P9c_ref_1m_review")
+        self.assertIn("PARTIAL_REFERENCE_GROUP", p.codes)
+        self.assertEqual(len(p.st_entries), 3)          # the 3 open members cited
+        self.assertIn("1:M reference tie", p.explanation)
+
+    def test_p9c_requires_two_members_and_distinctive_ref(self):
+        # A single reference-tied ST (1:1, not 1:M) does NOT trigger the
+        # partial-group review; nor does a short (<6 char) reference — both
+        # fall through to the ordinary P10 residual review.
+        bsl = E.make_bsl("L1", date(2026, 6, 16), 13275458, "702602081",
+                         "702602081", "DEPOSIT", "Miscellaneous", "")
+        one = [E._mk_entry("702602081 [41124.47]", 4112447, date(2026, 6, 10), "702602081", "LSU", "AR", "UNR", True, "ST")]
+        self.assertEqual(E.forward_reconcile([bsl], one, {}, "T", {})[0].pass_name, "P10_review")
+        bsl2 = E.make_bsl("L2", date(2026, 6, 16), 13275458, "2605", "2605", "DEPOSIT", "Miscellaneous", "")
+        short = [E._mk_entry("2605 [1.00]", 100, date(2026, 6, 10), "2605", "A", "AR", "UNR", True, "ST"),
+                 E._mk_entry("2605 [2.00]", 200, date(2026, 6, 10), "2605", "B", "AR", "UNR", True, "ST")]
+        self.assertEqual(E.forward_reconcile([bsl2], short, {}, "T", {})[0].pass_name, "P10_review")
+
 
 # ---- synthetic end-to-end fixture ------------------------------------
 

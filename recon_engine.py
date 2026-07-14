@@ -2384,6 +2384,80 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   "P9b_amount_only")
     runlog["p9b_amount_only"] = "ran"
 
+    # ---- P9c ORT / Receivables 1:M reference search (HARD GUARDRAIL,
+    #      owner 2026-07-14) --------------------------------------------
+    # The ORT chain (the bridge/chain for External STs) and the Receivables
+    # ST reference columns MUST always be searched for 1:M ties.  When a bank
+    # line's reference ties to a group of open non-journal, non-merchant STs
+    # that does NOT sum to the BSL (exact and exact-with-closed groups were
+    # already placed by P4), the remaining member(s) are already
+    # auto-reconciled (stranded) and absent from the UNR export.  The
+    # exact-sum invariant (owner 2026-07-11) bars a Match/Candidate here, so
+    # surface an ENRICHED REVIEW that NAMES the reference-tied open members,
+    # the partial sum, and the shortfall — an auto-rec split to re-audit in
+    # Unreconcile2 — rather than a bare 'no counterpart' note.  Placed before
+    # P10 so the residual pass only sees lines with no reference tie at all.
+    for bsl in unplaced():
+        # STRICT deposit-batch keys: the bank line's own reference fields
+        # (NOT the broad addenda/counterparty grid, which is only safe under
+        # P4's exact-sum filter), znorm-exact, >= 6 chars to avoid short
+        # date-like coincidences.
+        bkeys = {z for z in (znorm(bsl.reference_raw), znorm(bsl.recon_reference),
+                             znorm(bsl.account_servicer_reference)) if len(z) >= 6}
+        if not bkeys:
+            continue
+        members = []
+        for e in _open_entries(pool, ledger):
+            if e.source in JOURNAL_SOURCES:
+                continue
+            if e.is_mid and bsl.lane != LANE_MERCHANT:
+                continue
+            if not _type_gate_ok(bsl, e):
+                continue
+            if _ext_stale_barred(bsl, e):
+                continue  # 12+ day stale External member: not citable (owner 8d)
+            # An ST joins only on EXACT equality of its deposit/batch number
+            # (Reference or Transaction Number) with a BSL reference key.
+            ekeys = {z for z in (znorm(e.reference), znorm(e.id)) if len(z) >= 6}
+            if ekeys & bkeys:
+                members.append(e)
+        # A genuine 1:M deposit batch has >= 2 open members sharing the exact
+        # reference; a lone coincidental tie is left to the ordinary review.
+        if len(members) < 2:
+            continue
+        # deterministic de-dup by id and by receipt_id (dual-fire guard)
+        seen_id, seen_rid, uniq = set(), set(), []
+        for e in _sorted(members):
+            if e.id in seen_id:
+                continue
+            if e.receipt_id and e.receipt_id in seen_rid:
+                continue
+            seen_id.add(e.id)
+            if e.receipt_id:
+                seen_rid.add(e.receipt_id)
+            uniq.append(e)
+        if len(uniq) < 2:
+            continue
+        total = sum(e.amount_cents for e in uniq)
+        if total == bsl.amount_cents:
+            continue  # exact group — P4 owns it (defensive; should not reach here)
+        short = bsl.amount_cents - total
+        src = uniq[0].source
+        ref_shown = sorted(bkeys & set().union(
+            *[{znorm(e.reference), znorm(e.id)} for e in uniq]))
+        place(bsl, REVIEW, CONF_LOW, uniq,
+              ["PARTIAL_REFERENCE_GROUP", "POSSIBLE_AUTO_REC_SPLIT"],
+              f"ORT/Receivables 1:M reference tie (ref {', '.join(ref_shown)}): "
+              f"{len(uniq)} open {src} ST(s) carry the BSL reference and sum to "
+              f"{_usd(total)} of {_usd(bsl.amount_cents)} (short {_usd(short)} — the "
+              "remaining member(s) were already auto-reconciled and are absent from "
+              "the UNR export). The shared-reference tie is dispositive that these "
+              "belong to this deposit; an auto-rec split — run Unreconcile2 to re-audit "
+              "and free the stranded member(s). Not citable as a Match/Candidate: the "
+              "open subset does not sum to the bank line (exact-sum guardrail).",
+              "P9c_ref_1m_review")
+    runlog["p9c_ref_1m_review"] = "ran"
+
     # ---- P10 Residual -> Review -------------------------------------
     for bsl in unplaced():
         codes, expl = _p10_review_cause(bsl, pool, feed_errors)
