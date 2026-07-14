@@ -100,6 +100,18 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    tie — is almost certainly a coincidence and is barred even as a
    Candidate (`_type_incongruent_uncorroborated`, the amount-only lanes
    P9b + P4 deposit groups). ANY tie overrides (type is not dispositive).
+8f. **ORT / Receivables 1:M reference search (owner, 2026-07-14).** The ORT
+   chain (External STs) and the Receivables ST reference columns are ALWAYS
+   searched for 1:M ties (pass `P9c_ref_1m_review`). When a bank line's
+   reference is `znorm`-EXACTLY equal (never containment; ≥6 chars) to the
+   `Reference`/`Transaction Number` of ≥2 open STs but they sum SHORT of the
+   BSL (the rest already auto-reconciled/stranded, absent from the UNR
+   export), the exact-sum guardrail bars a Match/Candidate, so the line
+   surfaces as an ENRICHED REVIEW naming the tied members, the partial sum,
+   and the shortfall (`PARTIAL_REFERENCE_GROUP` / `POSSIBLE_AUTO_REC_SPLIT` →
+   run Unreconcile2). Exact-summing groups stay P4's; single coincidental
+   ties and short/date-like refs are excluded. Review placements never
+   consume their STs.
 9. **Determinism.** No randomness, no clock. `Date.now`/serials excepted where
    parsing Excel. Sort candidate sets by (amount, date, id) before choosing.
 
