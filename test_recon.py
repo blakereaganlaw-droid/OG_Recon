@@ -311,6 +311,16 @@ class TestPoolDedup(unittest.TestCase):
                  E._mk_entry("2605 [2.00]", 200, date(2026, 6, 10), "2605", "B", "AR", "UNR", True, "ST")]
         self.assertEqual(E.forward_reconcile([bsl2], short, {}, "T", {})[0].pass_name, "P10_review")
 
+    def test_p9c_rejects_opposite_sign_and_oversized_shared_id(self):
+        # A shared ACH originator / company id (not a deposit batch) collides
+        # a NEGATIVE debit with many POSITIVE receipts: opposite sign and the
+        # group exceeds the bank line -> NOT a partial deposit, no P9c review.
+        bsl = E.make_bsl("L1", date(2026, 6, 8), -112500, "8487001827",
+                         "8487001827", "ACH COMPANY ID: 8487001827", "Automated clearing house", "")
+        pool = [E._mk_entry("A [30000.00]", 3000000, date(2026, 5, 1), "8487001827", "X", "EXT", "UNR", True, "MET"),
+                E._mk_entry("B [36059.26]", 3605926, date(2026, 5, 2), "8487001827", "Y", "EXT", "UNR", True, "MET")]
+        self.assertNotEqual(E.forward_reconcile([bsl], pool, {}, "T", {})[0].pass_name, "P9c_ref_1m_review")
+
 
 # ---- synthetic end-to-end fixture ------------------------------------
 

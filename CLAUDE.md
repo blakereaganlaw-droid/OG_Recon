@@ -104,9 +104,11 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    chain (External STs) and the Receivables ST reference columns are ALWAYS
    searched for 1:M ties (pass `P9c_ref_1m_review`). When a bank line's
    reference is `znorm`-EXACTLY equal (never containment; ≥6 chars) to the
-   `Reference`/`Transaction Number` of ≥2 open STs but they sum SHORT of the
-   BSL (the rest already auto-reconciled/stranded, absent from the UNR
-   export), the exact-sum guardrail bars a Match/Candidate, so the line
+   `Reference`/`Transaction Number` of ≥2 open STs that share the BSL's sign
+   and sum SHORT of it (`|group| < |BSL|` — the rest already auto-reconciled/
+   stranded, absent from the UNR export; opposite-sign or oversized groups are
+   shared-originator-ID collisions, excluded), the exact-sum guardrail bars a
+   Match/Candidate, so the line
    surfaces as an ENRICHED REVIEW naming the tied members, the partial sum,
    and the shortfall (`PARTIAL_REFERENCE_GROUP` / `POSSIBLE_AUTO_REC_SPLIT` →
    run Unreconcile2). Exact-summing groups stay P4's; single coincidental
