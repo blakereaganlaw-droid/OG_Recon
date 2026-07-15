@@ -1714,6 +1714,29 @@ def _token_overlap(a, b):
     return False
 
 
+# Payer-family aliases (owner, 2026-07-14): distinct trade names for the SAME
+# payer are NOT a contradiction and DO corroborate.  VSHP (Volunteer State
+# Health Plan) / TN CARE SELECT / TennCare is BlueCare Tennessee (BlueCross
+# BlueShield of TN)'s managed-care product.  Each entry maps a canonical family
+# to the distinctive znorm tokens that denote it; keep tokens specific enough
+# not to collide with unrelated payers.
+_PAYER_FAMILY_ALIASES = [
+    ("BLUECARE", {"BLUECARE", "BCBST", "VSHP", "VOLUNTEERSTATEHEALTH",
+                  "TENNCARE", "TNCARE", "TNCARESELECT"}),
+]
+
+
+def payer_family(text) -> set:
+    """The canonical payer-family id(s) a piece of payer text belongs to."""
+    z = znorm(text)
+    return {canon for canon, toks in _PAYER_FAMILY_ALIASES
+            if any(t in z for t in toks)}
+
+
+def _bsl_payer_families(bsl) -> set:
+    return payer_family(bsl.additional_info) | payer_family(bsl.customer_reference)
+
+
 def payer_contradiction(bsl, entries):
     """Owner directive (2026-07-11, answer-key review): an amount-only pairing
     whose payer texts actively disagree is wrong — 'City of Chattanooga has
@@ -1737,7 +1760,14 @@ def payer_contradiction(bsl, entries):
         st |= _contra_tokens(e.counterparty)
     if not st:
         return False
-    return not _token_overlap(bt, st)
+    if _token_overlap(bt, st):
+        return False
+    # A shared payer FAMILY (e.g. VSHP / TennCare == BlueCare) is agreement,
+    # not contradiction, even when the surface tokens differ.
+    bfam = _bsl_payer_families(bsl)
+    if bfam and any(bfam & payer_family(e.counterparty) for e in entries):
+        return False
+    return True
 
 
 def _is_deposit_correction(bsl):
@@ -2263,6 +2293,54 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
 
     # ---- P8 Named-payer rules (Amount + Payer) ----------------------
     _p8_named_payer(unplaced, place, pool, ledger, runlog)
+
+    # ---- P8c Payer-family receipt-sum group (owner 2026-07-14) -------
+    # A managed-care remittance lands as ONE positive ACH covering several
+    # Receivables receipts from the same payer FAMILY, deposited the SAME day,
+    # whose per-receipt references do not tie the bank line (blank / parked
+    # SPN).  An exact same-day same-family receipt sum, corroborated by a
+    # payer-FAMILY tie (VSHP / TennCare == BlueCare Tennessee), clears the
+    # amount-alone bar.  It is a CANDIDATE, never a Match: the addenda's
+    # structured references may cite other receipts (reference ambiguity ->
+    # route to Candidate).  Whole-group sum by (family, same day) only; never
+    # a blind subset-sum.
+    for bsl in unplaced():
+        if bsl.amount_cents <= 0:
+            continue
+        fams = _bsl_payer_families(bsl)
+        if not fams:
+            continue
+        groups = {}
+        for e in _open_entries(pool, ledger):
+            if e.source != "AR":
+                continue
+            if not _type_gate_ok(bsl, e):
+                continue
+            if signed_lag(bsl.date, e.date) != 0:      # same deposit day only
+                continue
+            shared = fams & payer_family(e.counterparty)
+            if not shared:
+                continue
+            groups.setdefault(frozenset(shared), []).append(e)
+        for fam, g in sorted(groups.items(), key=lambda kv: sorted(kv[0])):
+            seen, uniq = set(), []
+            for e in _sorted(g):
+                if e.id in seen:
+                    continue
+                seen.add(e.id)
+                uniq.append(e)
+            if uniq and sum(e.amount_cents for e in uniq) == bsl.amount_cents:
+                place(bsl, CANDIDATE, CONF_MEDIUM, uniq,
+                      ["PAYER_FAMILY_GROUP"],
+                      f"Payer-family receipt group ({'/'.join(sorted(fam))}): "
+                      f"{len(uniq)} same-day Receivables receipt(s) from "
+                      f"{uniq[0].counterparty!r} sum exactly to the BSL. Payer-family "
+                      "tie corroborates (VSHP / TennCare == BlueCare Tennessee). "
+                      "Candidate, not Match — the addenda's structured payment "
+                      "references may cite other receipts of the same payer.",
+                      "P8c_payer_family")
+                break
+    runlog["p8c_payer_family"] = "ran"
 
     # ---- P8b Deferred stale 1:1 (out-of-band amount+reference ties) --
     # Held back from P3 so a stale coincidence never shadows a live ORT
