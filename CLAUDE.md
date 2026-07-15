@@ -73,7 +73,14 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    (amount-only) pairings are barred — even as Candidates — when both sides
    carry payer tokens and share none ("City of Chattanooga has nothing to do
    with Israel"). Reference ties outrank payer text; silence never
-   contradicts.
+   contradicts. **Payer-family aliases (owner, 2026-07-14):** distinct trade
+   names for one payer are agreement, not contradiction — VSHP / Volunteer
+   State Health Plan / TN CARE SELECT / TennCare **==** BlueCare Tennessee
+   (BCBST) via `payer_family`. Pass `P8c_payer_family`: a positive ACH covered
+   by ≥1 same-day Receivables receipts of the same payer family whose own refs
+   don't tie the bank line, summing EXACTLY (whole same-day same-family group,
+   never subset-sum), is a `PAYER_FAMILY_GROUP` **Candidate** (never a Match —
+   the addenda's SPNs may cite other receipts).
 8c. **Deposit-type / merchant / correction (owner, 2026-07-11).**
    "Deposit-type consistency" confers NOTHING — an exact-sum deposit group
    without a reference or payer tie is a plain amount-only Candidate, never

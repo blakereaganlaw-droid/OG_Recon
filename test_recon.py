@@ -321,6 +321,45 @@ class TestPoolDedup(unittest.TestCase):
                 E._mk_entry("B [36059.26]", 3605926, date(2026, 5, 2), "8487001827", "Y", "EXT", "UNR", True, "MET")]
         self.assertNotEqual(E.forward_reconcile([bsl], pool, {}, "T", {})[0].pass_name, "P9c_ref_1m_review")
 
+    def test_payer_family_alias_not_a_contradiction(self):
+        # VSHP / TennCare == BlueCare Tennessee: distinct trade names for one
+        # payer family are agreement, not contradiction.
+        self.assertEqual(E.payer_family("VSHP TN CARE SELECT"), {"BLUECARE"})
+        self.assertEqual(E.payer_family("BlueCare Tennessee"), {"BLUECARE"})
+
+        class _B:
+            amount_cents = 24673664
+            additional_info = "VSHP TN CARE SELCCD_PYMTS  CO NAME: VSHP TN CARE SEL"
+            customer_reference = "VSHP TN CARE SEL"
+        b = _B()
+        bc = E._mk_entry("R1", 10712119, date(2026, 7, 6), "", "BlueCare Tennessee", "AR", "UNR", True, "RECEIPTS")
+        self.assertFalse(E.payer_contradiction(b, [bc]))          # same family, no contradiction
+        israel = E._mk_entry("R2", 10712119, date(2026, 7, 6), "", "City of Chattanooga", "AR", "UNR", True, "RECEIPTS")
+        self.assertTrue(E.payer_contradiction(b, [israel]))        # unrelated payer -> contradiction
+
+    def test_p8c_payer_family_receipt_sum_candidate(self):
+        # A VSHP/TennCare ACH covered by two same-day BlueCare receipts whose
+        # own references do NOT tie the bank line surfaces as a Candidate via
+        # the payer-family tie + exact same-day sum (never a Match).
+        bsl = E.make_bsl("L1", date(2026, 7, 6), 24673664, "", "",
+                         "VSHP TN CARE SELCCD_PYMTS CO NAME: VSHP TN CARE SEL",
+                         "Automated clearing house", "", customer_reference="VSHP TN CARE SEL")
+        pool = [
+            E._mk_entry("DOC 25903", 10712119, date(2026, 7, 6), "", "BlueCare Tennessee", "AR", "UNR", True, "RECEIPTS"),
+            E._mk_entry("DOC 25901", 13961545, date(2026, 7, 6), "", "BlueCare Tennessee", "AR", "UNR", True, "RECEIPTS"),
+        ]
+        p = E.forward_reconcile([bsl], pool, {}, "FHB_TEST", {})[0]
+        self.assertEqual(p.kind, E.CANDIDATE)
+        self.assertEqual(p.pass_name, "P8c_payer_family")
+        self.assertIn("PAYER_FAMILY_GROUP", p.codes)
+        self.assertEqual(len(p.st_entries), 2)
+        # a different-day receipt breaks the same-day group -> no P8c candidate
+        pool2 = [
+            E._mk_entry("DOC 25903", 10712119, date(2026, 7, 6), "", "BlueCare Tennessee", "AR", "UNR", True, "RECEIPTS"),
+            E._mk_entry("DOC 25901", 13961545, date(2026, 6, 30), "", "BlueCare Tennessee", "AR", "UNR", True, "RECEIPTS"),
+        ]
+        self.assertNotEqual(E.forward_reconcile([bsl], pool2, {}, "FHB_TEST", {})[0].pass_name, "P8c_payer_family")
+
 
 # ---- synthetic end-to-end fixture ------------------------------------
 
