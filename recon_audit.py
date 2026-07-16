@@ -230,6 +230,46 @@ def _read_csv(path):
     return rows
 
 
+def _xlsb_norm(v):
+    # pyxlsb hands back EVERY numeric cell as a float, so an integral Oracle id
+    # (DEPOSIT_ID/RECEIPT_ID = 65105) arrives as 65105.0 and would stringify to
+    # "65105.0" — which the d:/r: citations (clean ints) never match, spuriously
+    # failing C4.  Collapse integral floats to int so an .xlsb MET yields the
+    # same real-deposit / real-receipt set as the .csv/.xlsx twin.  Money
+    # (1890.69) and true fractional serials are left untouched.  This duplicates
+    # the engine's _xlsb_norm literally — the audit imports nothing from it.
+    if isinstance(v, float) and -1e15 < v < 1e15 and v.is_integer():
+        return int(v)
+    return v
+
+
+def _read_xlsb(path, sheet_substr=None):
+    # Independent binary reader (pyxlsb).
+    from pyxlsb import open_workbook
+    with open_workbook(path) as wb:
+        names = wb.sheets
+        target = names[0]
+        if sheet_substr:
+            for n in names:
+                if sheet_substr.lower() in n.lower():
+                    target = n
+                    break
+        with wb.get_sheet(target) as ws:
+            rows = [tuple(_xlsb_norm(c.v) for c in row) for row in ws.rows()]
+    return rows
+
+
+def _read_table(path, sheet_substr=None):
+    """Extension dispatch mirroring the engine's read_rows (csv / xlsb / xlsx)
+    so the audit reads every format the engine accepts, MET .xlsb included."""
+    low = path.lower()
+    if low.endswith(".csv"):
+        return _read_csv(path)
+    if low.endswith(".xlsb"):
+        return _read_xlsb(path, sheet_substr)
+    return _read_xlsx(path, sheet_substr)
+
+
 def _pred_date(v):
     return _parse_date(v) is not None
 
@@ -275,7 +315,7 @@ def _reparse_source_bsls(input_dir):
     for name in sorted(os.listdir(input_dir)):
         low = name.lower()
         if "bsl" in low and "all_data" not in low and "enriched" not in low \
-                and "crossref" not in low and low.endswith((".xlsx", ".xlsm", ".csv")):
+                and "crossref" not in low and low.endswith((".xlsx", ".xlsm", ".csv", ".xlsb")):
             candidates.append(name)
     if not candidates:
         return None
@@ -284,10 +324,7 @@ def _reparse_source_bsls(input_dir):
     # alphabetically.  Stable sort keeps alphabetical order among ties.
     candidates.sort(key=_newest_date_key, reverse=True)
     bsl_file = os.path.join(input_dir, candidates[0])
-    if bsl_file.lower().endswith(".csv"):
-        rows = _read_csv(bsl_file)
-    else:
-        rows = _read_xlsx(bsl_file)
+    rows = _read_table(bsl_file)
     if not rows:
         return []
     hi = _locate_header(rows, _BSL_HEADER_VOCAB)
@@ -315,9 +352,9 @@ def _reparse_met_pairs(input_dir):
         low = name.lower()
         # 'oracle_otbi' names are MET exports even without the MET token
         # (mirrors the engine's router).
-        if ("met" in low or "oracle_otbi" in low) and low.endswith((".xlsx", ".xlsm", ".csv")):
+        if ("met" in low or "oracle_otbi" in low) and low.endswith((".xlsx", ".xlsm", ".csv", ".xlsb")):
             path = os.path.join(input_dir, name)
-            rows = _read_csv(path) if path.lower().endswith(".csv") else _read_xlsx(path)
+            rows = _read_table(path)
             # Native DEPOSIT_ID / RECEIPT_ID columns (some exports carry the
             # ids only there, not in the d:/r: description text).
             if rows:

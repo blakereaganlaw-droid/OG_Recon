@@ -163,7 +163,17 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   `DEPOSIT_ID`/`RECEIPT_ID` columns preferred over `d:/r:` description parse,
   ORT deposit-group pass (P4 phase 2), NA-placeholder nulling, integer
   reference cells (an int is a reference, not an Excel date serial), `.xlsb`
-  via pyxlsb. Real exports are NOT committed; `TestRealDataShapes` pins their
+  via pyxlsb. **`.xlsb` integral-float normalization (owner, 2026-07-16):**
+  pyxlsb returns EVERY numeric cell as a float, so an integral Oracle id
+  (`DEPOSIT_ID`/`RECEIPT_ID` = 65105) arrives as `65105.0` and stringifies to
+  `"65105.0"` — corrupting the MET↔ST bridge join and the `d:/r:` citations
+  (audit C4). `_xlsb_norm` collapses integral floats back to int at read time
+  in BOTH the engine (`_read_xlsb_rows`) and the audit's independent
+  `_read_xlsb`, so an `.xlsb` MET yields byte-identical output to its `.csv`
+  twin (money and true fractional serials untouched). The audit also now reads
+  MET/BSL `.xlsb` (it previously only accepted `.xlsx/.xlsm/.csv`, so an
+  `.xlsb` MET made its real-deposit set empty and every citation failed C4).
+  Real exports are NOT committed; `TestRealDataShapes` pins their
   shapes synthetically. The relationship docs
   (`UT_Recon_ORT_Data_Relationships.md`, SPN companion) are the domain
   authority for joins/gates alongside the spec.

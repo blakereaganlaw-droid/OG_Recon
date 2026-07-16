@@ -108,6 +108,21 @@ class TestPrimitives(unittest.TestCase):
         self.assertTrue(E.date_ok_merchant(3))
         self.assertFalse(E.date_ok_merchant(10))
 
+    def test_xlsb_integral_float_normalization(self):
+        # pyxlsb returns every numeric cell as a float; an integral Oracle id
+        # (DEPOSIT_ID 65105) must collapse to int so it does not stringify to
+        # "65105.0" and break the MET<->ST bridge join / d:/r: citations.  The
+        # engine and the (independent) audit must normalize IDENTICALLY.
+        for norm in (E._xlsb_norm, A._xlsb_norm):
+            self.assertEqual(norm(65105.0), 65105)
+            self.assertIs(type(norm(65105.0)), int)
+            self.assertEqual(str(norm(203362.0)), "203362")   # no ".0"
+            self.assertEqual(norm(1890.69), 1890.69)          # money untouched
+            self.assertEqual(norm("65105"), "65105")          # text untouched
+            self.assertIsNone(norm(None))
+            self.assertIs(norm(True), True)                    # bool is not a float
+            self.assertEqual(norm(1e18), 1e18)                 # beyond guard: untouched
+
 
 class TestRouter(unittest.TestCase):
     def test_classify(self):

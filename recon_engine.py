@@ -958,6 +958,20 @@ def _read_csv_rows(path):
     return [tuple(r) for r in rows]
 
 
+def _xlsb_norm(v):
+    """pyxlsb returns EVERY numeric cell as a float, so an integral Oracle id
+    (DEPOSIT_ID/RECEIPT_ID/TRANSACTION_ID = 65105) arrives as 65105.0 and would
+    stringify to "65105.0" — breaking the MET<->ST bridge join and the d:/r:
+    deposit-group citations (audit C4 fails: "not a real MET deposit").  Collapse
+    integral floats back to int so an .xlsb read matches the .csv/.xlsx text form
+    byte-for-byte downstream.  Money (1890.69) and any true fractional serial are
+    left untouched; the 1e15 guard keeps the collapse inside float's exact-integer
+    range; bool is not a float so it is unaffected."""
+    if isinstance(v, float) and -1e15 < v < 1e15 and v.is_integer():
+        return int(v)
+    return v
+
+
 def _read_xlsb_rows(path, sheet_hint):
     """Binary workbook reader (pyxlsb).  Dates arrive as Excel serials, which
     parse_date already accepts."""
@@ -984,7 +998,7 @@ def _read_xlsb_rows(path, sheet_hint):
             elif matches:
                 target = matches[0]
         with wb.get_sheet(target) as ws:
-            rows = [tuple(c.v for c in row) for row in ws.rows()]
+            rows = [tuple(_xlsb_norm(c.v) for c in row) for row in ws.rows()]
     return rows, target
 
 
