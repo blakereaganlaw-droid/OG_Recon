@@ -108,6 +108,21 @@ class TestPrimitives(unittest.TestCase):
         self.assertTrue(E.date_ok_merchant(3))
         self.assertFalse(E.date_ok_merchant(10))
 
+    def test_xlsb_integral_float_normalization(self):
+        # pyxlsb returns every numeric cell as a float; an integral Oracle id
+        # (DEPOSIT_ID 65105) must collapse to int so it does not stringify to
+        # "65105.0" and break the MET<->ST bridge join / d:/r: citations.  The
+        # engine and the (independent) audit must normalize IDENTICALLY.
+        for norm in (E._xlsb_norm, A._xlsb_norm):
+            self.assertEqual(norm(65105.0), 65105)
+            self.assertIs(type(norm(65105.0)), int)
+            self.assertEqual(str(norm(203362.0)), "203362")   # no ".0"
+            self.assertEqual(norm(1890.69), 1890.69)          # money untouched
+            self.assertEqual(norm("65105"), "65105")          # text untouched
+            self.assertIsNone(norm(None))
+            self.assertIs(norm(True), True)                    # bool is not a float
+            self.assertEqual(norm(1e18), 1e18)                 # beyond guard: untouched
+
 
 class TestRouter(unittest.TestCase):
     def test_classify(self):
@@ -336,6 +351,29 @@ class TestPoolDedup(unittest.TestCase):
         self.assertFalse(E.payer_contradiction(b, [bc]))          # same family, no contradiction
         israel = E._mk_entry("R2", 10712119, date(2026, 7, 6), "", "City of Chattanooga", "AR", "UNR", True, "RECEIPTS")
         self.assertTrue(E.payer_contradiction(b, [israel]))        # unrelated payer -> contradiction
+
+    def test_feed_session_label_is_not_a_payer_contradiction(self):
+        # Oracle ORT stamps unattributed External lines with a generic
+        # "FEED SESSION <n>" batch label in the counterparty column.  That
+        # names the load batch, not a payer, so it is SILENCE on payer
+        # identity and must NOT contradict a real bank-side payer (owner,
+        # 2026-07-16).  A Heartland settlement vs a feed-session ST is not
+        # contradicted; a real unrelated payer still is.
+        self.assertEqual(E._contra_tokens("TN FEED SESSION 4161 | TN FEED SESSION 4161"), set())
+        self.assertEqual(E._contra_tokens("CITY OF CHATTANOOGA"), {"CITY", "CHATTANOOGA"})
+
+        class _B:
+            amount_cents = 189069
+            additional_info = ("HRTLAND PMT SYS TXNS/FEES 2607136500000097923"
+                               "SENDING CO ID: WFBEHPS001 SENDING CO NAME: HRTLAND PMT SYS")
+            customer_reference = "HRTLAND PMT SYS"
+        b = _B()
+        feed = E._mk_entry("1030340", 2619400624, date(2026, 7, 13), "",
+                           "TN FEED SESSION 4161 | TN FEED SESSION 4161", "EXT", "UNR", True, "EXT")
+        self.assertFalse(E.payer_contradiction(b, [feed]))     # feed-session label = silence
+        israel = E._mk_entry("R9", 111, date(2026, 7, 13), "",
+                             "City of Chattanooga", "AR", "UNR", True, "RECEIPTS")
+        self.assertTrue(E.payer_contradiction(b, [israel]))    # unrelated payer still contradicts
 
     def test_p8c_payer_family_receipt_sum_candidate(self):
         # A VSHP/TennCare ACH covered by two same-day BlueCare receipts whose

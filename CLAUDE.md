@@ -73,7 +73,14 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    (amount-only) pairings are barred — even as Candidates — when both sides
    carry payer tokens and share none ("City of Chattanooga has nothing to do
    with Israel"). Reference ties outrank payer text; silence never
-   contradicts. **Payer-family aliases (owner, 2026-07-14):** distinct trade
+   contradicts. **Feed-session silence (owner, 2026-07-16):** Oracle ORT
+   stamps unattributed External lines with a generic `FEED SESSION <n>` batch
+   label in the counterparty column — that names the load batch, not a
+   payer/beneficiary, so it is SILENCE on payer identity and never
+   contradicts a real bank-side payer (`_FEED_SESSION_RE` strips it before
+   `_contra_tokens`). This is what lets a distinctive-amount Heartland
+   settlement match its ORT deposit chain instead of being falsely
+   contradicted. **Payer-family aliases (owner, 2026-07-14):** distinct trade
    names for one payer are agreement, not contradiction — VSHP / Volunteer
    State Health Plan / TN CARE SELECT / TennCare **==** BlueCare Tennessee
    (BCBST) via `payer_family`. Pass `P8c_payer_family`: a positive ACH covered
@@ -156,7 +163,17 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   `DEPOSIT_ID`/`RECEIPT_ID` columns preferred over `d:/r:` description parse,
   ORT deposit-group pass (P4 phase 2), NA-placeholder nulling, integer
   reference cells (an int is a reference, not an Excel date serial), `.xlsb`
-  via pyxlsb. Real exports are NOT committed; `TestRealDataShapes` pins their
+  via pyxlsb. **`.xlsb` integral-float normalization (owner, 2026-07-16):**
+  pyxlsb returns EVERY numeric cell as a float, so an integral Oracle id
+  (`DEPOSIT_ID`/`RECEIPT_ID` = 65105) arrives as `65105.0` and stringifies to
+  `"65105.0"` — corrupting the MET↔ST bridge join and the `d:/r:` citations
+  (audit C4). `_xlsb_norm` collapses integral floats back to int at read time
+  in BOTH the engine (`_read_xlsb_rows`) and the audit's independent
+  `_read_xlsb`, so an `.xlsb` MET yields byte-identical output to its `.csv`
+  twin (money and true fractional serials untouched). The audit also now reads
+  MET/BSL `.xlsb` (it previously only accepted `.xlsx/.xlsm/.csv`, so an
+  `.xlsb` MET made its real-deposit set empty and every citation failed C4).
+  Real exports are NOT committed; `TestRealDataShapes` pins their
   shapes synthetically. The relationship docs
   (`UT_Recon_ORT_Data_Relationships.md`, SPN companion) are the domain
   authority for joins/gates alongside the spec.
