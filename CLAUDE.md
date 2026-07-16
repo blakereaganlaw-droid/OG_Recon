@@ -73,7 +73,14 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    (amount-only) pairings are barred — even as Candidates — when both sides
    carry payer tokens and share none ("City of Chattanooga has nothing to do
    with Israel"). Reference ties outrank payer text; silence never
-   contradicts. **Payer-family aliases (owner, 2026-07-14):** distinct trade
+   contradicts. **Feed-session silence (owner, 2026-07-16):** Oracle ORT
+   stamps unattributed External lines with a generic `FEED SESSION <n>` batch
+   label in the counterparty column — that names the load batch, not a
+   payer/beneficiary, so it is SILENCE on payer identity and never
+   contradicts a real bank-side payer (`_FEED_SESSION_RE` strips it before
+   `_contra_tokens`). This is what lets a distinctive-amount Heartland
+   settlement match its ORT deposit chain instead of being falsely
+   contradicted. **Payer-family aliases (owner, 2026-07-14):** distinct trade
    names for one payer are agreement, not contradiction — VSHP / Volunteer
    State Health Plan / TN CARE SELECT / TennCare **==** BlueCare Tennessee
    (BCBST) via `payer_family`. Pass `P8c_payer_family`: a positive ACH covered

@@ -337,6 +337,29 @@ class TestPoolDedup(unittest.TestCase):
         israel = E._mk_entry("R2", 10712119, date(2026, 7, 6), "", "City of Chattanooga", "AR", "UNR", True, "RECEIPTS")
         self.assertTrue(E.payer_contradiction(b, [israel]))        # unrelated payer -> contradiction
 
+    def test_feed_session_label_is_not_a_payer_contradiction(self):
+        # Oracle ORT stamps unattributed External lines with a generic
+        # "FEED SESSION <n>" batch label in the counterparty column.  That
+        # names the load batch, not a payer, so it is SILENCE on payer
+        # identity and must NOT contradict a real bank-side payer (owner,
+        # 2026-07-16).  A Heartland settlement vs a feed-session ST is not
+        # contradicted; a real unrelated payer still is.
+        self.assertEqual(E._contra_tokens("TN FEED SESSION 4161 | TN FEED SESSION 4161"), set())
+        self.assertEqual(E._contra_tokens("CITY OF CHATTANOOGA"), {"CITY", "CHATTANOOGA"})
+
+        class _B:
+            amount_cents = 189069
+            additional_info = ("HRTLAND PMT SYS TXNS/FEES 2607136500000097923"
+                               "SENDING CO ID: WFBEHPS001 SENDING CO NAME: HRTLAND PMT SYS")
+            customer_reference = "HRTLAND PMT SYS"
+        b = _B()
+        feed = E._mk_entry("1030340", 2619400624, date(2026, 7, 13), "",
+                           "TN FEED SESSION 4161 | TN FEED SESSION 4161", "EXT", "UNR", True, "EXT")
+        self.assertFalse(E.payer_contradiction(b, [feed]))     # feed-session label = silence
+        israel = E._mk_entry("R9", 111, date(2026, 7, 13), "",
+                             "City of Chattanooga", "AR", "UNR", True, "RECEIPTS")
+        self.assertTrue(E.payer_contradiction(b, [israel]))    # unrelated payer still contradicts
+
     def test_p8c_payer_family_receipt_sum_candidate(self):
         # A VSHP/TennCare ACH covered by two same-day BlueCare receipts whose
         # own references do NOT tie the bank line surfaces as a Candidate via

@@ -1681,9 +1681,20 @@ _PAYER_LABEL_RE = re.compile(
 _CONTRA_STOP = {"THE", "AND", "FOR", "FROM", "WITH", "INC", "LLC", "CORP",
                 "CO", "OF"}
 
+# Oracle ORT bank-feed load stamps unattributed External lines with a generic
+# "FEED SESSION <n>" batch label in the counterparty column (owner, 2026-07-16:
+# "review all cells and all characters, especially the description text").  That
+# label names the load BATCH, not a payer/beneficiary/originator — so it is
+# SILENCE on payer identity, never a contradicting name.  Strip it before
+# tokenizing so a real bank-side payer (e.g. a Heartland settlement) is not
+# falsely contradicted by a feed-session artifact (owner doctrine: "silence
+# never contradicts").
+_FEED_SESSION_RE = re.compile(r"(?i)\bFEED\s+SESSION\b")
+
 
 def _contra_tokens(text):
-    return {w.upper() for w in _ALPHA_TOKEN_RE.findall(N(text))
+    cleaned = _FEED_SESSION_RE.sub(" ", N(text))
+    return {w.upper() for w in _ALPHA_TOKEN_RE.findall(cleaned)
             if len(w) >= 3 and w.upper() not in _CONTRA_STOP}
 
 

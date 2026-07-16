@@ -424,7 +424,14 @@ Validated against the owner-supplied FHB Master reference reconciliation
    counterparty) and they share none, a **zero-corroboration** pairing is
    barred even as a Candidate ("City of Chattanooga has nothing to do with
    Israel"). Reference ties always outrank payer text; silence on either
-   side never contradicts.
+   side never contradicts. **Feed-session silence (owner, 2026-07-16):**
+   Oracle ORT stamps unattributed External lines with a generic
+   `FEED SESSION <n>` batch label in the counterparty column. That label
+   names the load batch — not a payer/beneficiary/originator — so it is
+   silence on payer identity, not a contradicting name. `_FEED_SESSION_RE`
+   strips it before `_contra_tokens`, so a real bank-side payer (e.g. a
+   Heartland settlement) is not falsely contradicted by a feed-session
+   artifact and can match its ORT deposit chain.
 7. **Deposit-type consistency retired; merchant & correction guardrails
    (owner directive, false-match review).** "Deposit-type consistency"
    confers NOTHING — neither Match nor Candidate rank; an exact-sum deposit
