@@ -444,6 +444,16 @@ Validated against the owner-supplied FHB Master reference reconciliation
    than rejection. The audit's C7 enforces all three. Convera lines are
    international wires and ALWAYS Payables — they never pair with a
    non-Payables ST (enforced in the central type gate).
+   **Ref-tied split priority (owner, 2026-07-17, FHB UTIA $40 merchant
+   line):** in the ORT deposit-group pass, a deposit whose members carry
+   the BSL's reference (for a merchant line, the MID — "the critical
+   matching string") but sum to the BSL only WITH already-closed members
+   (auto-rec split) OUTRANKS coincidental equal-sum OPEN deposits carrying
+   no tie: the ref-tied split surfaces as the `POSSIBLE_AUTO_REC_SPLIT`
+   Candidate instead of the tie-less coincidence's amount-only path
+   (whose payer-contradiction bar previously stranded the line in Review
+   with the reference-tied deposit unmentioned). A corroborated exact-open
+   deposit still outranks any split group.
 8. **Distinctive-amount exception (owner directive).** Amount-only and
    transaction-type-only evidence are never sufficient — EXCEPT a
    statistically rare exact amount: non-zero cents AND >= $1,000 magnitude,

@@ -101,6 +101,14 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    carries a MID, an ST without that same MID is barred even as a
    Candidate ("the MID is the critical matching string"). Audit C7
    enforces it.
+8c2. **Ref-tied split outranks amount-only coincidence (owner, 2026-07-17,
+   FHB UTIA $40 merchant line).** In P4 phase 2, a deposit whose members
+   carry the BSL's reference but sum to it only WITH closed members
+   (auto-rec split) outranks coincidental equal-sum OPEN deposits that
+   carry no tie — the ref-tied split surfaces as the
+   `POSSIBLE_AUTO_REC_SPLIT` Candidate instead of the coincidence's
+   amount-only path barring the line into Review. Corroborated exact-open
+   deposits still win over splits.
 8d. **12-day stale-candidate ceiling (owner, 2026-07-12).** An
    External-source ST entered 12+ days BEFORE the BSL statement date is
    almost certainly not the counterpart — barred even as a Candidate
