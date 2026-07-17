@@ -375,6 +375,48 @@ class TestPoolDedup(unittest.TestCase):
                              "City of Chattanooga", "AR", "UNR", True, "RECEIPTS")
         self.assertTrue(E.payer_contradiction(b, [israel]))    # unrelated payer still contradicts
 
+    def test_ref_tied_split_group_outranks_amount_only_coincidence(self):
+        # Owner doctrine (2026-07-17, FHB UTIA $40 merchant line): a deposit
+        # whose members carry the BSL's reference but sum to it only WITH a
+        # closed member (auto-rec split) outranks a coincidental equal-sum
+        # OPEN deposit that carries no tie at all.  Previously the
+        # uncorroborated coincidence entered the amount-only branch and its
+        # payer-contradiction bar skipped PAST the split branch, stranding
+        # the line in Review with the ref-tied deposit unmentioned.
+        bsl = E.make_bsl("L32", date(2026, 5, 12), 4000, "8042195480", "",
+                         "MERCHANT SERVICEDEPOSIT   2605128042195480"
+                         "SENDING CO ID: 3084000026 SENDING CO NAME: MERCHANT SERVICE",
+                         "Automated clearing house", "")
+        open_member = E._mk_entry("987207", 1000, date(2026, 5, 13), "8042195480",
+                                  "", "EXT", "UNR", True, "MET",
+                                  deposit_id="117748", receipt_id="341093",
+                                  transaction_type="Automated clearing house")
+        closed_member = E._mk_entry("987229", 3000, date(2026, 5, 13), "8042195480",
+                                    "", "EXT", "REC", False, "MET",
+                                    deposit_id="117748", receipt_id="341092",
+                                    transaction_type="ACH")
+        # coincidental open $40 deposit, later date, no tie, contradicting payer
+        coincidence = E._mk_entry("999001", 4000, date(2026, 7, 14), "555000111",
+                                  "City of Chattanooga", "EXT", "UNR", True, "MET",
+                                  deposit_id="128801", receipt_id="900001",
+                                  transaction_type="Automated clearing house")
+        # extra open same-MID merchant STs (real FHB UTIA condition): they
+        # break the P4 phase-1 whole-reference-group sum, so only the
+        # deposit-chain (phase 2) view can explain the line.
+        extra1 = E._mk_entry("1031250", 2000, date(2026, 5, 14), "8042195480",
+                             "", "EXT", "UNR", True, "ST",
+                             transaction_type="Automated clearing house")
+        extra2 = E._mk_entry("1031251", 1500, date(2026, 5, 15), "8042195480",
+                             "", "EXT", "UNR", True, "ST",
+                             transaction_type="Automated clearing house")
+        pool = [open_member, closed_member, coincidence, extra1, extra2]
+        p = E.forward_reconcile([bsl], pool, {}, "FHB_TEST", {})[0]
+        self.assertEqual(p.kind, E.CANDIDATE)
+        self.assertEqual(p.pass_name, "P4_deposit_group")
+        self.assertIn("POSSIBLE_AUTO_REC_SPLIT", p.codes)
+        self.assertIn("117748", p.explanation)
+        self.assertIn("987229", p.explanation)   # closed member named
+
     def test_p8c_payer_family_receipt_sum_candidate(self):
         # A VSHP/TennCare ACH covered by two same-day BlueCare receipts whose
         # own references do NOT tie the bank line surfaces as a Candidate via

@@ -2217,6 +2217,25 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   "P4_deposit_group")
             continue
         exact_open = dated
+        # Owner doctrine (2026-07-17, FHB UTIA $40 merchant line): reference
+        # ties outrank amount-only evidence.  When a split group's members
+        # carry the BSL's reference (the deposit chain's own id — for a
+        # merchant line, the MID, "the critical matching string") and NO
+        # open exact-sum deposit carries any corroboration of its own, the
+        # ref-tied auto-rec split is the true chain.  Previously the
+        # uncorroborated equal-sum coincidence entered the amount-only
+        # branch and its payer-contradiction bar `continue`d PAST the
+        # split-group branch, stranding the line in Review while the
+        # reference-tied deposit went unmentioned.
+        ref_split = [(d, g, c) for d, g, c in split_groups
+                     if any(reference_equal(bsl.recon_reference, e.reference)
+                            or reference_equal(bsl.recon_reference, e.id)
+                            or reference_tie(bsl.recon_reference, e.reference)
+                            for e in g)]
+        if ref_split and not any(_deposit_corroboration(bsl, g)
+                                 for _, g in exact_open):
+            exact_open = []
+            split_groups = ref_split
         if len(exact_open) == 1:
             dep, group = exact_open[0]
             why = _deposit_corroboration(bsl, group)
