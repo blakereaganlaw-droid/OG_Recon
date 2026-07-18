@@ -451,6 +451,41 @@ def account_of_bank_name(name):
     return None
 
 
+# GL cash-account map (owner COA export, 2026-07-18): the Chart of Accounts
+# assigns each depository bank account a natural-account code, and the MET
+# export stamps it in ASSET_CONCATENATED_SEGMENTS
+# (ENTITY-FUND-DEPT-ACCOUNT-...).  This is an INDEPENDENT second scope key:
+# real exports carry cross-account postings the bank-name join cannot see
+# (38 rows on the UTHSC GL 100500 inside the Master MET; 34 rows on the
+# Master GL 100210 inside the UTIA MET).  Only codes whose engine account
+# exists in _ACCOUNT_TOKENS are mapped; clearing/payroll/CBORD GLs are
+# deliberately absent (they are not depository statements).
+_GL_CASH_ACCOUNTS = {
+    "100210": "FHB_MASTER",
+    "100221": "FHB_UTIA",
+    "100226": "FHB_UTSO",
+    "100310": "FHB_UTC",
+    "100330": "REGIONS_UTM",
+    "100335": "REGIONS_MASTER",
+    "100350": "REGIONS_UTIPS",
+    "100360": "REGIONS_UTIA",
+    "100384": "REGIONS_UTSI",
+    "100390": "REGIONS_UTHSC",
+    "100500": "FHB_UTHSC",
+}
+
+
+def account_of_gl_segments(segments):
+    """Map a concatenated GL combination ("01-1100001-000000-100221-...") to
+    the short engine account via its natural-account segment (position 4 of
+    the ENTITY-FUND-DEPT-ACCOUNT-... combo).  Returns None for malformed
+    combos and for GLs belonging to no configured depository account."""
+    parts = N(segments).split("-")
+    if len(parts) < 4:
+        return None
+    return _GL_CASH_ACCOUNTS.get(parts[3].strip())
+
+
 def _leading_date_key(filename):
     """Newest plausible YYYYMMDD stamp in the filename ('00000000' if none).
     An 8-digit run that does not parse as a calendar date (an account or
@@ -830,6 +865,9 @@ MET_ROLES = {
     "transaction_type": _rs(False, ["CET Transaction Type", "Transaction Type"], pred_any),
     "cleared_date": _rs(False, ["Cleared Date"], pred_date),
     "offset": _rs(False, ["Offset Concatenated Segments", "Offset", "GL"], pred_any),
+    # COA scope key (owner, 2026-07-18): the asset combo's natural account
+    # identifies the depository bank account independently of the bank name.
+    "asset_segments": _rs(False, ["Asset Concatenated Segments"], pred_any),
 }
 
 
@@ -1235,14 +1273,31 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
         rows, m, hi = met["rows"], met["map"], met["header_index"]
         raw = []
         met_total = 0
-        scoped = m.get("bank_account_name") is not None and account and account != "UNKNOWN"
+        have_account = bool(account) and account != "UNKNOWN"
+        scoped = m.get("bank_account_name") is not None and have_account
+        # COA fallback scope (owner, 2026-07-18): when the export lacks a
+        # bank-name column, the asset combo's GL cash account is the scope
+        # key — otherwise an all-accounts export would leak every account
+        # into the pool.  When BOTH keys are bound, bank name stays
+        # authoritative (it names the statement the row belongs to) and
+        # GL disagreements are surfaced in the runlog, never silently used.
+        gl_scoped = (not scoped and have_account
+                     and m.get("asset_segments") is not None)
+        gl_conflicts = 0
         for r in rows[hi + 1:]:
             met_total += 1
             # Scope join (ORT doc section 4.6): the MET export spans EVERY
             # account; keep only rows whose long bank-account name maps to
             # the account being reconciled.  Cross-account rows never enter
             # the pool — a cross-account amount hit must not become a Match.
-            if scoped and account_of_bank_name(_cell(r, m.get("bank_account_name"))) != account:
+            if scoped:
+                if account_of_bank_name(_cell(r, m.get("bank_account_name"))) != account:
+                    continue
+                if m.get("asset_segments") is not None:
+                    gl_acc = account_of_gl_segments(_cell(r, m.get("asset_segments")))
+                    if gl_acc is not None and gl_acc != account:
+                        gl_conflicts += 1
+            elif gl_scoped and account_of_gl_segments(_cell(r, m.get("asset_segments"))) != account:
                 continue
             amt = cents(_cell(r, m.get("amount")))
             trx = N(_cell(r, m.get("trx_id")))
@@ -1283,7 +1338,17 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
         deduped = _dedup_keep_largest(raw, lambda e: e.id)
         counts["MET"] = len(deduped)
         if scoped:
-            runlog["met_scope"] = {"rows_total": met_total, "rows_in_account": len(raw)}
+            runlog["met_scope"] = {"rows_total": met_total, "rows_in_account": len(raw),
+                                   "key": "bank_name"}
+            if gl_conflicts:
+                # Rows whose bank name says this account but whose GL cash
+                # account belongs to another depository (cross-account
+                # postings) — kept (bank name is authoritative), surfaced
+                # for the reconciler.
+                runlog["met_gl_conflicts"] = gl_conflicts
+        elif gl_scoped:
+            runlog["met_scope"] = {"rows_total": met_total, "rows_in_account": len(raw),
+                                   "key": "gl_cash_account"}
         # MET <-> ST bridge (CET_TRANSACTION_ID == ST Transaction Number, a
         # 1:1 bijection): the same transaction must never sit in the pool
         # twice, or reference groups double-count.  The ST export row is

@@ -1001,7 +1001,8 @@ class TestRealDataShapes(unittest.TestCase):
         self.assertEqual(runlog["audit"]["status"], "PASS",
                          msg=str(runlog["audit"].get("failures")))
         # scope: 3 of 4 MET rows are ours; the FHB-UTC row is excluded
-        self.assertEqual(runlog["met_scope"], {"rows_total": 4, "rows_in_account": 3})
+        self.assertEqual(runlog["met_scope"],
+                         {"rows_total": 4, "rows_in_account": 3, "key": "bank_name"})
         # bridge: trx 601 exists in both ST and MET -> one pool entry
         self.assertEqual(runlog["met_bridged_to_st"], 1)
         self.assertEqual(runlog["pool_total"], 3)
@@ -1020,6 +1021,47 @@ class TestRealDataShapes(unittest.TestCase):
         by_amount = {A._N(r[2]): r for r in match_rows}
         self.assertEqual(A._N(by_amount["150.00"][A.COL_DEP]), "901")  # ORT d:
         self.assertEqual(A._N(by_amount["150.00"][A.COL_REC]), "13")   # ORT r:
+
+    def test_met_gl_fallback_scope(self):
+        # COA scope key (owner, 2026-07-18): when the MET export lacks the
+        # bank-name column, the asset combo's GL cash account scopes the
+        # pool — a cross-account row (UTC GL 100310) must never enter.
+        met = [
+            ("ASSET_CONCATENATED_SEGMENTS", "CET_REFERENCE_TEXT", "CET_STATUS",
+             "CET_TRANSACTION_DATE", "CET_TRANSACTION_ID", "AMOUNT",
+             "TRANSACTION_DATE", "CET_DESCRIPTION", "DEPOSIT_ID", "RECEIPT_ID"),
+            ("01-1100001-000000-100210-000-0000-00-0000", "DEPREF77", "UNR",
+             "2026-07-01", 501, "400.00", "2026-07-01", "d:900 | r:11 | PAYER A", 900, 11),
+            ("01-1100001-000000-100210-000-0000-00-0000", "DEPREF77", "UNR",
+             "2026-07-01", 502, "600.00", "2026-07-01", "d:900 | r:12 | PAYER A", 900, 12),
+            ("01-1100001-000000-100210-000-0000-00-0000", "REF100200", "UNR",
+             "2026-07-02", 601, "150.00", "2026-07-02", "d:901 | r:13 | VENDOR", 901, 13),
+            ("01-1100001-000000-100310-000-0000-40-0000", "DEPREF77", "UNR",
+             "2026-07-01", 701, "1000.00", "2026-07-01", "d:902 | r:14 | PAYER A", 902, 14),
+        ]
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-03", "150.00", "REF100200", "ACH CREDIT", "REF100200",
+             "Automated clearing house", "Line 2 , 2026-07-03", "142"),
+        ]
+        self._build(bsl)
+        _write_xlsx(os.path.join(self.d, "20260710_MET_All_Accounts.xlsx"),
+                    [("Miscellaneous External Transact", met)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertEqual(runlog["met_scope"],
+                         {"rows_total": 4, "rows_in_account": 3, "key": "gl_cash_account"})
+        self.assertEqual(runlog["pool_total"], 3)  # UTC GL row excluded
+
+    def test_account_of_gl_segments(self):
+        self.assertEqual(E.account_of_gl_segments("01-1100001-000000-100221-000-0000-00-0000"), "FHB_UTIA")
+        self.assertEqual(E.account_of_gl_segments("01-1100001-000000-100330-000-0000-00-0000"), "REGIONS_UTM")
+        self.assertEqual(E.account_of_gl_segments("01-1100001-000000-100500-000-0000-70-0000"), "FHB_UTHSC")
+        self.assertIsNone(E.account_of_gl_segments("01-1100001-000000-100928-000-0000-00-0000"))  # clearing GL: unmapped
+        self.assertIsNone(E.account_of_gl_segments("100221"))          # malformed combo
+        self.assertIsNone(E.account_of_gl_segments(None))
 
     def test_deposit_auto_rec_split_is_candidate(self):
         rows = self._met_rows()
