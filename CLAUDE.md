@@ -185,6 +185,20 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   shapes synthetically. The relationship docs
   (`UT_Recon_ORT_Data_Relationships.md`, SPN companion) are the domain
   authority for joins/gates alongside the spec.
+- **COA GL scope key (owner, 2026-07-18).** The Chart of Accounts assigns
+  each depository bank account a natural-account GL code, stamped in the
+  MET's `ASSET_CONCATENATED_SEGMENTS` (`ENTITY-FUND-DEPT-ACCOUNT-...`).
+  `_GL_CASH_ACCOUNTS` / `account_of_gl_segments` map it to the engine
+  account (100210=FHB_MASTER, 100221=FHB_UTIA, 100310=FHB_UTC,
+  100330=REGIONS_UTM, 100500=FHB_UTHSC, …; clearing/payroll GLs
+  deliberately unmapped). Used as FALLBACK scope for the MET pool when the
+  bank-name column is unbound (else an all-accounts export leaks every
+  account); when both keys bind, bank name stays authoritative and GL
+  disagreements surface as `met_gl_conflicts` in the runlog (real exports
+  carry them: 38 UTHSC-GL rows inside the Master MET, 34 Master-GL rows
+  inside the UTIA MET). Entity segment codes (10=UTK, 40=UTC, 50=UTM,
+  60=UTSO, 70=UTHSC, 17/18/19=UTIA family) are reference only — campus
+  "consistency" confers NOTHING (rule 8c).
 - UNR-only exports are residuals: Oracle already took the easy matches, so
   low Match counts with precise Candidate/Review causes are CORRECT there,
   not a defect. Receipts/Edison/GMS exports enrich what can match.
