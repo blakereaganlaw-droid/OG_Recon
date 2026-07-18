@@ -848,6 +848,13 @@ RECEIPTS_ROLES = {
     "batch_number": _rs(False, ["Batch Number", "Receipt Batch"], pred_reference),
     "reference": _rs(False, ["Reference", "Remittance Reference"], pred_reference),
     "unapplied_amount": _rs(False, ["Unapplied Amount"], pred_signed_amount),
+    # Misdirected-SPN detector (owner hard guardrail, 2026-07-18): the
+    # receipts export is system-wide; this column names which bank account
+    # each receipt actually remits to.  Predicate demands a value that maps
+    # to a configured account so 'Remittance Bank' / '...Currency' twins
+    # can never bind here.
+    "remittance_bank_account": _rs(False, ["Remittance Bank Account"],
+                                   lambda v: account_of_bank_name(v) is not None),
 }
 
 MET_ROLES = {
@@ -1086,6 +1093,10 @@ class PoolEntry:
     transaction_type: str = ""  # Credit Card / Check / EFT (type gate)
     spr: str = ""           # Structured Payment Reference (screened separately)
     base_id: str = ""       # undisambiguated id when distinct rows share one label
+    foreign_account: str = ""  # set when the entry belongs to ANOTHER bank
+    #                            account (misdirected-SPN shadow pool; owner
+    #                            hard guardrail 2026-07-18) — never eligible
+    #                            for normal Matches/Candidates
 
 
 def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
@@ -1234,13 +1245,22 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 available=available,
                 origin="RECEIPTS",
             )
+            # Misdirected-SPN detector (owner hard guardrail, 2026-07-18):
+            # remember which bank account this receipt remits to.  The
+            # decision (foreign vs ours) happens at merge time below — a
+            # receipt that merges onto one of THIS account's STs is ours by
+            # definition, whatever the remittance column says.
+            if m.get("remittance_bank_account") is not None and account and account != "UNKNOWN":
+                rem = account_of_bank_name(_cell(r, m.get("remittance_bank_account")))
+                if rem is not None and rem != account:
+                    e.foreign_account = rem
             raw.append(e)
         deduped = _dedup_keep_largest(raw, lambda e: e.id)
         by_id = {}
         for p in pool:
             if p.source == "AR":
                 by_id.setdefault(p.base_id or p.id, []).append(p)
-        merged_rc = appended = 0
+        merged_rc = appended = foreign_rc = 0
         for e in deduped:
             group = by_id.get(e.base_id or e.id) or []
             # Merge by equal signed cents only — same label, different amount
@@ -1248,6 +1268,7 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
             equal = [p for p in group if p.amount_cents == e.amount_cents]
             prev = equal[0] if len(equal) == 1 else None
             if prev is not None:
+                # An ST exists in THIS account's export — not misdirected.
                 prev.status = e.status or prev.status
                 prev.available = e.available
                 if not prev.counterparty and e.counterparty:
@@ -1261,11 +1282,22 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 if prev.date is None:
                     prev.date = e.date
                 merged_rc += 1
+            elif e.foreign_account:
+                # Shadow pool (owner hard guardrail, 2026-07-18): the receipt
+                # remits to ANOTHER bank account and has no ST here.  Kept in
+                # the pool but never available to normal passes — only the
+                # dedicated misdirected search may cite it.
+                e.available = False
+                pool.append(e)
+                foreign_rc += 1
             else:
                 pool.append(e)
                 appended += 1
         counts["RECEIPTS"] = appended
         runlog["receipts_merged_to_st"] = merged_rc
+        if foreign_rc:
+            counts["RECEIPTS_FOREIGN"] = foreign_rc
+            runlog["receipts_foreign_account"] = foreign_rc
 
     # 3. ORT receipts from MET for the ECT chain (index by d: and reference).
     met = loaded.get("MET")
@@ -1284,21 +1316,32 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
         gl_scoped = (not scoped and have_account
                      and m.get("asset_segments") is not None)
         gl_conflicts = 0
+        foreign_raw = []
         for r in rows[hi + 1:]:
             met_total += 1
             # Scope join (ORT doc section 4.6): the MET export spans EVERY
             # account; keep only rows whose long bank-account name maps to
             # the account being reconciled.  Cross-account rows never enter
-            # the pool — a cross-account amount hit must not become a Match.
+            # the pool as matchable entries — but rows belonging to a
+            # DIFFERENT configured account feed the misdirected shadow pool
+            # (owner hard guardrail, 2026-07-18) instead of being dropped.
+            foreign_acc = ""
             if scoped:
-                if account_of_bank_name(_cell(r, m.get("bank_account_name"))) != account:
-                    continue
-                if m.get("asset_segments") is not None:
+                row_acc = account_of_bank_name(_cell(r, m.get("bank_account_name")))
+                if row_acc != account:
+                    if row_acc is None:
+                        continue
+                    foreign_acc = row_acc
+                elif m.get("asset_segments") is not None:
                     gl_acc = account_of_gl_segments(_cell(r, m.get("asset_segments")))
                     if gl_acc is not None and gl_acc != account:
                         gl_conflicts += 1
-            elif gl_scoped and account_of_gl_segments(_cell(r, m.get("asset_segments"))) != account:
-                continue
+            elif gl_scoped:
+                gl_acc = account_of_gl_segments(_cell(r, m.get("asset_segments")))
+                if gl_acc != account:
+                    if gl_acc is None:
+                        continue
+                    foreign_acc = gl_acc
             amt = cents(_cell(r, m.get("amount")))
             trx = N(_cell(r, m.get("trx_id")))
             if amt is None or not trx:
@@ -1334,9 +1377,22 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 receipt_id=rec_id,
                 transaction_type=_cell(r, m.get("transaction_type")),
             )
+            if foreign_acc:
+                # Shadow entry: only the misdirected search may cite it, and
+                # only while it is still OPEN on its own account.
+                if e.available:
+                    e.foreign_account = foreign_acc
+                    e.available = False
+                    foreign_raw.append(e)
+                continue
             raw.append(e)
         deduped = _dedup_keep_largest(raw, lambda e: e.id)
         counts["MET"] = len(deduped)
+        if foreign_raw:
+            foreign_ded = _dedup_keep_largest(foreign_raw, lambda e: e.id)
+            pool.extend(foreign_ded)
+            counts["MET_FOREIGN"] = len(foreign_ded)
+            runlog["met_foreign_account_open_rows"] = len(foreign_ded)
         if scoped:
             runlog["met_scope"] = {"rows_total": met_total, "rows_in_account": len(raw),
                                    "key": "bank_name"}
@@ -1695,6 +1751,13 @@ class Ledger:
 MATCH = "Match"
 CANDIDATE = "Candidate"
 REVIEW = "Review"
+# Misdirected (owner HARD GUARDRAIL, 2026-07-18): the bank deposit landed in
+# THIS account but the system transaction/receipt was booked to a DIFFERENT
+# bank account (any source — AR/AP/EXT; any bank — FHB/Regions; any campus).
+# Real case: City of Memphis $70,992.66 hit FHB UTHSC while receipt 300045836
+# remits to FHB Master — "300045836 ST does not exist" on UTHSC.  These pairs
+# get their own workbook tab; they can never auto-reconcile without a reroute.
+MISDIRECTED = "Misdirected"
 
 CONF_HIGH = "High"
 CONF_MEDIUM = "Medium"
@@ -2002,7 +2065,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         # HARD GUARDRAIL (owner doctrine, 2026-07-11): a Match or Candidate
         # without STs, or whose cited STs do not sum exactly to the BSL in
         # signed cents, must not exist.  Engine invariant — fail loud.
-        if kind in (MATCH, CANDIDATE):
+        if kind in (MATCH, CANDIDATE, MISDIRECTED):
             if not entries:
                 raise ReconError(
                     f"engine bug: {kind} for BSL {bsl.line_key} cites no ST "
@@ -2015,7 +2078,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         ids = [e.id for e in entries]
         if kind == MATCH:
             ledger.consume_match(ids)
-        elif kind == CANDIDATE:
+        elif kind in (CANDIDATE, MISDIRECTED):
             ledger.consume_candidate(ids)
         p = Placement(
             bsl=bsl, kind=kind, confidence=confidence, st_entries=list(entries),
@@ -2571,6 +2634,49 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   "P9b_amount_only")
     runlog["p9b_amount_only"] = "ran"
 
+    # ---- PM Misdirected search (owner HARD GUARDRAIL, 2026-07-18) ----
+    # The bank deposit landed in THIS account but the system transaction /
+    # receipt was booked to a DIFFERENT bank account (any source, any bank,
+    # any campus — real case: City of Memphis $70,992.66 in FHB UTHSC while
+    # receipt 300045836 remits to FHB Master).  Search the foreign shadow
+    # pool with FULL corroboration only: exact signed cents AND a reference
+    # tie (never amount alone).  These placements get their own workbook tab
+    # — they can never auto-reconcile without a reroute/ECT.
+    foreign = [e for e in pool if e.foreign_account]
+    if foreign:
+        for bsl in unplaced():
+            hits = []
+            for e in foreign:
+                if not _amount_matches(bsl, e):
+                    continue
+                if e.source in JOURNAL_SOURCES:
+                    continue
+                if not _type_gate_ok(bsl, e):
+                    continue
+                if not (cross_reference_tie(bsl, e) or cross_digit_tie(bsl, e)):
+                    continue
+                # No payer_contradiction screen here: it is consulted only by
+                # zero-corroboration placements (owner doctrine — reference
+                # ties outrank payer text), and every PM hit carries a
+                # reference tie by construction ("STATE OF NE" paying for
+                # "University of Nebraska" is the same transaction).
+                hits.append(e)
+            if not hits:
+                continue
+            ordered = _sorted(hits)
+            chosen = ordered[0]
+            place(bsl, MISDIRECTED, CONF_MEDIUM, [chosen],
+                  ["MISDIRECTED"],
+                  f"Misdirected: this bank line landed in {account} but the "
+                  f"matching system entry {chosen.id} (exact cents + reference "
+                  f"tie) is booked to {chosen.foreign_account}. It can never "
+                  "auto-reconcile here — reroute the receipt/ST or raise an ECT."
+                  + (" Alternates: " + ", ".join(
+                        f"{e.id} ({e.foreign_account})" for e in ordered[1:4])
+                     if len(ordered) > 1 else ""),
+                  "PM_misdirected")
+    runlog["pm_misdirected"] = "ran"
+
     # ---- P9c ORT / Receivables 1:M reference search (HARD GUARDRAIL,
     #      owner 2026-07-14) --------------------------------------------
     # The ORT chain (the bridge/chain for External STs) and the Receivables
@@ -2656,6 +2762,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
               "open subset does not sum to the bank line (exact-sum guardrail).",
               "P9c_ref_1m_review")
     runlog["p9c_ref_1m_review"] = "ran"
+
 
     # ---- P10 Residual -> Review -------------------------------------
     for bsl in unplaced():
@@ -3158,18 +3265,22 @@ def _placement_row(p: Placement):
 
 
 def write_reconciliation_workbook(path, account, placements):
-    """Matches / Candidate Matches / Review Notes (Section 13)."""
+    """Matches / Candidate Matches / Misdirected / Review Notes (Section 13;
+    Misdirected tab per owner hard guardrail 2026-07-18)."""
     matches = [p for p in placements if p.kind == MATCH]
     candidates = [p for p in placements if p.kind == CANDIDATE]
+    misdirected = [p for p in placements if p.kind == MISDIRECTED]
     reviews = [p for p in placements if p.kind == REVIEW]
     title = f"UT Reconciliation — {account}"
     tabs = [
         ("Matches", RECON_COLUMNS, [_placement_row(p) for p in matches]),
         ("Candidate Matches", RECON_COLUMNS, [_placement_row(p) for p in candidates]),
+        ("Misdirected", RECON_COLUMNS, [_placement_row(p) for p in misdirected]),
         ("Review Notes", RECON_COLUMNS, [_placement_row(p) for p in reviews]),
     ]
     _write_workbook(path, title, tabs, NAVY)
-    return {"matches": len(matches), "candidates": len(candidates), "reviews": len(reviews)}
+    return {"matches": len(matches), "candidates": len(candidates),
+            "misdirected": len(misdirected), "reviews": len(reviews)}
 
 
 # ======================================================================
@@ -3482,8 +3593,10 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     runlog["recon_summary"] = recon_summary
     runlog["stages"].append("write")
 
-    # Conservation ledger (Section 15.3): input == Matches + Candidates + Review.
-    total = recon_summary["matches"] + recon_summary["candidates"] + recon_summary["reviews"]
+    # Conservation ledger (Section 15.3): input == Matches + Candidates +
+    # Misdirected + Review.
+    total = (recon_summary["matches"] + recon_summary["candidates"]
+             + recon_summary["misdirected"] + recon_summary["reviews"])
     assert total == len(bsls), f"conservation: {total} placed != {len(bsls)} BSLs"
 
     # Audit (Section 14) — imported here so the engine stays independently

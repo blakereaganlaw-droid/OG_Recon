@@ -440,8 +440,9 @@ def audit(input_dir, recon_path, account):
 
     match_rows = data_rows("Matches")
     cand_rows = data_rows("Candidate Matches")
+    misdir_rows = data_rows("Misdirected")
     review_rows = data_rows("Review Notes")
-    all_out = match_rows + cand_rows + review_rows
+    all_out = match_rows + cand_rows + misdir_rows + review_rows
 
     # C1 conservation (count + multiset on date+cents)
     try:
@@ -480,12 +481,22 @@ def audit(input_dir, recon_path, account):
         if not _N(r[COL_ST_NUMS]):
             c2_ok = False
             failures.append(f"C2: Candidate row cites no ST: {r[:3]}")
+    # Misdirected rows (owner hard guardrail, 2026-07-18) must cite the
+    # foreign-account entry AND name the account it is booked to.
+    for r in misdir_rows:
+        if not _N(r[COL_ST_NUMS]):
+            c2_ok = False
+            failures.append(f"C2: Misdirected row cites no ST: {r[:3]}")
+        if "booked to" not in _N(r[COL_EXPL]).lower():
+            c2_ok = False
+            failures.append(f"C2: Misdirected row does not name the foreign account: {r[:3]}")
     checks["C2"] = "PASS" if c2_ok else "FAIL"
 
-    # C3 ST non-reuse across Matches + Candidates.
+    # C3 ST non-reuse across Matches + Candidates + Misdirected.
     seen = {}
     c3_ok = True
-    for label, rows in (("Match", match_rows), ("Candidate", cand_rows)):
+    for label, rows in (("Match", match_rows), ("Candidate", cand_rows),
+                        ("Misdirected", misdir_rows)):
         for r in rows:
             for st in _split_multi(r[COL_ST_NUMS]):
                 if st in seen:
@@ -620,7 +631,7 @@ def audit(input_dir, recon_path, account):
 
     # C9 formatting — Carlito, navy header fill, freeze A4, zero formulas, structure.
     c9_ok = True
-    expected_tabs = ["Matches", "Candidate Matches", "Review Notes"]
+    expected_tabs = ["Matches", "Candidate Matches", "Misdirected", "Review Notes"]
     for t in expected_tabs:
         if t not in tabs:
             c9_ok = False
