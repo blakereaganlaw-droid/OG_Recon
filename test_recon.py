@@ -1003,14 +1003,17 @@ class TestRealDataShapes(unittest.TestCase):
         # scope: 3 of 4 MET rows are ours; the FHB-UTC row is excluded
         self.assertEqual(runlog["met_scope"],
                          {"rows_total": 4, "rows_in_account": 3, "key": "bank_name"})
-        # bridge: trx 601 exists in both ST and MET -> one pool entry
+        # bridge: trx 601 exists in both ST and MET -> one pool entry.
+        # The FHB-UTC row joins as a foreign SHADOW entry (misdirected
+        # guardrail 2026-07-18) — in the pool, never matchable.
         self.assertEqual(runlog["met_bridged_to_st"], 1)
-        self.assertEqual(runlog["pool_total"], 3)
+        self.assertEqual(runlog["pool_total"], 4)
+        self.assertEqual(runlog["met_foreign_account_open_rows"], 1)
         # ACH line -> P3 exact Match; deposit line -> deposit-type consistency
         # confers NOTHING (owner doctrine 2026-07-11): the exact sum alone
         # surfaces as an amount-only Candidate, never a Match.
         self.assertEqual(runlog["recon_summary"],
-                         {"matches": 1, "candidates": 1, "reviews": 0})
+                         {"matches": 1, "candidates": 1, "misdirected": 0, "reviews": 0})
         self.assertEqual(runlog["forward_pass_counts"].get("P4_deposit_group"), 1)
         tabs_c, _ = A._read_output_tabs(runlog["recon_workbook"])
         cand = [r for r in tabs_c["Candidate Matches"][3:] if any(A._N(c) for c in r)]
@@ -1053,7 +1056,55 @@ class TestRealDataShapes(unittest.TestCase):
                          msg=str(runlog["audit"].get("failures")))
         self.assertEqual(runlog["met_scope"],
                          {"rows_total": 4, "rows_in_account": 3, "key": "gl_cash_account"})
-        self.assertEqual(runlog["pool_total"], 3)  # UTC GL row excluded
+        # The UTC-GL row is excluded from matching but joins the misdirected
+        # shadow pool (foreign_account set, available=False).
+        self.assertEqual(runlog["pool_total"], 4)
+        self.assertEqual(runlog["met_foreign_account_open_rows"], 1)
+
+    def test_misdirected_receipt_gets_own_tab(self):
+        # Owner HARD GUARDRAIL (2026-07-18, City of Memphis $70,992.66): the
+        # bank line lands in THIS account but the receipt remits to ANOTHER
+        # bank account, so no ST exists here.  With exact cents + reference
+        # tie the pair surfaces on the dedicated Misdirected tab (never a
+        # Match/Candidate); amount-only foreign coincidences stay Review.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-03", "70992.66", "300045836",
+             "CITY OF MEMPHIS PAYABLES 260703300045836", "300045836",
+             "Automated clearing house", "Line 26 , 2026-07-03", "142"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260718_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [
+            ("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Counterparty"),
+            ("2026-07-02", "150.00", "REF100200", 601, "External", "VENDOR INC"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260718_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        receipts = [
+            ("Receipt Number", "Status", "Entered Amount", "Customer Name",
+             "Receipt Date", "Remittance Bank Account", "Reference"),
+            # the misdirected receipt: remits to FHB - UTC, ref ties the BSL
+            ("300045836", "Remitted", "70992.66", "City of Memphis",
+             "2026-07-03", "FHB - UTC", "300045836"),
+            # a same-amount foreign receipt with NO tie: must NOT surface
+            ("888777666", "Remitted", "70992.66", "Someone Else",
+             "2026-07-03", "FHB - UTHSC", "999111"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260718_Oracle_Receivables_Receipts.xlsx"),
+                    [("Export to Excel", receipts)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertEqual(runlog["recon_summary"],
+                         {"matches": 0, "candidates": 0, "misdirected": 1, "reviews": 0})
+        tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
+        mis = [r for r in tabs["Misdirected"][3:] if any(A._N(c) for c in r)]
+        self.assertEqual(len(mis), 1)
+        expl = A._N(mis[0][A.COL_EXPL])
+        self.assertIn("booked to FHB_UTC", expl)
+        self.assertIn("300045836", A._N(mis[0][A.COL_ST_NUMS]))
 
     def test_account_of_gl_segments(self):
         self.assertEqual(E.account_of_gl_segments("01-1100001-000000-100221-000-0000-00-0000"), "FHB_UTIA")

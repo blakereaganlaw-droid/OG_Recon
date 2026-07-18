@@ -136,6 +136,26 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    run Unreconcile2). Exact-summing groups stay P4's; single coincidental
    ties and short/date-like refs are excluded. Review placements never
    consume their STs.
+8g. **Misdirected transactions (owner HARD GUARDRAIL, 2026-07-18).** The
+   bank deposit can land in ONE account while the system transaction /
+   receipt is booked to a DIFFERENT bank account — any source (AR/AP/EXT),
+   any bank (FHB/Regions), any campus/institute/department. Real case:
+   City of Memphis $70,992.66 hit FHB UTHSC while receipt 300045836 remits
+   to FHB Master ("300045836 ST does not exist" on UTHSC). ALWAYS search
+   for this. Foreign-account entries (receipts whose
+   `Remittance Bank Account` maps to another configured account and have
+   no ST in this account's export; MET rows scoped out to another
+   configured account) join a SHADOW pool — `foreign_account` set,
+   `available=False`, never eligible for Matches/Candidates. Pass
+   `PM_misdirected` (before P9c) pairs an unplaced BSL with a shadow entry
+   on exact signed cents AND a reference tie (never amount alone; NO
+   payer-contradiction screen — reference ties outrank payer text, e.g.
+   "STATE OF NE" paying for "University of Nebraska"). Placements go to
+   the dedicated **Misdirected** workbook tab (4th tab, same 19 columns),
+   explanation naming the foreign account — they can never auto-reconcile
+   without a reroute/ECT. Conservation spans all four tabs; audit enforces
+   citation+sum, foreign-account naming ("booked to"), non-reuse, and the
+   4-tab structure.
 9. **Determinism.** No randomness, no clock. `Date.now`/serials excepted where
    parsing Excel. Sort candidate sets by (amount, date, id) before choosing.
 
