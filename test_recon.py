@@ -1833,6 +1833,51 @@ class TestCMConfig(unittest.TestCase):
         self.assertIn("STATE-TNRECEIPTS", text)
         self.assertIn("SIMULATED", text)
 
+    def test_edison_annotation(self):
+        # Edison (State of TN) exports annotate stranded State lines with the
+        # payment reference/invoice — text only, placements untouched.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            # ref-tied Edison payment (payment ref digits in the ASR)
+            ("2026-07-08", "586.66", "NA", "STATE-TN PAYMNTS", "0007041551",
+             "Automated clearing house", "Line 1 , 2026-07-08", "142"),
+            # amount matches TWO payments, no ref tie -> never guessed
+            ("2026-07-09", "400.00", "NA", "STATE-TN PAYMNTS", "NA",
+             "Automated clearing house", "Line 2 , 2026-07-09", "142"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Counterparty"),
+              ("2026-07-02", "999.00", "OTHER", 601, "External", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        _write_xlsx(os.path.join(self.d, "Edison_Payments.xlsx"), [("sheet1", [
+            ("Reference", "Invoice Number", "Payment Date", "Amount", "Currency"),
+            ("0007041551", "12052025", "2026-07-07", "586.66", "USD"),
+            ("0007000001", "INV-A", "2026-07-07", "400.00", "USD"),
+            ("0007000002", "INV-B", "2026-07-08", "400.00", "USD"),
+        ])])
+        _write_xlsx(os.path.join(self.d, "Edison_Invoices.xlsx"), [("sheet1", [
+            ("Invoice Number", "Invoice Date", "Gross Amt", "Currency",
+             "Approval Status", "Due Date", "Voucher"),
+            ("12052025", "2026-06-30", "586.66", "USD", "Approved",
+             "2026-07-15", "00169979"),
+        ])])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertEqual(runlog["recon_summary"]["reviews"], 2)
+        tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
+        rev = {A._N(r[2]): A._N(r[A.COL_EXPL])
+               for r in tabs["Review Notes"][3:] if any(A._N(c) for c in r)}
+        self.assertIn("Edison: State of TN payment 0007041551", rev["586.66"])
+        self.assertIn("invoice '12052025'", rev["586.66"])
+        self.assertIn("Approved", rev["586.66"])
+        self.assertIn("voucher 00169979", rev["586.66"])
+        # ambiguous amount-only: no Edison note at all
+        self.assertNotIn("Edison", rev["400.00"])
+
     def test_run_recon_stages_bai2_txt(self):
         # A native BAI2 .txt must be staged by the per-run wrapper; any other
         # .txt stays ignored (preserves ignored_non_spreadsheets semantics).

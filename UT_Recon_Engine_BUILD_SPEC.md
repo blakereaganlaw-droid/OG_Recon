@@ -90,8 +90,8 @@ Match the **first** rule whose `contains` tokens all appear (case-insensitive) i
 | `ORT_AR` | `ORT` and `AR` | `Report`/first | 12-month | optional |
 | `ORT_MISC` | `ORT` and `Misc` | `Report`/first (stream) | 12-month | optional |
 | `BAI2` | `BAI` (incl. `BAIEXP`); native `.txt` transmissions accepted | first (`CSVEXP…`) / raw 16+88 records | current cycle | optional (gap-fill; raw file carries FULL untruncated addenda) |
-| `EDISON_PAY` | `Edison_Payments` | first | — | yes for State |
-| `EDISON_INV` | `Edison_Invoices` | first | — | yes for State |
+| `EDISON_PAY` | `Edison_Payments` | first | — | optional (LOADED — Review annotation only; C6 retired) |
+| `EDISON_INV` | `Edison_Invoices` | first | — | optional (LOADED — invoice status/voucher for the annotation) |
 | `MID_MASTER` | `MID_Master` | all sheets | — | yes for merchant |
 | `ENRICHED` (Grok cross-ref) | `Enriched` and `CrossRef` | first | — | optional (category hint only) |
 | `APPLIED_UNAPPLIED` | `Applied` and `Unapplied` | first | — | yes for SPN corroboration |

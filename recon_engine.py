@@ -1045,6 +1045,26 @@ DEPT_INFO_ROLES = {
     "mid": _rs(False, ["Credit Card Mid"], pred_mid),
 }
 
+# Edison (State of Tennessee) exports (owner, 2026-07-19): the STATE'S OWN
+# record of payments to UT and UT's invoices into Edison.  ANNOTATION ONLY —
+# the C6 State pass stays retired; State lines reconcile through the normal
+# lanes, and Edison names WHAT a stranded State line is (payment reference,
+# invoice, date) for the reviewer's manual ECT.  Never a pool source.
+EDISON_PAY_ROLES = {
+    "reference": _rs(True, ["Reference"], pred_reference),
+    "invoice": _rs(False, ["Invoice Number"], pred_any),
+    "date": _rs(False, ["Payment Date", "Date"], pred_date),
+    "amount": _rs(True, ["Amount"], pred_signed_amount),
+}
+
+EDISON_INV_ROLES = {
+    "invoice": _rs(True, ["Invoice Number"], pred_any),
+    "date": _rs(False, ["Invoice Date"], pred_date),
+    "amount": _rs(False, ["Gross Amt", "Gross Amount"], pred_signed_amount),
+    "status": _rs(False, ["Approval Status", "Status"], pred_any),
+    "voucher": _rs(False, ["Voucher"], pred_reference),
+}
+
 
 
 ENRICHED_ROLES = {
@@ -3160,6 +3180,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     by_amount = {}
     for e in pool:
         by_amount.setdefault(e.amount_cents, []).append(e)
+    edison_idx, edison_inv = _edison_index(loaded)
     for bsl in unplaced():
         exact_entries = by_amount.get(bsl.amount_cents, [])
         codes, expl = _p10_review_cause(bsl, pool, feed_errors, deposit_index,
@@ -3171,6 +3192,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         gl = recommend_gl_string(bsl, loaded, exact_entries)
         if gl:
             expl += f" Recommended GL: {gl}."
+        expl += _edison_note(bsl, edison_idx, edison_inv)
         place(bsl, REVIEW, CONF_LOW, [], codes, expl, "P10_review")
 
     # ---- Reverse misdirected search (owner, 2026-07-19) -------------
@@ -3526,6 +3548,79 @@ def _mid_note(bsl, mid_dir, account):
             info["home_account"] != account:
         note += f" ADVISORY: MID's home account is {info['home_account']}, not {account}."
     return note
+
+
+# ---- Edison (State of TN) annotation (owner, 2026-07-19) --------------
+
+def _edison_index(loaded):
+    """{signed cents -> [(payment reference, invoice, iso date)]} from the
+    Edison payments export, plus {invoice -> (status, voucher)} from the
+    invoice export.  Returns (None, {}) when EDISON_PAY is absent."""
+    ep = loaded.get("EDISON_PAY")
+    if not ep:
+        return None, {}
+    rows, m, hi = ep["rows"], ep["map"], ep["header_index"]
+    idx = {}
+    for r in rows[hi + 1:]:
+        amt = cents(_cell(r, m.get("amount")))
+        ref = N(_cell(r, m.get("reference")))
+        if amt is None or not ref:
+            continue
+        dt = parse_date(_cell(r, m.get("date")))
+        idx.setdefault(amt, []).append(
+            (ref, N(_cell(r, m.get("invoice"))), dt.isoformat() if dt else ""))
+    inv_info = {}
+    ei = loaded.get("EDISON_INV")
+    if ei:
+        rows, m, hi = ei["rows"], ei["map"], ei["header_index"]
+        for r in rows[hi + 1:]:
+            inv = N(_cell(r, m.get("invoice")))
+            if inv:
+                inv_info.setdefault(inv, (N(_cell(r, m.get("status"))),
+                                          N(_cell(r, m.get("voucher")))))
+    return idx, inv_info
+
+
+def _edison_note(bsl, edison_idx, inv_info):
+    """Name the Edison payment a stranded State line corresponds to —
+    ANNOTATION ONLY (the C6 State pass is retired; Edison records are the
+    payer's, never pool entries, so they can never place anything).  A
+    payment is cited when it matches on exact signed cents AND its payment
+    reference digits appear in the line's text (reference outranks amount);
+    an amount-only singleton is cited as uncorroborated.  Ambiguous
+    amount-only sets are never guessed."""
+    if not edison_idx:
+        return ""
+    cands = edison_idx.get(bsl.amount_cents, [])
+    if not cands:
+        return ""
+    line_digits = {d for d in
+                   (bsl.ref_digits | digit_runs(bsl.additional_info)
+                    | digit_runs(bsl.account_servicer_reference))
+                   if len(d) >= 6}
+    def _tied(ref):
+        z = znorm(ref)
+        return bool(z) and len(z) >= 6 and any(
+            z in d or d in z for d in line_digits)
+    tied = sorted((p for p in cands if _tied(p[0])))
+    chosen, qual = None, ""
+    if tied:
+        chosen = tied[0]
+    elif len(cands) == 1:
+        chosen = cands[0]
+        qual = " (amount-only; uncorroborated)"
+    if chosen is None:
+        return ""
+    ref, inv, dt = chosen
+    note = f" Edison: State of TN payment {ref}"
+    if inv:
+        note += f" for invoice {inv!r}"
+        st_v = inv_info.get(inv)
+        if st_v and st_v[0]:
+            note += f" ({st_v[0]}" + (f", voucher {st_v[1]}" if st_v[1] else "") + ")"
+    if dt:
+        note += f" paid {dt}"
+    return note + f" matches this line exactly{qual}."
 
 
 def _coa_tag(e, coa):
@@ -4419,6 +4514,8 @@ def load_and_bind(by_role, runlog):
         "MET": MET_ROLES,
         "BAI2": BAI2_ROLES,
         "DEPT_INFO": DEPT_INFO_ROLES,
+        "EDISON_PAY": EDISON_PAY_ROLES,
+        "EDISON_INV": EDISON_INV_ROLES,
         "APPLIED_UNAPPLIED": APPLIED_UNAPPLIED_ROLES,
         "AR_MATCHED": AR_MATCHED_ROLES,
         "ENRICHED": ENRICHED_ROLES,

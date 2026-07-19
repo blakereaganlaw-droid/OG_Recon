@@ -318,6 +318,17 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
 - Student Refund depositories now registered for ALL five campuses (UTK,
   UTC, UTHSC, UTM, UTSO — the TCR export names each); the long-form
   "FHB - Accounts Payable" maps to FHB_AP.
+- **Edison (State of TN) annotation (owner, 2026-07-19).** `EDISON_PAY` /
+  `EDISON_INV` now LOAD (Reference = the State's zero-padded 10-digit
+  payment id; Amount positive dollars; invoices carry Approval Status +
+  Voucher).  ANNOTATION ONLY — the C6 State pass stays retired; State lines
+  reconcile through the normal lanes.  `_edison_note` (P10) cites a payment
+  on exact signed cents AND a reference-digit tie to the line text
+  (reference outranks amount); an amount-only SINGLETON is cited as
+  uncorroborated; ambiguous amount-only sets are never guessed.  Real
+  Master data: 14 of 39 stranded State lines named, all reference-tied.
+  Edison records are the payer's, never pool entries — they can never
+  place anything.
 - UNR-only exports are residuals: Oracle already took the easy matches, so
   low Match counts with precise Candidate/Review causes are CORRECT there,
   not a defect. Receipts/Edison/GMS exports enrich what can match.
