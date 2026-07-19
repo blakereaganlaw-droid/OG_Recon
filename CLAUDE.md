@@ -335,6 +335,41 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   Master data: 14 of 39 stranded State lines named, all reference-tied.
   Edison records are the payer's, never pool entries — they can never
   place anything.
+- **Recon-history advisory audit (owner, 2026-07-19 — orphan-doctrine R2
+  activation).** A staged `Reconciled_*` export (the `Exported` sheet,
+  17 cols, `Created By` = ESSADMIN AutoReconcile / OIC_SYSTEM_USER TCR /
+  human) feeds `load_recon_history` + `recon_history_audit` (end of
+  `run()`, after config_audit): duplicate-feed signatures (>1 distinct
+  Transaction ID per (source, cents, znref, type) key), open unconsumed
+  STs whose amount an ESSADMIN/OIC REC group already worked ("prefer
+  referral R9"), and Review lines with history neighborhoods.  Output:
+  runlog `recon_history_orphans` + `<account>_orphan_findings.md/.json` —
+  ADVISORY only; placements provably byte-identical with/without the
+  export (tested synthetic + real Master: 136 dup-feed signatures found).
+  RR `Reconciliation_Report_*` renderings lack `Created By` and are skipped.
+  **R2 option C (owner sign-off, 2026-07-19):** availability IS now flipped —
+  but ONLY through SAME-TRANSACTION IDENTITY, never amount.  An open pool ST
+  whose OWN transaction id (`by_txn_id`) is a reconciled leg of an
+  automation-created (ESSADMIN/OIC_SYSTEM_USER) REC group AT MATCHING SIGNED
+  CENTS is an orphan — `available=False`, runlog `recon_history_consumed`
+  (loaded before `build_pool`, mirrors R3's `met_status_overrides`).  A
+  human-reconciled group is left untouched (deliberate reconciliations are
+  not second-guessed).  Proven no-op on real FHB Master (open pool and the
+  reconciled set are cleanly disjoint — 0 id collisions); acts only where a
+  genuine orphan collision exists.
+- **Completeness trio (owner, 2026-07-19):** audit **C11** — every cited
+  ST id must exist in a source export (permissive superset: ST/Receipts/
+  Payments/MET ids, all files all dates; layered whole-cell → token →
+  digit-run matching so real ids never false-fail; `_split_ids` is the
+  exact `_join_multi` inverse and keeps the `[amount]` disambiguation
+  suffix for C3/C5 identity).  **Pagination union** generalized to
+  {BSL, ST, RECEIPTS, PAYMENTS, ALL_BSL, MET} same-date `_2/_3` shards
+  with a duplicate-row fail-loud guard (a re-upload is not a page) and
+  BSL line-key uniqueness; the audit's C1 re-parse unions the same shard
+  set.  **Multi-BAI2 union** at the index level: every BAI2 file loads
+  (per-file binding), candidates union per (date, cents) with
+  same-transaction dedup by bank reference (keep the richer addenda) —
+  a July transmission no longer blinds June's open lines.
 - UNR-only exports are residuals: Oracle already took the easy matches, so
   low Match counts with precise Candidate/Review causes are CORRECT there,
   not a defect. Receipts/Edison/GMS exports enrich what can match.

@@ -653,7 +653,9 @@ class RoutedFile:
 # the owner is told, per file, that the engine will not use it.
 _RECOGNIZED_NOT_LOADED = {
     "ALL_DATA": "lifecycle workbook — Unreconcile2's fuel",
-    "RECONCILED": "reconciled forensic export — offline config-audit / Unreconcile2 fuel",
+    "RECONCILED": "reconciled forensic export — recon-history audit "
+                  "(orphan-doctrine R2): advisory findings + same-transaction-id "
+                  "orphan suppression; never a bank-line matching source",
     "CONTRACTS_INV": "contracts-to-invoices reference — not consumed by the forward passes",
     "GMS_AGING": "sponsored AR aging — not consumed by the forward passes",
     "AR_INVOICES": "AR invoice listing — not consumed by the forward passes",
@@ -1949,6 +1951,35 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 dual_fire_twins += 1
     if dual_fire_twins:
         runlog["dual_fire_twins"] = dual_fire_twins
+
+    # Orphan doctrine R2 option C (owner sign-off, 2026-07-19): the
+    # reconciled-group export is the authoritative reconciliation record.
+    # An open-looking pool ST whose OWN transaction id is a leg of a REC
+    # group created by AUTOMATION (ESSADMIN AutoReconcile / OIC_SYSTEM_USER
+    # creation rule) is an orphan — its money is already consumed, whatever
+    # the UNR ST export says (R3: the reconciliation record outranks the ST
+    # export).  Suppress it so no pass consumes it.  This is SAME-TRANSACTION
+    # identity (exact transaction-id match) guarded by exact signed cents —
+    # NEVER amount alone (rule 4/R1); a human-reconciled group is left
+    # untouched (deliberate reconciliations are not second-guessed).  On the
+    # real FHB Master data the open pool and the reconciled set are cleanly
+    # disjoint (0 id collisions), so this is a proven no-op there; it acts
+    # only where a genuine orphan collision exists.
+    by_txn = (loaded.get("RECON_HISTORY") or {}).get("by_txn_id")
+    if by_txn:
+        r2_consumed = 0
+        for e in pool:
+            if not e.available or e.foreign_account:
+                continue
+            rec = by_txn.get(_norm_id(e.id)) or (
+                _norm_id(e.base_id) and by_txn.get(_norm_id(e.base_id)))
+            if rec and rec["creators"] & _AUTOMATION_CREATORS and \
+                    rec["cents"] == e.amount_cents:
+                e.available = False
+                e.status = "REC"
+                r2_consumed += 1
+        if r2_consumed:
+            runlog["recon_history_consumed"] = r2_consumed
 
     runlog["pool_sizes"] = counts
     runlog["pool_total"] = len(pool)
@@ -4756,6 +4787,207 @@ def config_audit(loaded, account, placements, pool, output_dir, runlog):
     return report
 
 
+# ---- Recon-history advisory audit (orphan-doctrine R2, 2026-07-19) ----
+# The reconciled-group exports carry the `Created By` actor (ESSADMIN =
+# AutoReconcile, OIC_SYSTEM_USER = transaction-creation rule, else a human)
+# — the one column that attributes every prior reconciliation.  ADVISORY
+# ONLY: findings go to the runlog + an orphan-findings artifact; the pool,
+# ledger, placements, and workbook are never touched (R2 says "prefer
+# referral (R9) over a low-evidence match" — referral is a finding, and an
+# amount + Created By hit is NOT identity (rule 4/R1), so availability is
+# never flipped here; that would need the ORT intent bridge + owner
+# sign-off).
+
+_AUTOMATION_CREATORS = {"ESSADMIN", "OIC_SYSTEM_USER"}
+
+_RECONCILED_SOURCE_SHORT = {
+    "RECEIVABLES": "AR", "PAYABLES": "AP", "EXTERNAL": "EXT",
+    "JOURNAL": "GL", "STATEMENT": "BSL",
+}
+
+
+def load_recon_history(files, account):
+    """Parse the RECONCILED family's `Exported` sheets (one row per
+    reconciled-group leg; 17 cols, header row located by 'Reconciled
+    Group') into the R2 indexes.  Files naming a DIFFERENT account are
+    skipped with a notice; files without the Exported schema (the paginated
+    Reconciliation_Report_* renderings) are skipped quietly — they carry no
+    Created By.  Fail-soft: any read/bind failure returns what was parsed
+    plus a note, never an exception (advisory must not gate delivery)."""
+    if not files:
+        return None
+    fine = {}       # (src, cents, znref, ztype) -> {ids, creators, groups}
+    coarse = {}     # cents -> {group: {creators, auto, sources}}
+    by_txn = {}     # _norm_id(Transaction ID) -> {creators, cents} (R2 opt C)
+    seen_rows = set()
+    used_files, notes = [], []
+    for rf in files:
+        facc = infer_account(rf.filename)
+        if facc and account and account != "UNKNOWN" and facc != account:
+            notes.append(f"{rf.filename}: names {facc}, run is {account} — skipped")
+            continue
+        try:
+            rows, _ = read_rows(rf)
+        except Exception as e:      # noqa: BLE001 — advisory fail-soft
+            notes.append(f"{rf.filename}: unreadable ({e}) — skipped")
+            continue
+        hi = _coa_header_index(rows, "Reconciled Group")
+        if hi is None:
+            continue                # a Reconciliation_Report rendering, not Exported
+        idx = _coa_colmap(rows[hi])
+        col = {k: idx.get(_norm_header(a)) for k, a in (
+            ("group", "Reconciled Group"), ("source", "Transaction Source"),
+            ("reference", "Reference"), ("amount", "Amount (USD)"),
+            ("ttype", "Transaction Type"), ("trx_id", "Transaction ID"),
+            ("auto", "Automatically Reconciled"), ("created_by", "Created By"))}
+        if col["group"] is None or col["created_by"] is None:
+            notes.append(f"{rf.filename}: Exported header incomplete — skipped")
+            continue
+        used_files.append(rf.filename)
+        for r in rows[hi + 1:]:
+            key_row = tuple(N(_cell(r, c)) for c in col.values() if c is not None)
+            if not any(key_row) or key_row in seen_rows:
+                continue            # blank or a leg duplicated across the
+            seen_rows.add(key_row)  # overlapping BSL/ST exports
+            group = N(_cell(r, col["group"]))
+            src = _RECONCILED_SOURCE_SHORT.get(
+                _norm_header(_cell(r, col["source"])), "")
+            amt = cents(_cell(r, col["amount"]))
+            creator = N(_cell(r, col["created_by"]))
+            if not group or amt is None:
+                continue
+            auto = _norm_header(_cell(r, col["auto"])) == "Y"
+            g = coarse.setdefault(amt, {}).setdefault(
+                group, {"creators": set(), "auto": auto, "sources": set()})
+            g["creators"].add(creator)
+            g["auto"] = g["auto"] or auto
+            if src:
+                g["sources"].add(src)
+            if src and src != "BSL":
+                fkey = (src, amt, znorm(_cell(r, col["reference"])),
+                        _norm_header(_cell(r, col["ttype"])))
+                f = fine.setdefault(fkey, {"ids": set(), "creators": set(),
+                                           "groups": set()})
+                tid = N(_cell(r, col["trx_id"]))
+                if tid:
+                    f["ids"].add(tid)
+                    # R2 option C same-transaction identity index: this
+                    # transaction is a reconciled leg — a pool ST at this id
+                    # + cents is an orphan (already consumed).
+                    t = by_txn.setdefault(_norm_id(tid),
+                                          {"creators": set(), "cents": amt})
+                    t["creators"].add(creator)
+                f["creators"].add(creator)
+                f["groups"].add(group)
+    if not used_files:
+        return {"notes": notes} if notes else None
+    return {"fine": fine, "coarse": coarse, "by_txn_id": by_txn,
+            "files": used_files, "notes": notes}
+
+
+def recon_history_audit(rh, account, placements, pool, output_dir, runlog):
+    """Cross-reference this run's outcomes against the reconciled history
+    (R2).  Pure read of placements/pool — one-way data flow, provably
+    incapable of influencing them (runs after the writer + audit)."""
+    if not rh or not rh.get("coarse"):
+        if rh and rh.get("notes"):
+            runlog["recon_history"] = {"notes": rh["notes"]}
+        return None
+    fine, coarse = rh["fine"], rh["coarse"]
+    lines_md = [f"# Orphan findings (recon history R2) — {account}", "",
+                f"History source(s): {', '.join(rh['files'])}. ADVISORY — "
+                "these findings refer groups to Unreconcile2 (R9: refer, "
+                "don't route around); nothing here moved a placement.", ""]
+    report = {"files": rh["files"]}
+
+    # 1. Duplicate feeds: one (source, cents, reference, type) signature
+    #    carrying >1 DISTINCT transaction id — the same money fed twice.
+    dups = sorted(((k, v) for k, v in fine.items() if len(v["ids"]) > 1),
+                  key=lambda kv: (-len(kv[1]["ids"]), kv[0]))
+    report["dup_feed_signatures"] = len(dups)
+    if dups:
+        lines_md += ["## Duplicate feeds (same signature, distinct "
+                     "transaction ids)", ""]
+        for (src, amt, zref, ztype), v in dups[:25]:
+            lines_md.append(
+                f"- {src} {_usd(amt)} ref `{zref or '(blank)'}`: "
+                f"{len(v['ids'])} ids ({', '.join(sorted(v['ids'])[:4])}) "
+                f"by {', '.join(sorted(v['creators']))} in "
+                + ", ".join(sorted(v["groups"])[:3]))
+        lines_md.append("")
+
+    # 2. R2 on the open pool: an open, unconsumed ST whose signed cents an
+    #    ESSADMIN/OIC-created REC group already worked — the classic orphan
+    #    neighborhood.  Advisory referral, never a bar (amount is not
+    #    identity).
+    consumed = set()
+    for p in placements:
+        if p.kind in (MATCH, CANDIDATE, MISDIRECTED):
+            for e in p.st_entries:
+                consumed.add(e.id)
+                if e.base_id:
+                    consumed.add(e.base_id)
+    orphan_hits = []
+    for e in pool:
+        if not e.available or e.foreign_account or e.id in consumed:
+            continue
+        groups = coarse.get(e.amount_cents)
+        if not groups:
+            continue
+        autom = sorted(g for g, info in groups.items()
+                       if info["creators"] & _AUTOMATION_CREATORS)
+        if autom:
+            orphan_hits.append((e, autom))
+    report["open_st_automation_neighborhood"] = len(orphan_hits)
+    if orphan_hits:
+        lines_md += ["## Open STs in an automation-worked amount "
+                     "neighborhood (R2)",
+                     "Automation (ESSADMIN/OIC_SYSTEM_USER) already "
+                     "reconciled a group at this exact signed cents — "
+                     "before consuming these open STs elsewhere, run the "
+                     "intent test / refer to Unreconcile2 (R9).", ""]
+        for e, autom in sorted(orphan_hits,
+                               key=lambda t: (t[0].amount_cents, t[0].id))[:30]:
+            lines_md.append(
+                f"- {e.id} {_usd(e.amount_cents)} ({e.source}) — REC "
+                + ", ".join(autom[:3]))
+        lines_md.append("")
+
+    # 3. Review lines whose amount a REC group already worked: name the
+    #    consuming groups + creators for the reconciler (signature #6
+    #    neighborhood — the counterpart may sit inside a prior group).
+    review_hits = []
+    for p in placements:
+        if p.kind != REVIEW:
+            continue
+        groups = coarse.get(p.bsl.amount_cents)
+        if groups:
+            review_hits.append((p.bsl, sorted(groups)[:3], sorted(
+                {c for info in groups.values() for c in info["creators"]})))
+    report["review_lines_with_history_neighborhood"] = len(review_hits)
+    if review_hits:
+        lines_md += ["## Review lines whose amount appears in reconciled "
+                     "history", ""]
+        for bsl, groups, creators in review_hits[:30]:
+            lines_md.append(
+                f"- {bsl.date} {_usd(bsl.amount_cents)}: "
+                + ", ".join(groups) + f" (by {', '.join(creators[:4])})")
+        lines_md.append("")
+
+    path = os.path.join(output_dir, f"{account}_orphan_findings.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines_md) + "\n")
+    jpath = os.path.join(output_dir, f"{account}_orphan_findings.json")
+    with open(jpath, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True, default=str)
+    report["report_path"] = path
+    report["json_path"] = jpath
+    if rh.get("notes"):
+        report["notes"] = rh["notes"]
+    runlog["recon_history_orphans"] = report
+    return report
+
+
 # ======================================================================
 # Section 9 P0 — Load & validate; build BSL list
 # ======================================================================
@@ -4814,33 +5046,39 @@ def load_and_bind(by_role, runlog):
         specs = role_specs.get(role)
         if specs is None and role != "MID_MASTER":
             continue  # recognized; no binding required at this layer
-        # MET pagination union (owner review, 2026-07-19): real OTBI exports
-        # arrive as same-date "_2/_3" page shards (20260717_..._MET_..._2.csv).
-        # Same-date MET files are PAGES of one export — union them, requiring
-        # an identical column binding (else fail loud naming both files).
-        # Different-date MET files stay newest-wins (they are refreshes).
-        if role == "MET" and len(files) > 1 and \
+        # Multi-BAI2 union (owner review, 2026-07-19): a run's open lines
+        # can span months, but newest-wins read only ONE BAI2 file — a July
+        # transmission could never enrich June's lines.  Load EVERY BAI2
+        # file (each with its OWN binding; raw-.txt and spreadsheet shapes
+        # legitimately differ) and union at the INDEX level in _bai2_index.
+        # BAI2 is enrichment-only — never a pool entry — so this changes
+        # only which addenda are available, never conservation.
+        if role == "BAI2" and len(files) > 1:
+            parsed = []
+            for rf in files:                  # newest-first route order
+                rows, _ = read_rows(rf)
+                mapping, hi = bind_columns(rows, specs, filename=rf.filename)
+                parsed.append({"rows": rows, "map": mapping,
+                               "header_index": hi, "file": rf.filename})
+            loaded[role] = {"files": parsed,
+                            "file": " + ".join(p["file"] for p in parsed)}
+            bound_report[role] = {"files": [p["file"] for p in parsed],
+                                  "union": "index-level"}
+            continue
+        # Pagination union (owner review, 2026-07-19; generalized beyond MET
+        # 2026-07-19): real Oracle exports arrive as same-date "_2/_3" page
+        # shards.  Same-date files of a paginatable role are PAGES of one
+        # export — union them (identical column binding required, duplicate
+        # rows barred).  Different-date files stay newest-wins (refreshes).
+        if role in PAGINATABLE_ROLES and len(files) > 1 and \
                 len({_leading_date_key(f.filename) for f in files}) == 1:
-            shards = sorted(files, key=lambda f: f.filename)
-            rows, _ = read_rows(shards[0])
-            mapping, hi = bind_columns(rows, specs, filename=shards[0].filename)
-            rows = list(rows)
-            for extra in shards[1:]:
-                erows, _ = read_rows(extra)
-                emap, ehi = bind_columns(erows, specs, filename=extra.filename)
-                if emap != mapping:
-                    raise InvalidSourceData(
-                        extra.filename, role,
-                        f"MET page shard binds different columns than "
-                        f"{shards[0].filename} ({emap} vs {mapping}) — "
-                        "not pages of one export")
-                rows.extend(erows[ehi + 1:])
-            fname = " + ".join(f.filename for f in shards)
-            loaded[role] = {"rows": rows, "map": mapping, "header_index": hi,
-                            "file": fname}
-            bound_report[role] = {"file": fname, "columns": mapping,
-                                  "header_index": hi,
-                                  "union_of": [f.filename for f in shards]}
+            entry = _union_same_date_shards(files, specs, role)
+            loaded[role] = {k: entry[k] for k in
+                            ("rows", "map", "header_index", "file")}
+            bound_report[role] = {"file": entry["file"],
+                                  "columns": entry["map"],
+                                  "header_index": entry["header_index"],
+                                  "union_of": entry["union_of"]}
             continue
         rf = _pick_newest(files, role)  # newest YYYYMMDD stamp wins
         if role == "MID_MASTER":
@@ -4857,6 +5095,69 @@ def load_and_bind(by_role, runlog):
     return loaded
 
 
+# Roles whose real exports paginate into same-date "_2/_3" shards.  Every
+# other role keeps single-file semantics (a same-date second file is a
+# conflict, not a page): MID_MASTER / DEPT_INFO / CFG_* / EDISON_* /
+# ENRICHED stay newest-wins-or-fail-loud; CHART_OF_ACCOUNTS has its own
+# multi-file loader; BAI2 has its own index-level union.
+PAGINATABLE_ROLES = {"BSL", "ST", "RECEIPTS", "PAYMENTS", "ALL_BSL", "MET"}
+
+
+def _union_same_date_shards(files, specs, role):
+    """Union same-date page shards of one paginated export.  Requires every
+    shard to bind the IDENTICAL column mapping (else fail loud naming both
+    files), and bars duplicate data rows across shards — a re-uploaded copy
+    of the same export is a DUPLICATE, not a page, and unioning it would
+    double-count money (fatal for BSL conservation)."""
+    shards = sorted(files, key=lambda f: f.filename)
+    rows, _ = read_rows(shards[0])
+    mapping, hi = bind_columns(rows, specs, filename=shards[0].filename)
+    rows = list(rows)
+    seen_rows = {tuple(N(c) for c in r) for r in rows[hi + 1:]
+                 if any(N(c) for c in r)}
+    for extra in shards[1:]:
+        erows, _ = read_rows(extra)
+        emap, ehi = bind_columns(erows, specs, filename=extra.filename)
+        if emap != mapping:
+            raise InvalidSourceData(
+                extra.filename, role,
+                f"page shard binds different columns than "
+                f"{shards[0].filename} ({emap} vs {mapping}) — "
+                "not pages of one export")
+        for r in erows[ehi + 1:]:
+            key = tuple(N(c) for c in r)
+            if any(key):
+                if key in seen_rows:
+                    raise InvalidSourceData(
+                        extra.filename, role,
+                        f"data row duplicated across same-date shards "
+                        f"({shards[0].filename} + {extra.filename}) — a "
+                        "duplicate upload, not pagination; remove one file "
+                        "(unioning it would double-count)")
+                seen_rows.add(key)
+            rows.append(r)
+    # BSL pages carry globally unique statement-line keys; a repeat across
+    # shards means the same bank line twice — conservation poison.
+    if role == "BSL":
+        lk = mapping.get("line_key")
+        if lk is not None:
+            seen_lk = set()
+            for r in rows[hi + 1:]:
+                v = N(_cell(r, lk))
+                if not v:
+                    continue
+                if v in seen_lk:
+                    raise InvalidSourceData(
+                        shards[0].filename, role,
+                        f"statement line {v!r} appears in more than one "
+                        "same-date BSL shard — duplicate upload, not "
+                        "pagination")
+                seen_lk.add(v)
+    fname = " + ".join(f.filename for f in shards)
+    return {"rows": rows, "map": mapping, "header_index": hi, "file": fname,
+            "union_of": [f.filename for f in shards]}
+
+
 def _pick_newest(files, role):
     """Newest-wins file selection for a role (spec §4.1).  Two files whose
     date keys tie would mean one silently ignored — fail loud instead and
@@ -4871,29 +5172,61 @@ def _pick_newest(files, role):
 
 
 def _bai2_index(loaded):
-    """Index BAI2 rows by (date, signed cents).  DETAIL1..DETAIL10 columns are
-    located by exact header name (deterministic; they carry the full addenda
-    the Oracle BSL feed truncates at ~1000 chars)."""
+    """Index BAI2 rows by (date, signed cents).  DETAIL1..DETAILn columns are
+    located by exact header name PER FILE (deterministic; they carry the full
+    addenda the Oracle BSL feed truncates at ~1000 chars).  Accepts both the
+    multi-file shape ({"files": [...]}) and the legacy single-file dict;
+    candidate lists union across files in newest-first order — _bai2_enrich's
+    decline-on-ambiguity already arbitrates merged lists conservatively."""
     bai = loaded.get("BAI2")
     if not bai:
         return None
-    rows, m, hi = bai["rows"], bai["map"], bai["header_index"]
-    header = rows[hi]
-    detail_cols = [i for i, h in enumerate(header)
-                   if re.fullmatch(r"DETAIL\d+", _norm_header(h) or "")]
+    parts = bai["files"] if "files" in bai else [bai]
     idx = {}
-    for r in rows[hi + 1:]:
-        dt = parse_date(_cell(r, m.get("post_date")))
-        amt = cents(_cell(r, m.get("amount")))
-        if dt is None or amt is None:
-            continue
-        details = "".join(N(_cell(r, c)) for c in detail_cols)
-        idx.setdefault((dt, amt), []).append({
-            "details": details,
-            "description": N(_cell(r, m.get("description"))),
-            "bank_reference": clean_ref(_cell(r, m.get("bank_reference"))),
-            "customer_reference": clean_ref(_cell(r, m.get("customer_reference"))),
-        })
+    for part in parts:
+        rows, m, hi = part["rows"], part["map"], part["header_index"]
+        header = rows[hi]
+        detail_cols = [i for i, h in enumerate(header)
+                       if re.fullmatch(r"DETAIL\d+", _norm_header(h) or "")]
+        for r in rows[hi + 1:]:
+            dt = parse_date(_cell(r, m.get("post_date")))
+            amt = cents(_cell(r, m.get("amount")))
+            if dt is None or amt is None:
+                continue
+            details = "".join(N(_cell(r, c)) for c in detail_cols)
+            cand = {
+                "details": details,
+                "description": N(_cell(r, m.get("description"))),
+                "bank_reference": clean_ref(_cell(r, m.get("bank_reference"))),
+                "customer_reference": clean_ref(_cell(r, m.get("customer_reference"))),
+            }
+            bucket = idx.setdefault((dt, amt), [])
+            # Same-transaction dedup across overlapping BAI2 windows (the
+            # 0715 csv and 0718 txt both carry July 1-15): the bank
+            # reference identifies the transaction — verified identical
+            # across file formats on real UTC data (326/350 overlapping
+            # keys).  Keep ONE candidate per bank reference, preferring the
+            # richer addenda (the raw transmission); without it, treating
+            # the duplicate as a second candidate made _bai2_enrich decline
+            # 31 previously-clean joins.  Blank-reference twins dedup on a
+            # space-normalized details prefix; genuinely distinct same-day
+            # same-amount transactions keep both (the decline is then
+            # correct).
+            dup = None
+            for prev in bucket:
+                if cand["bank_reference"] and \
+                        prev["bank_reference"] == cand["bank_reference"]:
+                    dup = prev
+                    break
+                pa = prev["details"].replace(" ", "")
+                ca = cand["details"].replace(" ", "")
+                if pa and ca and (pa.startswith(ca) or ca.startswith(pa)):
+                    dup = prev
+                    break
+            if dup is None:
+                bucket.append(cand)
+            elif len(cand["details"]) > len(dup["details"]):
+                dup.update(cand)
     return idx
 
 
@@ -5069,13 +5402,15 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     if "ALL_DATA" in by_role:
         runlog["all_data"] = ("present: not loaded (forward-only engine; "
                               "run Unreconcile2 for the backward re-audit)")
-    if "RECONCILED" in by_role:
-        runlog["reconciled_exports"] = (
-            "present: not loaded (forensic reconciled exports — offline "
-            "config-audit / Unreconcile2 fuel, never forward-engine input)")
-
     loaded = load_and_bind(by_role, runlog)
     runlog["stages"].append("bind")
+
+    # Recon-history (orphan doctrine R2) is loaded BEFORE the pool so the
+    # option-C same-transaction-id orphan suppression can run inside
+    # build_pool; the same object feeds the end-of-run advisory audit.
+    rh = load_recon_history(by_role.get("RECONCILED"), account)
+    if rh:
+        loaded["RECON_HISTORY"] = rh
 
     pool = build_pool(loaded, account, runlog)
     runlog["stages"].append("pool")
@@ -5118,6 +5453,15 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     # no CFG exports, no-op; never affects placements, workbook, or audit.
     if config_audit(loaded, account, placements, pool, output_dir, runlog):
         runlog["stages"].append("config_audit")
+
+    # Recon-history advisory audit (orphan-doctrine R2, 2026-07-19): when a
+    # reconciled-group export is staged, cross-reference this run's outcomes
+    # against WHO reconciled what before.  Advisory — runs after everything,
+    # reads placements/pool one-way, never gates.  (rh was loaded before the
+    # pool for the option-C orphan suppression; reused here.)
+    if recon_history_audit(loaded.get("RECON_HISTORY"), account, placements,
+                           pool, output_dir, runlog):
+        runlog["stages"].append("recon_history_audit")
 
     # Write JSON run log (Section 15.7).
     log_path = os.path.join(output_dir, f"{account}_runlog.json")

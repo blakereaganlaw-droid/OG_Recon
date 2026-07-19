@@ -1841,6 +1841,319 @@ class TestRoutingHardening(unittest.TestCase):
             runlog = E.run(self.d, self.out, present=True)
         self.assertEqual(len(runlog["files_ignored_by_name"]), 3)
 
+    def test_recon_history_advisory_audit(self):
+        # R2 (orphan doctrine): a staged Reconciled_* export yields advisory
+        # orphan findings — placements byte-identical with or without it.
+        bsl = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                "Account Servicer Reference", "Transaction Type", "Statement",
+                "Transaction Code"),
+               ("2026-07-01", "150.00", "NA", "MYSTERY PAYMENT", "NA",
+                "Miscellaneous", "Line 1 , 2026-07-01", "174")]
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              ("2026-06-30", "700.00", "OPENREF9", 601, "Receivables", "V")]
+        rec = [("Reconciled Group", "Transaction Source", "Reference", "Date",
+                "Amount (USD)", "Transaction Type", "Transaction ID",
+                "Journal", "Journal Batch", "Journal Line", "Batch Name",
+                "Payment File Reference", "Receipt Batch Number",
+                "Cleared Date", "Automatically Reconciled", "Created By",
+                "Creation Date"),
+               # ESSADMIN group at the open ST's cents (R2 neighborhood)
+               ("Group 1", "Statement", "OPENREF9", "2026-06-29", "700.00",
+                "ACH", "", "", "", "", "", "", "", "", "Y", "ESSADMIN", "2026-06-29"),
+               ("Group 1", "External", "OPENREF9", "2026-06-29", "700.00",
+                "", "900001", "", "", "", "", "", "", "", "Y", "ESSADMIN", "2026-06-29"),
+               # duplicate feed: same signature, two DISTINCT transaction ids
+               ("Group 2", "External", "DUPREF88", "2026-06-20", "55.00",
+                "", "800001", "", "", "", "", "", "", "", "Y", "OIC_SYSTEM_USER", "2026-06-20"),
+               ("Group 3", "External", "DUPREF88", "2026-06-21", "55.00",
+                "", "800002", "", "", "", "", "", "", "", "Y", "OIC_SYSTEM_USER", "2026-06-21"),
+               # group at the Review line's cents (history neighborhood)
+               ("Group 4", "Statement", "X1", "2026-06-15", "150.00",
+                "MSC", "", "", "", "", "", "", "", "", "N", "WKITTS2", "2026-06-15"),
+               ("Group 4", "Receivables", "X1", "2026-06-15", "150.00",
+                "", "700001", "", "", "", "", "", "", "", "N", "WKITTS2", "2026-06-15")]
+        for with_rec in (False, True):
+            d, out = tempfile.mkdtemp(), tempfile.mkdtemp()
+            _write_xlsx(os.path.join(d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                        [("Exported", bsl)])
+            _write_xlsx(os.path.join(d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                        [("Exported", st)])
+            if with_rec:
+                _write_xlsx(os.path.join(d, "20260710_Oracle_CM_Reconciled_FHB_Master_BSL.xlsx"),
+                            [("Exported", rec)])
+            runlog = E.run(d, out, present=True)
+            tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
+            dump = {t: [[A._N(c) for c in r] for r in rows]
+                    for t, rows in tabs.items()}
+            if not with_rec:
+                base_dump = dump
+                self.assertNotIn("recon_history_orphans", runlog)
+                self.assertFalse(os.path.exists(os.path.join(
+                    out, "FHB_MASTER_orphan_findings.md")))
+            else:
+                self.assertEqual(dump, base_dump)     # placements untouched
+                rep = runlog["recon_history_orphans"]
+                self.assertEqual(rep["dup_feed_signatures"], 1)
+                self.assertEqual(rep["open_st_automation_neighborhood"], 1)
+                self.assertEqual(rep["review_lines_with_history_neighborhood"], 1)
+                text = open(rep["report_path"]).read()
+                self.assertIn("800001", text)
+                self.assertIn("ESSADMIN", text)
+                self.assertIn("Group 4", text)
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_recon_history_option_c_orphan_suppression(self):
+        # R2 option C: an open pool ST whose transaction id is a leg of an
+        # ESSADMIN/OIC REC group at matching cents is an orphan — suppressed
+        # from matching (available=False), so the bank line it would have
+        # matched falls to Review instead of a Match.
+        bsl = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                "Account Servicer Reference", "Transaction Type", "Statement",
+                "Transaction Code"),
+               ("2026-07-01", "700.00", "OPENREF9", "", "OPENREF9",
+                "Miscellaneous", "Line 1 , 2026-07-01", "174")]
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              ("2026-06-30", "700.00", "OPENREF9", "900042", "Receivables", "V")]
+        rec = [("Reconciled Group", "Transaction Source", "Reference", "Date",
+                "Amount (USD)", "Transaction Type", "Transaction ID",
+                "Journal", "Journal Batch", "Journal Line", "Batch Name",
+                "Payment File Reference", "Receipt Batch Number",
+                "Cleared Date", "Automatically Reconciled", "Created By",
+                "Creation Date"),
+               ("Group 9", "Statement", "OPENREF9", "2026-06-29", "700.00",
+                "ACH", "", "", "", "", "", "", "", "", "Y", "ESSADMIN", "2026-06-29"),
+               # the SAME transaction id (900042) is a reconciled leg -> orphan
+               ("Group 9", "Receivables", "OPENREF9", "2026-06-29", "700.00",
+                "", "900042", "", "", "", "", "", "", "", "Y", "ESSADMIN", "2026-06-29")]
+
+        def run_it(with_rec):
+            d, out = tempfile.mkdtemp(), tempfile.mkdtemp()
+            _write_xlsx(os.path.join(d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                        [("Exported", bsl)])
+            _write_xlsx(os.path.join(d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                        [("Exported", st)])
+            if with_rec:
+                _write_xlsx(os.path.join(d, "20260710_Oracle_CM_Reconciled_FHB_Master_ST.xlsx"),
+                            [("Exported", rec)])
+            rl = E.run(d, out, present=True)
+            shutil.rmtree(d, ignore_errors=True)
+            return rl
+
+        without = run_it(False)
+        # without the reconciled export the open ST 900042 is a live
+        # reference-tied counterpart -> a Match.
+        self.assertEqual(without["recon_summary"]["matches"], 1)
+        with_rec = run_it(True)
+        self.assertEqual(with_rec["recon_history_consumed"], 1)
+        # the orphan is suppressed -> the line can no longer match it.
+        self.assertEqual(with_rec["recon_summary"]["matches"], 0)
+        self.assertEqual(with_rec["recon_summary"]["reviews"], 1)
+        self.assertEqual(with_rec["audit"]["status"], "PASS")
+
+    def test_recon_history_option_c_human_group_not_suppressed(self):
+        # A HUMAN-reconciled group (not ESSADMIN/OIC) must NOT flip
+        # availability — deliberate reconciliations are not second-guessed.
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source"), ("2026-06-30", "700.00", "R", "900042", "Receivables")]
+        rec = [("Reconciled Group", "Transaction Source", "Reference", "Date",
+                "Amount (USD)", "Transaction Type", "Transaction ID",
+                "Automatically Reconciled", "Created By"),
+               ("Group 9", "Receivables", "R", "2026-06-29", "700.00", "",
+                "900042", "N", "WKITTS2")]
+        rf = E.RoutedFile("RECONCILED", os.path.join(self.d, "r.xlsx"),
+                          "20260710_Oracle_CM_Reconciled_FHB_Master_ST.xlsx", "multi")
+        _write_xlsx(rf.path, [("Exported", rec)])
+        rh = E.load_recon_history([rf], "FHB_MASTER")
+        self.assertIn("900042", rh["by_txn_id"])
+        self.assertNotIn("ESSADMIN", rh["by_txn_id"]["900042"]["creators"])
+        # a pool entry at that id would NOT be flipped (creator not automation)
+        self.assertFalse(rh["by_txn_id"]["900042"]["creators"] & E._AUTOMATION_CREATORS)
+
+    def test_recon_history_wrong_account_skipped(self):
+        files = [E.RoutedFile("RECONCILED", "/nonexistent/x.xlsx",
+                              "20260710_Oracle_CM_Reconciled_FHB_UTC_BSL.xlsx",
+                              "multi")]
+        rh = E.load_recon_history(files, "FHB_MASTER")
+        self.assertTrue(rh is None or not rh.get("coarse"))
+
+    def test_multi_bai2_index_union_and_dedup(self):
+        # Two BAI2 files with overlapping windows: the index unions their
+        # coverage but dedups the SAME transaction (same bank reference),
+        # keeping the richer addenda — a duplicate must not become a second
+        # candidate that makes enrichment decline.
+        raw = "\n".join([
+            "01,000000000,000000000,260718,0759,1,,,2/",
+            "02,084000026,084000026,1,260710,,USD,2/",
+            "16,142,5100,Z,26191005187395,001,",
+            "88,MERCHANT SERVICEDEPOSIT",
+            "88,Customer ID: 8035701948",
+            "99,0,1,2/",
+        ])
+        with open(os.path.join(self.d, "20260718_FHB_Master_BAI2.txt"), "w") as fh:
+            fh.write(raw)
+        # spreadsheet BAI2 covering an EARLIER window + the same 07-10 record
+        _write_xlsx(os.path.join(self.d, "20260715_FHB_Master_BAI2.xlsx"),
+                    [("first", [("Post Date", "Amount", "Bank Reference",
+                                 "Customer Reference", "BAI Code"),
+                                ("2026-07-10", "51.00", "26191005187395", "001", "142"),
+                                ("2026-06-05", "77.00", "26156000000001", "002", "142")])])
+        files = [E.RoutedFile("BAI2", os.path.join(self.d, n), n, "first")
+                 for n in sorted(os.listdir(self.d), reverse=True)
+                 if "BAI2" in n]
+        loaded = E.load_and_bind({"BAI2": files}, {})
+        self.assertEqual(len(loaded["BAI2"]["files"]), 2)
+        idx = E._bai2_index(loaded)
+        # overlapping record deduped to ONE candidate, richer (txt) details
+        cands = idx[(date(2026, 7, 10), 5100)]
+        self.assertEqual(len(cands), 1)
+        self.assertIn("Customer ID: 8035701948", cands[0]["details"])
+        # June record from the older file present (window union)
+        self.assertIn((date(2026, 6, 5), 7700), idx)
+
+    def test_single_bai2_shape_unchanged(self):
+        _write_xlsx(os.path.join(self.d, "20260715_FHB_Master_BAI2.xlsx"),
+                    [("first", [("Post Date", "Amount", "Bank Reference",
+                                 "Customer Reference", "BAI Code"),
+                                ("2026-07-10", "51.00", "26191005187395", "001", "142")])])
+        files = [E.RoutedFile("BAI2", os.path.join(self.d, n), n, "first")
+                 for n in sorted(os.listdir(self.d)) if "BAI2" in n]
+        loaded = E.load_and_bind({"BAI2": files}, {})
+        self.assertNotIn("files", loaded["BAI2"])     # legacy single-dict shape
+        idx = E._bai2_index(loaded)
+        self.assertIn((date(2026, 7, 10), 5100), idx)
+
+    def test_bsl_pagination_union_end_to_end(self):
+        # Two same-date BSL page shards: engine unions them, conservation
+        # spans both pages, and the audit's C1 re-parse unions the same
+        # shards (a single-file read would falsely fail C1).
+        hdr = ("Date", "Amount (USD)", "Reference", "Additional Information",
+               "Account Servicer Reference", "Transaction Type", "Statement",
+               "Transaction Code")
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [hdr,
+                     ("2026-07-01", "10.00", "R1", "", "R1", "Miscellaneous",
+                      "Line 1 , 2026-07-01", "174")])])
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR_2.xlsx"),
+                    [("Exported", [hdr,
+                     ("2026-07-02", "20.00", "R2", "", "R2", "Miscellaneous",
+                      "Line 2 , 2026-07-02", "174")])])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              ("2026-06-30", "999.00", "X", 601, "Receivables", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["bsl_count"], 2)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertIn("union_of", runlog["roles_bound"]["BSL"])
+
+    def test_pagination_duplicate_upload_fails_loud(self):
+        # An identical data row across two same-date shards is a duplicate
+        # upload, not pagination — unioning would double-count money.
+        hdr = ("Date", "Amount (USD)", "Reference", "Additional Information",
+               "Account Servicer Reference", "Transaction Type", "Statement",
+               "Transaction Code")
+        row = ("2026-07-01", "10.00", "R1", "", "R1", "Miscellaneous",
+               "Line 1 , 2026-07-01", "174")
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [hdr, row])])
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR_2.xlsx"),
+                    [("Exported", [hdr, row])])
+        with self.assertRaises(E.InvalidSourceData) as cm:
+            E.run(self.d, self.out, present=True)
+        self.assertIn("duplicate", str(cm.exception).lower())
+
+    def test_non_paginatable_role_still_fails_loud_on_tie(self):
+        # DEPT_INFO is not paginatable: two same-date files stay a conflict.
+        hdr = ("Department Name", "Campus Name", "Credit Card Mid")
+        _write_xlsx(os.path.join(self.d, "20260710_ORT_Department_Info.xlsx"),
+                    [("Report", [hdr, ("Dept A", "UTK", "8011111111")])])
+        _write_xlsx(os.path.join(self.d, "20260710_ORT_Department_Info_2.xlsx"),
+                    [("Report", [hdr, ("Dept B", "UTC", "8022222222")])])
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [("Date", "Amount (USD)", "Reference",
+                                    "Additional Information",
+                                    "Account Servicer Reference",
+                                    "Transaction Type", "Statement",
+                                    "Transaction Code"),
+                                   ("2026-07-01", "10.00", "R1", "", "R1",
+                                    "Miscellaneous", "L1", "174")])])
+        with self.assertRaises(E.InvalidSourceData) as cm:
+            E.run(self.d, self.out, present=True)
+        self.assertIn("tie", str(cm.exception).lower())
+
+    def test_c11_fabricated_st_id_fails(self):
+        # A Match citing an ST id absent from every source export fails C11.
+        bsl = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                "Account Servicer Reference", "Transaction Type", "Statement",
+                "Transaction Code"),
+               ("2026-07-01", "150.00", "REF88001", "", "REF88001",
+                "Miscellaneous", "Line 1 , 2026-07-01", "174")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              ("2026-06-30", "150.00", "REF88001", 601, "Receivables", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS")
+        self.assertEqual(runlog["audit"]["checks"]["C11"], "PASS")
+        # Tamper the cited ST number to a fabricated id -> C11 FAIL.
+        from openpyxl import load_workbook
+        wb = load_workbook(runlog["recon_workbook"])
+        ws = wb["Matches"]
+        ws.cell(row=4, column=10, value="999999999")
+        wb.save(runlog["recon_workbook"])
+        res = A.audit(self.d, runlog["recon_workbook"], "FHB_MASTER")
+        self.assertEqual(res["checks"]["C11"], "FAIL")
+        self.assertTrue(any("C11" in f and "999999999" in f for f in res["failures"]))
+
+    def test_split_ids_semantics(self):
+        # '; '-joined cell: one id embeds ', ' — must NOT be over-split.
+        cell = "Correct Parsing Rule - Reference: a, b; 601"
+        self.assertEqual(A._split_ids(cell),
+                         ["Correct Parsing Rule - Reference: a, b", "601"])
+        # ', '-joined cell: plain multi-id split.
+        self.assertEqual(A._split_ids("601, 602"), ["601", "602"])
+        # Disambiguation suffix KEPT by default (it IS the identity, rule 8)
+        self.assertEqual(A._split_ids("1 [0.01], 1 [10.00]"),
+                         ["1 [0.01]", "1 [10.00]"])
+        # ... and stripped for the C11 source-membership lookup.
+        self.assertEqual(A._split_ids("1 [0.01], 1 [10.00]", strip_disambig=True),
+                         ["1", "1"])
+        self.assertEqual(A._split_ids("1024656 [-728.95]", strip_disambig=True),
+                         ["1024656"])
+
+    def test_reparse_valid_st_ids_sources(self):
+        # Superset spans ST + receipts (incl. DOC synth) + payments + MET,
+        # with .xlsb-style '.0' collapse; Edison/reconciled files excluded.
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", [("Date", "Amount (USD)", "Reference",
+                                    "Transaction Number", "Source"),
+                                   ("2026-06-30", "1.00", "R", "601", "Receivables")])])
+        _write_xlsx(os.path.join(self.d, "20260710_Oracle_Receivables_Receipts.xlsx"),
+                    [("Export to Excel", [("Receipt Number", "Document Number",
+                                           "Receipt Amount"),
+                                          ("364912", "9001", "5.00"),
+                                          ("", "77001", "6.00")])])
+        _write_xlsx(os.path.join(self.d, "20260710_Oracle_Payables_Payments.xlsx"),
+                    [("first", [("Payment Number", "Payment Amount", "Payment Status"),
+                                ("60410073", "7.00", "Negotiable")])])
+        _write_xlsx(os.path.join(self.d, "20260710_Oracle_OTBI_MET_FHB.xlsx"),
+                    [("Sheet1", [("CET_TRANSACTION_ID", "AMOUNT"),
+                                 ("65105.0", "8.00")])])
+        _write_xlsx(os.path.join(self.d, "Edison_Payments.xlsx"),
+                    [("sheet1", [("Reference", "Amount"), ("0007000001", "9.00")])])
+        ids, digits = A._reparse_valid_st_ids(self.d)
+        for want in ("601", "364912", "DOC 77001", "60410073", "65105"):
+            self.assertIn(want, ids, msg=sorted(ids))
+        self.assertNotIn("0007000001", ids)      # Edison excluded
+        self.assertIn("60410073", digits)
+
     def test_chatt_account_tokens(self):
         self.assertEqual(E.infer_account("20260715_FHB_UT_Chatt_Student_Refund_BAI2.csv"),
                          "FHB_STUDENT_REFUND_UTC")

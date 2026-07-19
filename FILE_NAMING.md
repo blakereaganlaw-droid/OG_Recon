@@ -49,7 +49,7 @@ YYYYMMDD_<Source>_<Account>_<Role>[_<Status>].<ext>
 | Applied/Unapplied receipts | `Applied` or `Unapplied` | yes | — |
 | AR matched receipts feed | `AR_Matched` / `Deposit_Receipts` | yes | `AR_Matched_Invoice_Receipts_...csv` |
 | Enriched BSL workbook | `Enriched` / `Crossref` | yes (enrichment) | — |
-| **Reconciled forensic exports** | `Reconciled` / `Reconciliation_Report` | **recognized, never loaded** | `..._Reconciled_..._BSL.xlsx` |
+| **Reconciled forensic exports** | `Reconciled` / `Reconciliation_Report` | recognized; `Reconciled_*` (Exported sheet) feeds the ADVISORY recon-history/orphan audit — never a pool source | `..._Reconciled_..._BSL.xlsx` |
 | Lifecycle workbook | `All_Data` | recognized, never loaded (Unreconcile2) | `FHB_UTC_All_Data.xlsx` |
 | GMS aging / sponsor map / AR invoices / contracts / unapplied summary / rosetta | `GMS_001`, `Sponsored_Aging`, `RPT_GMS_0`, `AR_Invoices`, `Contracts_To_Receivable_Invoices`, `AR_063`, `Relationship_Map`, `Rosetta` | recognized, **not used by the forward engine** (you'll get a console NOTE) | — |
 
@@ -81,14 +81,13 @@ Account tokens: `FHB_Master`, `FHB_UTC` (also `FHB_UT_Chatt`), `FHB_UTHSC`,
 
 | Problem | What happens | Fix |
 |---|---|---|
-| **`Reconciled_..._BSL.xlsx` in an upload** | Previously would have bound the open-BSL role and poisoned the run with already-reconciled lines. Now routes to the never-loaded `RECONCILED` role. | Keep `Reconciled` in the name (it's the protection); don't strip it. |
+| **`Reconciled_..._BSL.xlsx` in an upload** | Previously would have bound the open-BSL role and poisoned the run with already-reconciled lines. Now routes to the `RECONCILED` role (advisory recon-history audit only). | Keep `Reconciled` in the name (it's the protection); don't strip it. |
 | **All-accounts BSL named without `All`** | Would bind as THIS account's open BSL → thousands of foreign lines. | Always keep `All_BSL` together (`Oracle_OTBI_All_BSL_UNR`). |
 | **Raw bank file named `Master.txt`** | No `BAI` token → ignored (announced). | Name it `YYYYMMDD_<Account>_BAI2.txt`. |
-| **Same date stamp on two exports of one role** | Run stops and asks you to disambiguate — nothing silently ignored. | Bump the newer file's date stamp. Exception: **MET page shards** (`..._MET_X.csv` + `..._MET_X_2.csv`, same date) are unioned automatically. |
+| **Same date stamp on two exports of one role** | Run stops and asks you to disambiguate — nothing silently ignored. | Bump the newer file's date stamp. Exception: **page shards** of BSL/ST/Receipts/Payments/ALL_BSL/MET (`..._X.csv` + `..._X_2.csv`, same date) are unioned automatically — with a fail-loud guard if the "pages" carry duplicate rows (a re-upload is not a page). |
 | **Undated refresh beside a dated file** | The dated file wins even if the undated one is newer. | Always date-stamp refreshes. |
 | **`UT Chatt` spelling** | Now maps to UTC (previously invisible to the mixed-account guard). | Prefer `UTC` for consistency. |
-| **Paginated non-MET exports** (`Receipts_2.xlsx`) | Only MET supports same-date shard union; other roles fail loud on a tie or pick the newest date. | Combine pages into one file before upload, or ask to extend union to that role. |
-| **BAI2 window vs open lines** | BAI2 is newest-file-wins: a July-only file cannot enrich June's open lines. | Upload a BAI2 file covering the whole open-line window (or run monthly files in separate runs). |
+| **BAI2 window vs open lines** | ALL staged BAI2 files now union (same transaction deduped by bank reference, richer addenda kept) — a July file plus an older file covers both windows. | Stage every BAI2 file spanning the open-line window. |
 | **`_ST_` requirement** | A file named `...FHB_Master_ST.xlsx` works (`_ST.`), but `...Master_STATUS.xlsx` will not route as ST (deliberate — `All_Status`/`Rosetta_Stone` protection). | Use `_ST_UNR` / `_ST.` forms. |
 | **Generic names** (`export.xlsx`, `data.csv`) | No rule matches → announced and skipped. | Use the recommended pattern. |
 | **Mixed-account uploads** | Preflight fails loud listing the conflicting tokens. | One account per upload (all-accounts MET/ALL_BSL/receipts/payments/config/CoA files are account-neutral and always fine to include). |
@@ -104,13 +103,16 @@ IGNORED (file name): mystery_export.xlsx — no router rule matches this name  F
 NOTE (file name): FHB_UTC_All_Data.xlsx recognized as ALL_DATA — lifecycle workbook — Unreconcile2's fuel; the forward engine will not read it.
 ```
 
-## Known gaps (not name problems — data we don't ingest yet)
+## Known gaps (data we don't ingest yet)
 
-- **Recon History / `Created By` exports** — recognized (`RECONCILED`) but
-  not loaded in-engine; duplicate-feed attribution currently runs as an
-  offline analysis (orphan-doctrine R2 activation is the designed follow-up).
 - **GMS aging, AR invoices, sponsor map, contracts, unapplied summary** —
   routed but unused by the forward passes; they would enrich Review
   annotations if ever needed.
-- **Multiple BAI2 files per run** — newest-wins today; a multi-file union
-  across statement windows is a designed enhancement.
+- **`Reconciliation_Report_*` renderings** — routed to RECONCILED but
+  skipped by the recon-history audit (they lack the `Created By` actor
+  column; stage the `Reconciled_*` Exported-sheet exports instead).
+
+(Previously-listed gaps now BUILT: Recon History in-engine (R2 orphan
+audit), multi-BAI2 union across statement windows, pagination union for
+BSL/ST/Receipts/Payments/ALL_BSL, and the audit's C11 ST-id membership
+check.)
