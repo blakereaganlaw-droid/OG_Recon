@@ -277,6 +277,58 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   `coa_combo_validity` (rows_seen / unrecognized_combo / non_postable_efdp)
   beside `met_gl_conflicts` — a counter that never drops or downgrades a row.
   The entity-divergence downgrade (Tier 2) is designed but not yet wired.
+  **Recommended GL comes from the OFFSET combo only (adversarial review,
+  2026-07-19):** `recommend_gl_string`'s CoA fallback decodes the exact-amount
+  counterpart's `OFFSET_CONCATENATED_SEGMENTS` (the ECT posting side, §6) —
+  NEVER the cash-side asset combo (its account segment is the bank's own cash
+  GL), and NEVER a foreign-account shadow entry (rule 8g: another
+  depository's posting must not steer this account's ECT).  P10 builds one
+  amount index for the whole residual pass (no per-line pool rescans).
+- **CM configuration audit (owner, 2026-07-19 — orphan-doctrine R5
+  activation).** The five `CM_Configurations_*` exports load as `CFG_TCR` /
+  `CFG_PARSE` / `CFG_MATCHING` / `CFG_TOLERANCE` / `CFG_RULESETS`
+  (`load_cm_config`; paginated-export reader `_cfg_read_table` keeps ORPHAN
+  TCR rows with a blank bank account — 23 live on the real export, 3 still
+  enabled).  When present, `config_audit` (end of `run()`, AFTER writer +
+  audit) REPLAYS the TCRs against this run's lines via `like_match` (Oracle
+  LIKE, case-sensitive; a case-insensitive-only hit is the case-bug
+  signature) and classifies every Review line: creation FAILURE (claimed by
+  an enabled rule, no pool entry at the amount), fired-but-stranded, claimed
+  only by a DISABLED rule (the Student Refund smoking gun), or uncovered
+  (recurring signatures → proposed CREATE-TCR search strings).  Static
+  checks: null trx codes, orphan rules, duplicate enabled pairs, CASH=None,
+  CASH-GL posting to another depository.  Parse-rule gaps per bank family
+  (codes with blank references and no rule).  Output: runlog `config_audit`
+  + `<account>_config_recommendations.md/.json` in outputs — NEVER the
+  locked 19-col workbook; placements provably byte-identical with configs
+  present (tested).  All fire counts labeled SIMULATED (Oracle evaluates
+  untruncated addenda; the export truncates ~1000 chars).
+- **Native BAI2 `.txt` (owner, 2026-07-19).** `route_folder` accepts `.txt`
+  ONLY when it classifies as BAI2; `_read_bai2_txt` parses the raw
+  transmission (01/02/03/16/88 records) into rows binding `BAI2_ROLES` —
+  full untruncated 88-continuation addenda in DETAIL columns (`Customer
+  ID:`, `Trace Number:`, `TRN1` reassociation keys), BAI sign convention
+  (100-399 credit / 400-699 debit), group as-of dates, integer cents.  Real
+  UTHSC file: 18,793 details.  Feeds the existing BAI2 enrichment — richer
+  payer/MID visibility legitimately moves weak amount-only placements into
+  the correct guardrail lanes (validated: $0.01 penny-test and stale-MID
+  cases).  Raw-file vocabulary differs from the Oracle feed's relabeling
+  (`Company Name:` ↔ `SENDING CO NAME:` etc.) — parse-rule work must cover
+  BOTH vocabularies (dual twins are safe no-ops).
+- Student Refund depositories now registered for ALL five campuses (UTK,
+  UTC, UTHSC, UTM, UTSO — the TCR export names each); the long-form
+  "FHB - Accounts Payable" maps to FHB_AP.
+- **Edison (State of TN) annotation (owner, 2026-07-19).** `EDISON_PAY` /
+  `EDISON_INV` now LOAD (Reference = the State's zero-padded 10-digit
+  payment id; Amount positive dollars; invoices carry Approval Status +
+  Voucher).  ANNOTATION ONLY — the C6 State pass stays retired; State lines
+  reconcile through the normal lanes.  `_edison_note` (P10) cites a payment
+  on exact signed cents AND a reference-digit tie to the line text
+  (reference outranks amount); an amount-only SINGLETON is cited as
+  uncorroborated; ambiguous amount-only sets are never guessed.  Real
+  Master data: 14 of 39 stranded State lines named, all reference-tied.
+  Edison records are the payer's, never pool entries — they can never
+  place anything.
 - UNR-only exports are residuals: Oracle already took the easy matches, so
   low Match counts with precise Candidate/Review causes are CORRECT there,
   not a defect. Receipts/Edison/GMS exports enrich what can match.

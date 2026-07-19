@@ -89,9 +89,9 @@ Match the **first** rule whose `contains` tokens all appear (case-insensitive) i
 | `RECEIPTS` (Receivables, all-status) | `Receivables_Receipts` or `Receipts_All` | `Export to Excel`/first | all statuses | yes |
 | `ORT_AR` | `ORT` and `AR` | `Report`/first | 12-month | optional |
 | `ORT_MISC` | `ORT` and `Misc` | `Report`/first (stream) | 12-month | optional |
-| `BAI2` | `BAI` (incl. `BAIEXP`) | first (`CSVEXP…`) | current cycle | optional (gap-fill) |
-| `EDISON_PAY` | `Edison_Payments` | first | — | yes for State |
-| `EDISON_INV` | `Edison_Invoices` | first | — | yes for State |
+| `BAI2` | `BAI` (incl. `BAIEXP`); native `.txt` transmissions accepted | first (`CSVEXP…`) / raw 16+88 records | current cycle | optional (gap-fill; raw file carries FULL untruncated addenda) |
+| `EDISON_PAY` | `Edison_Payments` | first | — | optional (LOADED — Review annotation only; C6 retired) |
+| `EDISON_INV` | `Edison_Invoices` | first | — | optional (LOADED — invoice status/voucher for the annotation) |
 | `MID_MASTER` | `MID_Master` | all sheets | — | yes for merchant |
 | `ENRICHED` (Grok cross-ref) | `Enriched` and `CrossRef` | first | — | optional (category hint only) |
 | `APPLIED_UNAPPLIED` | `Applied` and `Unapplied` | first | — | yes for SPN corroboration |
@@ -103,11 +103,13 @@ Match the **first** rule whose `contains` tokens all appear (case-insensitive) i
 | `DEPT_INFO` | `ORT_Department_Info` | first | — | optional (account strings) |
 | `CHART_OF_ACCOUNTS` | `AcctCombos`/`Segments`/`ComboSets`/`CombosTech`/`Chart_Of_Accounts`/`GL_Departments` | `Report`/first | — | optional (advisory GL decode; MULTI-FILE) |
 | `GMS_001/002/035` sponsor maps | `RPT_GMS_00` | first (header deep) | — | optional |
-| `CFG_MATCHING` | `Matching_Rules` | first | — | optional (rule fidelity) |
-| `CFG_PARSE` | `Parse_Rules` | first | — | optional |
-| `CFG_TOLERANCE` | `Tolerance_Rules` | first | — | optional |
-| `CFG_RULESETS` | `Recon_Rulesets` | first | — | optional |
-| `CFG_TCR` | `Transaction_Creation_Rules` | first | — | optional |
+| `CFG_MATCHING` | `Matching_Rules` | first | — | optional (LOADED — advisory config audit) |
+| `CFG_PARSE` | `Parse_Rules` | first | — | optional (LOADED — advisory config audit) |
+| `CFG_TOLERANCE` | `Tolerance_Rules` | first | — | optional (LOADED — advisory config audit) |
+| `CFG_RULESETS` | `Recon_Rulesets` | first | — | optional (LOADED — advisory config audit) |
+| `CFG_TCR` | `Transaction_Creation_Rules` | first | — | optional (LOADED — advisory config audit; orphan blank-account rows kept) |
+
+**Advisory CM configuration audit (owner, 2026-07-19 — orphan-doctrine R5 activation).** When the `CFG_*` exports are staged with an upload, `config_audit` runs at the END of `run()` (after the writer, conservation assert, and audit — influence on placements is structurally impossible; proven byte-identical by test). It replays the account's Transaction Creation Rules against this run's lines via `like_match` (Oracle LIKE semantics, case-sensitive; a case-insensitive-only hit is flagged as a case bug) and classifies every Review line: **creation FAILURE** (claimed by an enabled rule, no pool entry at the amount), **fired-but-stranded**, **claimed only by a DISABLED rule**, or **uncovered** (recurring signatures become CREATE-TCR proposals). Static checks need no bank lines: null trx codes, orphan rules, duplicate enabled (code, search-string) pairs, missing CASH combos, CASH GLs posting to another depository (`account_of_gl_segments`). Parse-rule gaps report codes with blank references and no rule for the account's bank family. Findings land in the runlog (`config_audit`) and in `<account>_config_recommendations.md` / `.json` in outputs — never in the locked 19-column workbook; every fire count is labeled SIMULATED (Oracle evaluates its own untruncated addenda; the BSL export truncates ~1000 chars).
 | `RELATIONSHIP_MAP` | `Relationship_Map` or `Rosetta` | (reference only) | — | optional |
 
 **Account inference:** take the account token from the BSL/ALL_DATA filename (`FHB_UTC`, `FHB_Master`, `Regions_UTM`, …). Normalize the long Oracle account name to this short form before any scope comparison.
@@ -213,7 +215,7 @@ Group every open ST/receipt sharing that reference; the deduped group sums to th
 `BSL.reference` (or addenda `Customer ID`) is a `MID`; the merchant card receipts carry the same MID as their reference and group to the settlement. `MID_MASTER` maps the MID to campus/department/GL for the account string. Card window: ST precedes BSL by 1–4 days.
 
 **Account-string sourcing for Review/ECT:**
-`MET.OFFSET_CONCATENATED_SEGMENTS`, `AR Matched.CONCATENATED_SEGMENTS`, `MISC Receipts.Offset`, `MID_MASTER.gl_codes`, and `GMS.Owning Org` each yield the GL string to recommend for a manual ECT. When `CHART_OF_ACCOUNTS` is loaded, `recommend_gl_string` also falls back — after a MID_MASTER miss — to the exact-amount counterpart's `asset_segments` decoded through `coa_decode` (combo `= ent / dept / account` labels); advisory text only, never a placement.
+`MET.OFFSET_CONCATENATED_SEGMENTS`, `AR Matched.CONCATENATED_SEGMENTS`, `MISC Receipts.Offset`, `MID_MASTER.gl_codes`, and `GMS.Owning Org` each yield the GL string to recommend for a manual ECT. When `CHART_OF_ACCOUNTS` is loaded, `recommend_gl_string` also falls back — after a MID_MASTER miss — to the exact-amount counterpart's `OFFSET_CONCATENATED_SEGMENTS` decoded through `coa_decode` (combo `= ent / dept / account` labels). The cash-side ASSET combo is never recommended (its account segment is the bank's own cash GL — not a posting side), and foreign-account shadow entries are excluded (rule 8g). Advisory text only, never a placement.
 
 ---
 

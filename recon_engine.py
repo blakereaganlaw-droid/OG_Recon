@@ -396,6 +396,13 @@ _ACCOUNT_TOKENS = [
     # carries neither "student" nor "refund", so it still binds FHB_UTC).
     ("FHB_STUDENT_REFUND_UTK", ["fhb", "student", "refund", "utk"]),
     ("FHB_STUDENT_REFUND_UTC", ["fhb", "student", "refund", "utc"]),
+    # The TCR config export (owner, 2026-07-19) names Student Refund
+    # depositories for UTHSC/UTM/UTSO too — without these entries the
+    # generic campus token would swallow them ("FHB - Student Refund -
+    # UTHSC" -> FHB_UTHSC), poisoning the misdirected shadow scope (8g).
+    ("FHB_STUDENT_REFUND_UTHSC", ["fhb", "student", "refund", "uthsc"]),
+    ("FHB_STUDENT_REFUND_UTM", ["fhb", "student", "refund", "utm"]),
+    ("FHB_STUDENT_REFUND_UTSO", ["fhb", "student", "refund", "utso"]),
     ("FHB_MASTER", ["fhb", "master"]),
     ("FHB_UTHSC", ["fhb", "uthsc"]),
     ("FHB_UTIA", ["fhb", "utia"]),
@@ -403,6 +410,9 @@ _ACCOUNT_TOKENS = [
     ("FHB_UTM", ["fhb", "utm"]),
     ("FHB_UTSO", ["fhb", "utso"]),
     ("FHB_AP", ["fhb", "ap"]),
+    # Long-form bank name ("FHB - Accounts Payable"): "ap" only matches a
+    # whole name segment, so the spelled-out form needs its own entry.
+    ("FHB_AP", ["fhb", "accounts", "payable"]),
     ("REGIONS_UTIA", ["regions", "utia"]),
     ("REGIONS_UTIPS", ["regions", "utips"]),
     ("REGIONS_UTM", ["regions", "utm"]),
@@ -622,10 +632,17 @@ def route_folder(input_dir) -> dict:
         path = os.path.join(input_dir, name)
         if not os.path.isfile(path):
             continue
-        if not name.lower().endswith((".xlsx", ".xlsm", ".xlsb", ".csv")):
+        low = name.lower()
+        if not low.endswith((".xlsx", ".xlsm", ".xlsb", ".csv", ".txt")):
             continue
         role = classify_file(name)
         if role is None:
+            continue
+        # Raw bank files (owner, 2026-07-19): a .txt is accepted ONLY as a
+        # native BAI2 transmission ("FHB_UTHSC_BAI2.txt") — the raw reader
+        # parses type-16/88 records with the FULL untruncated addenda the
+        # Oracle BSL feed cuts off.  Any other .txt stays unrouted.
+        if low.endswith(".txt") and role != "BAI2":
             continue
         rf = RoutedFile(role, path, name, rule_by_role[role].sheet)
         by_role.setdefault(role, []).append(rf)
@@ -1028,6 +1045,26 @@ DEPT_INFO_ROLES = {
     "mid": _rs(False, ["Credit Card Mid"], pred_mid),
 }
 
+# Edison (State of Tennessee) exports (owner, 2026-07-19): the STATE'S OWN
+# record of payments to UT and UT's invoices into Edison.  ANNOTATION ONLY —
+# the C6 State pass stays retired; State lines reconcile through the normal
+# lanes, and Edison names WHAT a stranded State line is (payment reference,
+# invoice, date) for the reviewer's manual ECT.  Never a pool source.
+EDISON_PAY_ROLES = {
+    "reference": _rs(True, ["Reference"], pred_reference),
+    "invoice": _rs(False, ["Invoice Number"], pred_any),
+    "date": _rs(False, ["Payment Date", "Date"], pred_date),
+    "amount": _rs(True, ["Amount"], pred_signed_amount),
+}
+
+EDISON_INV_ROLES = {
+    "invoice": _rs(True, ["Invoice Number"], pred_any),
+    "date": _rs(False, ["Invoice Date"], pred_date),
+    "amount": _rs(False, ["Gross Amt", "Gross Amount"], pred_signed_amount),
+    "status": _rs(False, ["Approval Status", "Status"], pred_any),
+    "voucher": _rs(False, ["Voucher"], pred_reference),
+}
+
 
 
 ENRICHED_ROLES = {
@@ -1134,6 +1171,80 @@ def _read_csv_rows(path):
     return [tuple(r) for r in rows]
 
 
+def _bai2_date(yymmdd):
+    """BAI2 YYMMDD -> ISO date string ('' when malformed).  BAI2 years are
+    two-digit; the format postdates 2000, so 20YY is always correct here."""
+    s = N(yymmdd)
+    if len(s) == 6 and s.isdigit():
+        return f"20{s[0:2]}-{s[2:4]}-{s[4:6]}"
+    return ""
+
+
+def _read_bai2_txt(path):
+    """Parse a NATIVE BAI2 transmission (.txt) into spreadsheet-shaped rows
+    binding the existing BAI2_ROLES: header row + one row per type-16 detail
+    record, with the 88-continuation addenda preserved UNTRUNCATED in
+    DETAIL1..DETAILn columns (the whole point — the Oracle BSL feed cuts the
+    addenda; the raw file carries Customer ID / Trace Number / TRN1 / check
+    numbers in full).  Record types: 01 file header, 02 group header (as-of
+    date, YYMMDD), 03 account identifier, 16 detail
+    (,type-code,amount-in-minor-units,funds-type,bank-ref,customer-ref,text),
+    88 continuation of the PREVIOUS record, 49/98/99 trailers.  Sign follows
+    the BAI type-code convention: 100-399 credit (+), 400-699 debit (-).
+    Money stays integer cents throughout (no float)."""
+    details = []          # [date, desc, signed_amount_str, bank_ref, cust_ref, code, [addenda...]]
+    group_date = ""
+    cur = None            # the open type-16 record collecting 88 lines
+    max_addenda = 0
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.rstrip("\r\n").rstrip()
+            if line.endswith("/"):
+                line = line[:-1].rstrip()
+            if not line:
+                continue
+            rec, _, rest = line.partition(",")
+            if rec == "02":
+                f = rest.split(",")
+                # 02,receiver,originator,group-status,as-of-date,...
+                group_date = _bai2_date(f[3]) if len(f) > 3 else group_date
+                cur = None
+            elif rec == "16":
+                f = rest.split(",")
+                code = N(f[0]) if f else ""
+                minor = N(f[1]) if len(f) > 1 else ""
+                sign = ""
+                if code.isdigit() and 400 <= int(code) <= 699:
+                    sign = "-"
+                # integer minor units -> decimal string (never float)
+                digits = minor if minor.isdigit() else ""
+                if digits:
+                    cents_ = int(digits)
+                    amt = f"{sign}{cents_ // 100}.{cents_ % 100:02d}"
+                else:
+                    amt = ""
+                bank_ref = N(f[3]) if len(f) > 3 else ""
+                cust_ref = N(f[4]) if len(f) > 4 else ""
+                text = ",".join(f[5:]).strip() if len(f) > 5 else ""
+                cur = [group_date, text, amt, bank_ref, cust_ref, code, []]
+                details.append(cur)
+            elif rec == "88":
+                if cur is not None:
+                    cur[6].append(rest.strip())
+                    max_addenda = max(max_addenda, len(cur[6]))
+            elif rec in ("03", "49", "98", "99", "01"):
+                if rec != "03":
+                    pass
+                cur = None  # continuations after non-16 records are not detail addenda
+    header = ["Post Date", "Transaction Description", "Amount",
+              "Bank Reference", "Customer Reference", "BAI Code"] + \
+             [f"DETAIL{i + 1}" for i in range(max_addenda)]
+    rows = [tuple(header)]
+    for d in details:
+        rows.append(tuple(d[:6] + d[6] + [""] * (max_addenda - len(d[6]))))
+    return rows
+
+
 def _xlsb_norm(v):
     """pyxlsb returns EVERY numeric cell as a float, so an integral Oracle id
     (DEPOSIT_ID/RECEIPT_ID/TRANSACTION_ID = 65105) arrives as 65105.0 and would
@@ -1185,6 +1296,9 @@ def read_rows(routed_file: RoutedFile):
     try:
         if ext == ".csv":
             return _read_csv_rows(routed_file.path), "csv"
+        if ext == ".txt":
+            # Only BAI2 .txt files are routed (route_folder); parse natively.
+            return _read_bai2_txt(routed_file.path), "bai2-raw"
         if ext == ".xlsb":
             return _read_xlsb_rows(routed_file.path, routed_file.sheet_hint)
         return _read_sheet_rows(routed_file.path, routed_file.sheet_hint)
@@ -1235,11 +1349,15 @@ class PoolEntry:
     asset_segments: str = ""   # raw MET ASSET_CONCATENATED_SEGMENTS combo,
     #                            decoded through the CoA for Review/GL text only
     #                            (advisory; campus consistency confers nothing)
+    offset_segments: str = ""  # raw MET OFFSET_CONCATENATED_SEGMENTS combo —
+    #                            the ECT posting side (§6 account-string
+    #                            sourcing); the CoA-recommended GL comes from
+    #                            HERE, never from the cash-side asset combo
 
 
 def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
               available, origin, deposit_id="", receipt_id="", transaction_type="",
-              spr="", asset_segments=""):
+              spr="", asset_segments="", offset_segments=""):
     ref = clean_ref(reference)
     return PoolEntry(
         id=N(id),
@@ -1261,6 +1379,7 @@ def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
         transaction_type=N(transaction_type),
         spr=clean_ref(spr),
         asset_segments=N(asset_segments),
+        offset_segments=N(offset_segments),
     )
 
 
@@ -1550,6 +1669,7 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
             if amt is None or not trx:
                 continue
             asset_seg = N(_cell(r, m.get("asset_segments")))
+            offset_seg = N(_cell(r, m.get("offset")))
             desc = N(_cell(r, m.get("description")))
             dep_desc, rec_desc, _payer = parse_met_description(desc)
             # Native DEPOSIT_ID / RECEIPT_ID columns are authoritative; the
@@ -1581,6 +1701,7 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 receipt_id=rec_id,
                 transaction_type=_cell(r, m.get("transaction_type")),
                 asset_segments=asset_seg,
+                offset_segments=offset_seg,
             )
             if foreign_acc:
                 # Shadow entry: only the misdirected search may cite it, and
@@ -1658,6 +1779,8 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 prev.receipt_id = e.receipt_id
             if not prev.asset_segments and e.asset_segments:
                 prev.asset_segments = e.asset_segments  # CoA decode (advisory)
+            if not prev.offset_segments and e.offset_segments:
+                prev.offset_segments = e.offset_segments  # ECT posting side
             if not prev.counterparty and e.counterparty:
                 prev.counterparty = e.counterparty
                 prev.payer_tokens = prev.payer_tokens | payer_tokens(e.counterparty)
@@ -3051,15 +3174,25 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
 
     # ---- P10 Residual -> Review -------------------------------------
     coa = loaded.get("CHART_OF_ACCOUNTS")
+    # One amount index for the whole residual pass: _p10_review_cause and the
+    # recommended-GL fallback both need the exact-amount slice — build it once
+    # instead of scanning the pool twice per Review line.
+    by_amount = {}
+    for e in pool:
+        by_amount.setdefault(e.amount_cents, []).append(e)
+    edison_idx, edison_inv = _edison_index(loaded)
     for bsl in unplaced():
-        codes, expl = _p10_review_cause(bsl, pool, feed_errors, deposit_index, coa)
+        exact_entries = by_amount.get(bsl.amount_cents, [])
+        codes, expl = _p10_review_cause(bsl, pool, feed_errors, deposit_index,
+                                        coa, exact_entries)
         if _is_deposit_correction(bsl):
             codes = ["MANUAL_ECT"] + [c for c in codes if c != "MANUAL_ECT"]
             expl = ("Deposit correction — rarely has an ST; manual ECT "
                     "required. " + expl)
-        gl = recommend_gl_string(bsl, loaded, pool)
+        gl = recommend_gl_string(bsl, loaded, exact_entries)
         if gl:
             expl += f" Recommended GL: {gl}."
+        expl += _edison_note(bsl, edison_idx, edison_inv)
         place(bsl, REVIEW, CONF_LOW, [], codes, expl, "P10_review")
 
     # ---- Reverse misdirected search (owner, 2026-07-19) -------------
@@ -3417,6 +3550,79 @@ def _mid_note(bsl, mid_dir, account):
     return note
 
 
+# ---- Edison (State of TN) annotation (owner, 2026-07-19) --------------
+
+def _edison_index(loaded):
+    """{signed cents -> [(payment reference, invoice, iso date)]} from the
+    Edison payments export, plus {invoice -> (status, voucher)} from the
+    invoice export.  Returns (None, {}) when EDISON_PAY is absent."""
+    ep = loaded.get("EDISON_PAY")
+    if not ep:
+        return None, {}
+    rows, m, hi = ep["rows"], ep["map"], ep["header_index"]
+    idx = {}
+    for r in rows[hi + 1:]:
+        amt = cents(_cell(r, m.get("amount")))
+        ref = N(_cell(r, m.get("reference")))
+        if amt is None or not ref:
+            continue
+        dt = parse_date(_cell(r, m.get("date")))
+        idx.setdefault(amt, []).append(
+            (ref, N(_cell(r, m.get("invoice"))), dt.isoformat() if dt else ""))
+    inv_info = {}
+    ei = loaded.get("EDISON_INV")
+    if ei:
+        rows, m, hi = ei["rows"], ei["map"], ei["header_index"]
+        for r in rows[hi + 1:]:
+            inv = N(_cell(r, m.get("invoice")))
+            if inv:
+                inv_info.setdefault(inv, (N(_cell(r, m.get("status"))),
+                                          N(_cell(r, m.get("voucher")))))
+    return idx, inv_info
+
+
+def _edison_note(bsl, edison_idx, inv_info):
+    """Name the Edison payment a stranded State line corresponds to —
+    ANNOTATION ONLY (the C6 State pass is retired; Edison records are the
+    payer's, never pool entries, so they can never place anything).  A
+    payment is cited when it matches on exact signed cents AND its payment
+    reference digits appear in the line's text (reference outranks amount);
+    an amount-only singleton is cited as uncorroborated.  Ambiguous
+    amount-only sets are never guessed."""
+    if not edison_idx:
+        return ""
+    cands = edison_idx.get(bsl.amount_cents, [])
+    if not cands:
+        return ""
+    line_digits = {d for d in
+                   (bsl.ref_digits | digit_runs(bsl.additional_info)
+                    | digit_runs(bsl.account_servicer_reference))
+                   if len(d) >= 6}
+    def _tied(ref):
+        z = znorm(ref)
+        return bool(z) and len(z) >= 6 and any(
+            z in d or d in z for d in line_digits)
+    tied = sorted((p for p in cands if _tied(p[0])))
+    chosen, qual = None, ""
+    if tied:
+        chosen = tied[0]
+    elif len(cands) == 1:
+        chosen = cands[0]
+        qual = " (amount-only; uncorroborated)"
+    if chosen is None:
+        return ""
+    ref, inv, dt = chosen
+    note = f" Edison: State of TN payment {ref}"
+    if inv:
+        note += f" for invoice {inv!r}"
+        st_v = inv_info.get(inv)
+        if st_v and st_v[0]:
+            note += f" ({st_v[0]}" + (f", voucher {st_v[1]}" if st_v[1] else "") + ")"
+    if dt:
+        note += f" paid {dt}"
+    return note + f" matches this line exactly{qual}."
+
+
 def _coa_tag(e, coa):
     """" (dept <DEP_DESC>, entity <ENT_DESC>)" for a named ST that carries a
     CoA-decodable asset combo, else "".  ADVISORY text only (rule 8c); returns
@@ -3435,12 +3641,15 @@ def _coa_tag(e, coa):
     return f" ({', '.join(bits)})" if bits else ""
 
 
-def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None, coa=None):
+def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None, coa=None,
+                      exact_entries=None):
     """Name the dominant Review cause (Section 9 P10), distinguishing open
     counterparts from already-reconciled ones and testing the ties it names.
     When a Chart of Accounts is loaded, each named ST that carries an asset
-    combo is annotated with its decoded department/entity (advisory only)."""
-    exact = [e for e in pool if e.amount_cents == bsl.amount_cents]
+    combo is annotated with its decoded department/entity (advisory only).
+    `exact_entries` is the caller's precomputed exact-amount slice."""
+    exact = (exact_entries if exact_entries is not None
+             else [e for e in pool if e.amount_cents == bsl.amount_cents])
     open_exact = [e for e in exact if e.available]
     closed_exact = [e for e in exact if not e.available]
 
@@ -3511,7 +3720,7 @@ def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None, coa=None):
     return list(dict.fromkeys(codes)), expl
 
 
-def recommend_gl_string(bsl, loaded, pool=None):
+def recommend_gl_string(bsl, loaded, exact_entries=None):
     """Best-effort GL account string for a manual ECT (Section 6 sources)."""
     # MID master only (merchant lane); MISC Receipts is an ALL_DATA sheet,
     # never loaded here — returns "" when there is no MID hit.
@@ -3520,21 +3729,27 @@ def recommend_gl_string(bsl, loaded, pool=None):
         gl = mid_master.get("mid_gl", {}).get(bsl.mid)
         if gl:
             return gl
-    # CoA fallback (owner, 2026-07-19): after a MID miss, an exact-amount ST
-    # counterpart carrying an asset combo yields a human-readable GL/department
-    # for the manual ECT.  Advisory only — never a placement (rule 8c); returns
-    # "" when the CoA is absent, so the Review text is byte-identical without it.
+    # CoA fallback (owner, 2026-07-19; hardened 2026-07-19 adversarial
+    # review): after a MID miss, an exact-amount MET counterpart's OFFSET
+    # combo — the ECT posting side (§6) — yields the recommendation.  The
+    # cash-side asset combo is NEVER recommended (its account segment is the
+    # bank's own cash GL), and foreign-account shadow entries are excluded
+    # (rule 8g: another depository's posting must not steer this account's
+    # ECT).  `exact_entries` is the caller's precomputed exact-amount slice
+    # (P10 already scanned the pool once — no second full scan).  Advisory
+    # only; returns "" when the CoA is absent so output is byte-identical.
     coa = loaded.get("CHART_OF_ACCOUNTS")
-    if coa and pool:
-        for e in _sorted([p for p in pool
-                          if p.amount_cents == bsl.amount_cents
-                          and getattr(p, "asset_segments", "")]):
-            d = coa_decode(e.asset_segments, coa)
+    if coa and exact_entries:
+        for e in _sorted([p for p in exact_entries
+                          if not p.foreign_account
+                          and getattr(p, "offset_segments", "")]):
+            d = coa_decode(e.offset_segments, coa)
             if d:
                 label = " / ".join(x for x in
                                    (d.get("ent_desc"), d.get("dep_desc"),
                                     d.get("act_desc")) if x)
-                return f"{e.asset_segments} = {label}" if label else e.asset_segments
+                return (f"{e.offset_segments} = {label}" if label
+                        else e.offset_segments)
     return ""
 
 
@@ -3865,6 +4080,423 @@ def load_chart_of_accounts(files):
             "postable_efdp": postable_efdp}
 
 
+# ---- CM Configuration exports (owner, 2026-07-19) --------------------
+# The five Cash Management configuration reports (Transaction Creation
+# Rules, Parse Rules, Matching Rules, Tolerance Rules, Recon Rulesets).
+# Loaded for the ADVISORY config audit only (orphan-doctrine R5 activation:
+# "CFG_TCR coverage activates only when those exports are present") — they
+# never gate a placement.  Paginated exports: title + run-date preamble,
+# header row located by marker (never assumed), column A blank padding,
+# repeated headers / "N of M" footer rows dropped.
+
+def _cfg_read_table(rf, marker, fields, keep_keys=None):
+    """Read one CM_Configurations export into a list of dicts.  `fields` maps
+    output key -> header alias; the header row is located by `marker`.  A row
+    is kept when ANY of `keep_keys` (default: the first field) is non-blank
+    and is not a repeated page header — the TCR export carries ORPHAN rules
+    with a BLANK bank-account cell (rules detached from any account) that a
+    single-column keep-rule would silently drop (doctrine rule 3)."""
+    rows, _ = read_rows(rf)
+    hi = _coa_header_index(rows, marker)
+    if hi is None:
+        raise InvalidSourceData(rf.filename, rf.role,
+                                f"no header row carrying {marker!r} found")
+    idx = _coa_colmap(rows[hi])
+    cols = {k: idx.get(_norm_header(alias)) for k, alias in fields.items()}
+    key0 = next(iter(fields))
+    if cols[key0] is None:
+        raise InvalidSourceData(rf.filename, rf.role,
+                                f"marker column {fields[key0]!r} did not bind")
+    keys = list(keep_keys or (key0,))
+    header_norms = {_norm_header(alias) for alias in fields.values()}
+    out = []
+    for r in rows[hi + 1:]:
+        vals = {k: (N(_cell(r, ci)) if ci is not None else "")
+                for k, ci in cols.items()}
+        keep = next((vals[k] for k in keys if vals.get(k)), "")
+        if not keep or _norm_header(keep) in header_norms:
+            continue  # blank spacer / repeated page header
+        out.append(vals)
+    return out
+
+
+def load_cm_config(role, rf):
+    """Dispatch one CFG_* routed file to its table shape."""
+    if role == "CFG_TCR":
+        return _cfg_read_table(rf, "BNK ACCNTNME", {
+            "bank_account": "BNK ACCNTNME", "enabled": "ENBLD",
+            "seq": "SQC NUM", "name": "RLE NME", "descr": "DSCRPT",
+            "trx_code": "TRX CDE", "trx_type": "TRX TPE",
+            "search_field": "SRCH FLD", "search_string": "SRCH STRNG",
+            "cash": "CASH", "offset": "OFFSET",
+            "last_update": "LST UPDTE", "updated_by": "UPDTEBY"},
+            # Orphan rules (blank bank account, rule name present) must load —
+            # 23 live on the real export, 3 of them still ENABLED.
+            keep_keys=("bank_account", "name"))
+    if role == "CFG_PARSE":
+        return _cfg_read_table(rf, "PRS RLE SET", {
+            "rule_set": "PRS RLE SET", "descr": "DSCRPT",
+            "set_enabled": "RLE SET ENBLD", "seq": "SQNCENUM",
+            "enabled": "ENBLD", "trx_code": "TRX CDE", "trx_type": "TRX TPE",
+            "source_field": "SRCE FLD", "target_field": "TRGT FLD",
+            "pattern": "PRSE RLE", "overwrite": "OVRWRTE",
+            "last_update": "LST UPDTE", "updated_by": "UPDTE BY"})
+    if role == "CFG_MATCHING":
+        return _cfg_read_table(rf, "MTCH RLE NME", {
+            "name": "MTCH RLE NME", "descr": "DSCRPT", "enabled": "ENBLD",
+            "source": "TRX SRCE", "match_type": "MTCH TPE",
+            "amount_match": "AMNT MTCH", "date_match": "DTE MTCH",
+            "ref_match": "REF ID MTCH", "type_match": "TPE MTCH",
+            "stmt_groupby": "STMT GRPBY", "trx_groupby": "TRX GRPBY",
+            "criteria": "ADV CRTRA",
+            "last_update": "LST UPDTE", "updated_by": "UPDTEBY"})
+    if role == "CFG_TOLERANCE":
+        return _cfg_read_table(rf, "TOL RLE NME", {
+            "name": "TOL RLE NME", "descr": "DSCRPT",
+            "date_enabled": "DTE ENBLD", "days_before": "DAYS BFR",
+            "days_after": "DAYS AFTR", "amount_enabled": "AMNT ENBLD",
+            "amount_below": "AMNT BELOW", "amount_above": "AMNT ABOVE",
+            "percent_enabled": "PRCNT ENBLD",
+            "last_update": "LST UPDTE", "updated_by": "LST UPDTE BY"})
+    if role == "CFG_RULESETS":
+        return _cfg_read_table(rf, "RLST NME", {
+            "ruleset": "RLST NME", "descr": "RLST DSCRPT",
+            "last_update": "RLST LST UPDTE", "updated_by": "RLST UPDTE BY",
+            "seq": "SQNCE NUM", "matching_rule": "MTCH RLE NME",
+            "tolerance_rule": "TOL RLE NME"})
+    return None
+
+
+CM_CONFIG_ROLES = ("CFG_TCR", "CFG_PARSE", "CFG_MATCHING",
+                   "CFG_TOLERANCE", "CFG_RULESETS")
+
+
+@functools.lru_cache(maxsize=8192)
+def _like_regex(pattern, ci):
+    """Compile an Oracle LIKE pattern (% = any run, _ = any one char) to a
+    regex.  Used to SIMULATE Transaction Creation Rule firing against
+    bank-line addenda — advisory config audit only."""
+    out = []
+    for ch in pattern:
+        if ch == "%":
+            out.append(".*")
+        elif ch == "_":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+    flags = re.DOTALL | (re.IGNORECASE if ci else 0)
+    return re.compile("".join(out), flags)
+
+
+def like_match(pattern, text, case_sensitive=True):
+    """Oracle LIKE semantics, full-match.  Oracle applies LIKE to the whole
+    column value (TCR search strings carry their own leading/trailing % when
+    substring semantics are intended) and is CASE-SENSITIVE — the default
+    here.  A pattern that matches case-insensitively but NOT case-sensitively
+    is the config audit's case-bug signature ('%CANTALOUPE%' never firing on
+    'Cantaloupe, Inc.')."""
+    p = N(pattern)
+    if not p:
+        return False
+    return _like_regex(p, not case_sensitive).fullmatch(N(text)) is not None
+
+
+# ---- Configuration audit (owner, 2026-07-19) --------------------------
+# ADVISORY ONLY: replays the Transaction Creation Rules against this run's
+# bank lines and inspects parse-rule coverage, producing config-change
+# recommendations (disable / fix / create) in the runlog and a markdown
+# artifact.  Never touches placements, the workbook, or the audit.
+# Real-data validation (FHB UTHSC FY27): TCR coverage IS reconciliation —
+# 631 TCR-claimed lines were 100% reconciled while ALL 44 unreconciled
+# lines were TCR-unclaimed, so coverage gaps are the cheapest UNR fix.
+
+def _tcr_search_text(bsl, rule):
+    """The BSL field a TCR's SRCH FLD points at."""
+    fld = _norm_header(rule.get("search_field"))
+    if not fld:
+        return None                     # blank field: rule fires on code alone
+    if "ADDENDA" in fld:
+        return bsl.additional_info
+    if "SERV" in fld:
+        return bsl.account_servicer_reference
+    if "CUSTOMER" in fld:
+        return bsl.customer_reference
+    if "RECON" in fld:
+        return bsl.recon_reference
+    return bsl.additional_info
+
+
+def _tcr_claims(bsl, rule, case_sensitive=True):
+    """Would this TCR fire on this bank line?  Code must match; a blank
+    search string claims every line of the code (Oracle behavior)."""
+    if N(rule.get("trx_code")) != N(bsl.transaction_code):
+        return False
+    pat = N(rule.get("search_string"))
+    if not pat:
+        return True
+    text = _tcr_search_text(bsl, rule)
+    if text is None:
+        return True
+    if "%" not in pat and "_" not in pat:
+        pat = f"%{pat}%"                # bare strings behave as contains
+    return like_match(pat, text, case_sensitive=case_sensitive)
+
+
+def _uncovered_signature(bsl):
+    """Grouping signature for TCR-uncovered lines: the leading description
+    text with digit runs collapsed, so recurring flows cluster."""
+    s = re.sub(r"\d+", "#", N(bsl.additional_info))[:40].strip()
+    return (N(bsl.transaction_code), s)
+
+
+def config_audit(loaded, account, placements, pool, output_dir, runlog):
+    """Replay the CM configuration against this run's outcomes (orphan
+    doctrine R5 — activates only when CFG exports are present).  Writes
+    runlog['config_audit'] plus <account>_config_recommendations.md/.json.
+    ALL fire counts are SIMULATED against the BSL export's (truncated)
+    addenda — an upper bound on coverage gaps, never placement evidence."""
+    tcr_cfg = loaded.get("CFG_TCR")
+    parse_cfg = loaded.get("CFG_PARSE")
+    if not tcr_cfg and not parse_cfg:
+        return None
+    report = {}
+    lines_md = [f"# Configuration recommendations — {account}",
+                "", "All rule-fire counts are SIMULATED against the exported "
+                "bank lines (Oracle evaluates its own untruncated addenda); "
+                "treat them as leads, not proof.", ""]
+
+    # ---- TCR replay -------------------------------------------------
+    if tcr_cfg:
+        mine = [r for r in tcr_cfg["rules"]
+                if account_of_bank_name(r.get("bank_account")) == account]
+        enabled = [r for r in mine if N(r.get("enabled")).upper() == "Y"]
+        disabled = [r for r in mine if N(r.get("enabled")).upper() != "Y"]
+        # Static config defects (need no bank lines) -------------------
+        orphans = [r for r in tcr_cfg["rules"] if not N(r.get("bank_account"))]
+        null_code = [r for r in enabled if not N(r.get("trx_code"))]
+        no_cash = [r for r in mine if not N(r.get("cash"))]
+        wrong_gl = [r for r in enabled
+                    if N(r.get("cash"))
+                    and account_of_gl_segments(r.get("cash")) not in (None, account)]
+        dup_index = {}
+        for r in enabled:
+            key = (N(r.get("trx_code")), N(r.get("search_string")).upper())
+            if key[1]:
+                dup_index.setdefault(key, []).append(N(r.get("name")))
+        dup_pairs = sorted((k, v) for k, v in dup_index.items() if len(v) > 1)
+        # Amount-existence set for the creation-failure split: the WHOLE
+        # pool including shadow/closed entries — absence at |cents| means
+        # the TCR created nothing anywhere.
+        pool_abs = {abs(e.amount_cents) for e in pool}
+        claimed_rules = set()
+        creation_failures = []     # claimed + NO pool entry at the amount
+        stranded_claimed = []      # claimed + counterpart exists, unmatched
+        case_bug_hits = []         # enabled TCR fires only case-insensitively
+        disabled_hits = []         # Review lines only a DISABLED TCR claims
+        uncovered = {}             # signature -> [placement, ...]
+        for p in placements:
+            bsl = p.bsl
+            claimers = [r for r in enabled if _tcr_claims(bsl, r)]
+            for r in claimers:
+                claimed_rules.add(r.get("name"))
+            if p.kind != REVIEW:
+                continue
+            if claimers:
+                if abs(bsl.amount_cents) not in pool_abs:
+                    creation_failures.append((bsl, claimers[0]))
+                else:
+                    stranded_claimed.append((bsl, claimers[0]))
+                continue
+            ci_only = [r for r in enabled
+                       if _tcr_claims(bsl, r, case_sensitive=False)]
+            if ci_only:
+                case_bug_hits.append((bsl, ci_only[0]))
+                continue
+            dis = [r for r in disabled if _tcr_claims(bsl, r)]
+            if dis:
+                disabled_hits.append((bsl, dis[0]))
+                continue
+            uncovered.setdefault(_uncovered_signature(bsl), []).append(p)
+        idle = sorted(N(r.get("name")) for r in enabled
+                      if N(r.get("name")) not in claimed_rules)
+        report["tcr"] = {
+            "rules_for_account": len(mine),
+            "enabled": len(enabled),
+            "orphan_rules_no_account": len(orphans),
+            "enabled_null_trx_code": len(null_code),
+            "cash_combo_missing": len(no_cash),
+            "cash_gl_foreign_account": len(wrong_gl),
+            "duplicate_enabled_pairs": len(dup_pairs),
+            "creation_failures": len(creation_failures),
+            "stranded_but_claimed": len(stranded_claimed),
+            "case_bug_suspects": len(case_bug_hits),
+            "claimed_by_disabled_rule": len(disabled_hits),
+            "uncovered_review_lines": sum(len(v) for v in uncovered.values()),
+            "idle_rules_this_window": len(idle),
+        }
+        if null_code:
+            lines_md += ["## Enabled rules with NO transaction code (FIX)",
+                         "A null TRX CDE can never fire as exported.", ""]
+            lines_md += [f"- `{N(r.get('name'))}` (updated "
+                         f"{N(r.get('last_update'))} by {N(r.get('updated_by'))})"
+                         for r in null_code]
+            lines_md.append("")
+        if wrong_gl:
+            lines_md += ["## Rules whose CASH combo posts to ANOTHER "
+                         "depository (FIX)", ""]
+            for r in wrong_gl:
+                lines_md.append(
+                    f"- `{N(r.get('name'))}` CASH `{N(r.get('cash'))}` -> "
+                    f"{account_of_gl_segments(r.get('cash'))} (this account is {account})")
+            lines_md.append("")
+        if no_cash:
+            lines_md += ["## Rules with NO CASH combo (FIX before enabling)", ""]
+            lines_md += [f"- `{N(r.get('name'))}` (enabled={N(r.get('enabled'))})"
+                         for r in no_cash]
+            lines_md.append("")
+        if dup_pairs:
+            lines_md += ["## Duplicate enabled rules — same code + search "
+                         "string (DISABLE one of each)", ""]
+            for (code, s), names in dup_pairs:
+                lines_md.append(f"- code {code} `{s[:60]}`: " + ", ".join(
+                    f"`{n}`" for n in sorted(names)))
+            lines_md.append("")
+        if orphans:
+            lines_md += [f"## Orphan rules bound to NO bank account "
+                         f"({len(orphans)}; CLEAN UP)",
+                         "Rebind to the intended account (parseable from the "
+                         "name) or delete.", ""]
+            lines_md += [f"- `{N(r.get('name'))}` (enabled={N(r.get('enabled'))})"
+                         for r in sorted(orphans, key=lambda r: N(r.get("name")))[:30]]
+            lines_md.append("")
+        if creation_failures:
+            lines_md += ["## TCR creation FAILURES (INVESTIGATE the feed)",
+                         "An enabled rule claims each line, yet NO system "
+                         "transaction exists at that amount anywhere in the "
+                         "pool — the rule fired (or should have) and created "
+                         "nothing.", ""]
+            for bsl, r in creation_failures[:25]:
+                lines_md.append(
+                    f"- {bsl.date} {_usd(bsl.amount_cents)} code {bsl.transaction_code}"
+                    f" — rule `{r.get('name')}` | {N(bsl.additional_info)[:70]}")
+            lines_md.append("")
+        if stranded_claimed:
+            lines_md += ["## TCR fired-but-stranded (FIX / INVESTIGATE)",
+                         "An enabled Transaction Creation Rule claims each of "
+                         "these lines and a counterpart amount exists in the "
+                         "pool, yet the line is still unreconciled.", ""]
+            for bsl, r in stranded_claimed[:25]:
+                lines_md.append(
+                    f"- {bsl.date} {_usd(bsl.amount_cents)} code {bsl.transaction_code}"
+                    f" — rule `{r.get('name')}` | {N(bsl.additional_info)[:70]}")
+            lines_md.append("")
+        if case_bug_hits:
+            lines_md += ["## Case-sensitivity bugs (FIX the search string)",
+                         "The rule matches this line case-INSENSITIVELY only; "
+                         "Oracle LIKE is case-sensitive, so the rule never "
+                         "fires ('%CANTALOUPE%' vs 'Cantaloupe, Inc.').", ""]
+            for bsl, r in case_bug_hits[:25]:
+                lines_md.append(
+                    f"- rule `{r.get('name')}` (search `{r.get('search_string')}`)"
+                    f" vs line {bsl.date} {_usd(bsl.amount_cents)}:"
+                    f" {N(_tcr_search_text(bsl, r))[:70]}")
+            lines_md.append("")
+        if disabled_hits:
+            lines_md += ["## Claimed only by a DISABLED rule (ENABLE or replace)", ""]
+            for bsl, r in disabled_hits[:25]:
+                lines_md.append(
+                    f"- {bsl.date} {_usd(bsl.amount_cents)} — disabled rule "
+                    f"`{r.get('name')}`")
+            lines_md.append("")
+        recurring = sorted(((sig, ps) for sig, ps in uncovered.items()
+                            if len(ps) >= 2),
+                           key=lambda kv: (-len(kv[1]), kv[0]))
+        if recurring:
+            lines_md += ["## Uncovered recurring flows (CREATE a TCR)",
+                         "No enabled TCR claims these unreconciled lines; "
+                         "each signature recurs in this run.  Proposed search "
+                         "string uses the line's merchant number when one is "
+                         "present.", ""]
+            for (code, sig), ps in recurring[:15]:
+                mids = sorted({p.bsl.mid for p in ps if p.bsl.mid})
+                prop = (f"%MERCHANT%DEPOSIT%{mids[0]}%" if mids
+                        else f"%{sig.replace('#', '%').strip('% ')}%")
+                total = sum(p.bsl.amount_cents for p in ps)
+                lines_md.append(
+                    f"- code {code} × {len(ps)} lines ({_usd(total)}): sig "
+                    f"`{sig}` -> proposed SRCH STRNG `{prop}`")
+            lines_md.append("")
+        report["tcr"]["uncovered_recurring_signatures"] = len(recurring)
+        if idle:
+            lines_md += [f"## Idle rules this window ({len(idle)} of "
+                         f"{len(enabled)} enabled claimed nothing)",
+                         "Window-level only — check a full-year replay before "
+                         "pruning.", ""]
+            lines_md += [f"- `{n}`" for n in idle[:30]]
+            lines_md.append("")
+
+    # ---- Parse-rule coverage ---------------------------------------
+    if parse_cfg:
+        bank = account.split("_", 1)[0]      # FHB / REGIONS
+        bank_rules = [r for r in parse_cfg["rules"]
+                      if bank.lower() in N(r.get("rule_set")).lower()
+                      and N(r.get("enabled")).upper() == "Y"]
+        covered_codes = {N(r.get("trx_code")) for r in bank_rules}
+        code_stats = {}
+        for p in placements:
+            bsl = p.bsl
+            code = N(bsl.transaction_code)
+            st = code_stats.setdefault(code, {"lines": 0, "no_ref": 0})
+            st["lines"] += 1
+            if not bsl.recon_reference:
+                st["no_ref"] += 1
+        gaps = {c: st for c, st in sorted(code_stats.items())
+                if c not in covered_codes and st["no_ref"]}
+        report["parse"] = {
+            "bank": bank, "rules": len(bank_rules),
+            "covered_codes": sorted(covered_codes),
+            "uncovered_codes_with_blank_refs": {
+                c: st["no_ref"] for c, st in gaps.items()},
+        }
+        if gaps:
+            lines_md += ["## Parse-rule gaps (CREATE parse rules)",
+                         f"Bank rule set covers codes "
+                         f"{', '.join(sorted(covered_codes))}; these codes in "
+                         "this run carry NO parse rule, leaving the "
+                         "reconciliation reference blank:", ""]
+            for c, st in gaps.items():
+                lines_md.append(
+                    f"- code {c}: {st['no_ref']} of {st['lines']} lines have a "
+                    "blank reference -> add ACCNT_SERVICER_REF -> "
+                    "RECON_REFERENCE `(X~)`")
+            lines_md += ["",
+                         "Also recommended (raw-BAI2 evidence): extract "
+                         "`Customer ID:` / `Trace Number:` / `TRN1` and check "
+                         "numbers from ADDENDA — the bank's servicer-ref "
+                         "field letter-strips alphanumeric ACH ids, and no "
+                         "current rule captures these keys.", ""]
+
+    # ---- Tolerance note ---------------------------------------------
+    tol = loaded.get("CFG_TOLERANCE")
+    if tol and tol["rules"]:
+        t = tol["rules"][0]
+        report["tolerance"] = {"name": t.get("name"),
+                               "days_before": t.get("days_before"),
+                               "days_after": t.get("days_after"),
+                               "amount_enabled": t.get("amount_enabled")}
+
+    path = os.path.join(output_dir, f"{account}_config_recommendations.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines_md) + "\n")
+    jpath = os.path.join(output_dir, f"{account}_config_recommendations.json")
+    with open(jpath, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True, default=str)
+    report["report_path"] = path
+    report["json_path"] = jpath
+    runlog["config_audit"] = report
+    return report
+
+
 # ======================================================================
 # Section 9 P0 — Load & validate; build BSL list
 # ======================================================================
@@ -3882,6 +4514,8 @@ def load_and_bind(by_role, runlog):
         "MET": MET_ROLES,
         "BAI2": BAI2_ROLES,
         "DEPT_INFO": DEPT_INFO_ROLES,
+        "EDISON_PAY": EDISON_PAY_ROLES,
+        "EDISON_INV": EDISON_INV_ROLES,
         "APPLIED_UNAPPLIED": APPLIED_UNAPPLIED_ROLES,
         "AR_MATCHED": AR_MATCHED_ROLES,
         "ENRICHED": ENRICHED_ROLES,
@@ -3907,6 +4541,15 @@ def load_and_bind(by_role, runlog):
                                       "combos": len(coa["combo_decode"]),
                                       "entities": len(coa["entity_desc"]),
                                       "postable_efdp": len(coa["postable_efdp"])}
+            continue
+        if role in CM_CONFIG_ROLES:
+            # CM configuration reports (orphan-doctrine R5 activation):
+            # loaded for the advisory config audit only, never a gate.
+            rf = _pick_newest(files, role)
+            rules = load_cm_config(role, rf)
+            if rules:
+                loaded[role] = {"rules": rules, "file": rf.filename}
+                bound_report[role] = {"file": rf.filename, "rows": len(rules)}
             continue
         specs = role_specs.get(role)
         if specs is None and role != "MID_MASTER":
@@ -4167,6 +4810,12 @@ def run(account_input_dir, output_dir="./outputs", present=True):
         audit_result = {"status": "SKIPPED", "reason": "recon_audit not importable"}
     runlog["audit"] = audit_result
     runlog["stages"].append("audit")
+
+    # Configuration audit (owner, 2026-07-19; orphan-doctrine R5): advisory
+    # replay of the CM configuration against this run's outcomes.  Optional —
+    # no CFG exports, no-op; never affects placements, workbook, or audit.
+    if config_audit(loaded, account, placements, pool, output_dir, runlog):
+        runlog["stages"].append("config_audit")
 
     # Write JSON run log (Section 15.7).
     log_path = os.path.join(output_dir, f"{account}_runlog.json")

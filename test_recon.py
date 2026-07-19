@@ -1635,5 +1635,268 @@ class TestChartOfAccounts(unittest.TestCase):
                          {"rows_seen": 1, "unrecognized_combo": 0, "non_postable_efdp": 0})
 
 
+class TestCMConfig(unittest.TestCase):
+    """CM Configuration exports (owner, 2026-07-19): the five CFG_* loaders,
+    the Oracle-LIKE simulator, and the raw BAI2 .txt reader."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.out = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+        shutil.rmtree(self.out, ignore_errors=True)
+
+    def test_cfg_router(self):
+        cases = {
+            "CM_Configurations_Transaction_Creation_Rules.xlsx": "CFG_TCR",
+            "CM_Configurations_Parse_Rules.xlsx": "CFG_PARSE",
+            "CM_Configurations_Matching_Rules.xlsx": "CFG_MATCHING",
+            "CM_Configurations_Tolerance_Rules.xlsx": "CFG_TOLERANCE",
+            "CM_Configurations_Recon_Rulesets.xlsx": "CFG_RULESETS",
+            "FHB_UTHSC_BAI2.txt": "BAI2",
+        }
+        for name, want in cases.items():
+            self.assertEqual(E.classify_file(name), want, msg=name)
+
+    def test_cfg_tcr_loader(self):
+        # Paginated export shape: preamble rows, header at row 6, footer.
+        rows = [("",) * 16] * 4 + [
+            ("Transaction Creation Rules",) + ("",) * 15,
+            ("Run Date: 7/19/2026",) + ("",) * 15,
+            ("", "BNK ACCNTNME", "ENBLD", "SQC NUM", "RLE NME", "DSCRPT",
+             "TRX CDE", "TRX TPE", "SRCH FLD", "SRCH STRNG", "CASH", "OFFSET",
+             "ACCNT FLG", "LST UPDTE", "UPDTEBY", ""),
+            ("", "FHB - Master Account", "Y", "1", "EFT 495_Test", "d",
+             "495", "EFT", "ADDENDA", "%LGIP%", "01-1100098-000000-100210-000-0000-00-0000",
+             "01-1100001-000000-100930-000-0000-00-0000", "Y",
+             "2026-04-02 17:03:10", "AOWENS43", ""),
+            ("",) * 16,                            # blank spacer
+            ("", "BNK ACCNTNME", "ENBLD", "SQC NUM", "RLE NME", "DSCRPT",
+             "TRX CDE", "TRX TPE", "SRCH FLD", "SRCH STRNG", "CASH", "OFFSET",
+             "ACCNT FLG", "LST UPDTE", "UPDTEBY", ""),  # repeated page header
+            ("", "FHB - UTHSC", "N", "2", "ACH 142_Test", "d",
+             "142", "ACH", "", "", "01-1100098-000000-100500-000-0000-00-0000",
+             "", "Y", "2026-01-01 00:00:00", "X", ""),
+            ("1 of 2",) + ("",) * 15,              # footer
+        ]
+        p = os.path.join(self.d, "CM_Configurations_Transaction_Creation_Rules.xlsx")
+        _write_xlsx(p, [("Sheet1", rows)])
+        rf = E.RoutedFile("CFG_TCR", p, os.path.basename(p), "first")
+        rules = E.load_cm_config("CFG_TCR", rf)
+        self.assertEqual(len(rules), 2)            # spacer/header/footer dropped
+        self.assertEqual(rules[0]["bank_account"], "FHB - Master Account")
+        self.assertEqual(rules[0]["trx_code"], "495")
+        self.assertEqual(rules[0]["search_string"], "%LGIP%")
+        self.assertEqual(rules[1]["enabled"], "N")
+
+    def test_like_match(self):
+        self.assertTrue(E.like_match("%LGIP Account No.: 447112-10%",
+                                     "PRIOR TEXT LGIP Account No.: 447112-10 TRAILER"))
+        self.assertTrue(E.like_match("RETURN SETTLE%", "RETURN SETTLEMENT X"))
+        self.assertFalse(E.like_match("RETURN SETTLE%", "X RETURN SETTLEMENT"))
+        self.assertTrue(E.like_match("%PAY%REVERSAL%", "ACH PAY 33 REVERSAL 9"))
+        self.assertTrue(E.like_match("A_C", "AbC"))          # _ = one char
+        self.assertFalse(E.like_match("A_C", "AbbC"))
+        self.assertFalse(E.like_match("", "anything"))       # blank never fires
+
+    def test_raw_bai2_txt_reader(self):
+        raw = "\n".join([
+            "01,000000000,000000000,260719,0759,2659562,,,2/",
+            "02,084000026,084000026,1,260718,,USD,2/",
+            "03,90603,USD,010,0,,,015,0,,,/",
+            "88,060,0,,,063,0,,,072,0,,,/",                      # 03 continuation: ignored
+            "16,142,5100,Z,25202003732875,08035701948,",
+            "88,MERCHANT SERVICEDEPOSIT 2507218035701948",
+            "88,Customer ID: 8035701948",
+            "88,Trace Number: 084000023732875",
+            "16,475,250000,Z,99887766,00001234,",
+            "49,0,2/",
+            "98,0,1,2/",
+            "99,0,1,2/",
+        ])
+        p = os.path.join(self.d, "FHB_UTHSC_BAI2.txt")
+        with open(p, "w") as fh:
+            fh.write(raw)
+        rows = E._read_bai2_txt(p)
+        self.assertEqual(len(rows), 3)                    # header + 2 details
+        hdr = rows[0]
+        self.assertEqual(hdr[:6], ("Post Date", "Transaction Description",
+                                   "Amount", "Bank Reference",
+                                   "Customer Reference", "BAI Code"))
+        # credit 142: positive, group as-of date, addenda in DETAIL columns
+        self.assertEqual(rows[1][0], "2026-07-18")
+        self.assertEqual(E.cents(rows[1][2]), 5100)
+        self.assertEqual(rows[1][5], "142")
+        self.assertIn("Customer ID: 8035701948", rows[1])
+        # the 03-record continuation must NOT leak into detail addenda
+        self.assertFalse(any("060,0" in str(c) for c in rows[1]))
+        # debit 475: negated
+        self.assertEqual(E.cents(rows[2][2]), -250000)
+        # binds the existing BAI2 role vocabulary
+        m, hi = E.bind_columns(rows, E.BAI2_ROLES, filename="FHB_UTHSC_BAI2.txt")
+        self.assertEqual(hi, 0)
+        self.assertEqual(m["bai_code"], 5)
+
+    def test_cfg_tcr_orphan_rows_load(self):
+        # The real export carries rules with a BLANK bank-account cell
+        # (detached rules, 3 still enabled) — they must load, not be
+        # silently dropped as spacer rows (doctrine rule 3).
+        rows = [("",) * 16] * 6 + [
+            ("", "BNK ACCNTNME", "ENBLD", "SQC NUM", "RLE NME", "DSCRPT",
+             "TRX CDE", "TRX TPE", "SRCH FLD", "SRCH STRNG", "CASH", "OFFSET",
+             "ACCNT FLG", "LST UPDTE", "UPDTEBY", ""),
+            ("", "FHB - UTHSC", "Y", "1", "normal rule", "d", "142", "ACH",
+             "", "", "01-x", "", "Y", "", "A", ""),
+            ("", "", "Y", "", "DIR 555 orphan rule", "d", "555", "MSC",
+             "", "", "", "", "Y", "", "A", ""),
+        ]
+        p = os.path.join(self.d, "CM_Configurations_Transaction_Creation_Rules.xlsx")
+        _write_xlsx(p, [("Sheet1", rows)])
+        rules = E.load_cm_config("CFG_TCR", E.RoutedFile("CFG_TCR", p, os.path.basename(p), "first"))
+        self.assertEqual(len(rules), 2)
+        orphan = [r for r in rules if not r["bank_account"]]
+        self.assertEqual(len(orphan), 1)
+        self.assertEqual(orphan[0]["name"], "DIR 555 orphan rule")
+
+    def test_recommend_gl_offset_only_and_foreign_excluded(self):
+        # Adversarial-review fixes: the CoA fallback recommends ONLY the
+        # OFFSET combo (the ECT posting side) and never cites a
+        # foreign-account shadow entry (rule 8g).
+        coa = {"combo_decode": {}, "entity_desc": {"01": "UT System"},
+               "postable_efdp": set()}
+        loaded = {"CHART_OF_ACCOUNTS": coa}
+        b = E.make_bsl("1", date(2026, 7, 1), 25000, "R", "R", "", "Miscellaneous", "174")
+        # foreign shadow entry with offset combo: must NOT be recommended
+        foreign = E._mk_entry("F1", 25000, date(2026, 7, 1), "X", "", "EXT",
+                              "UNR", True, "MET",
+                              offset_segments="70-1100001-000000-461000-000-0000-00-0000")
+        foreign.foreign_account = "FHB_UTHSC"
+        foreign.available = False
+        self.assertEqual(E.recommend_gl_string(b, loaded, [foreign]), "")
+        # asset-only entry (no offset combo): nothing to recommend
+        asset_only = E._mk_entry("A1", 25000, date(2026, 7, 1), "X", "", "EXT",
+                                 "UNR", True, "MET",
+                                 asset_segments="01-1100001-000000-100210-000-0000-00-0000")
+        self.assertEqual(E.recommend_gl_string(b, loaded, [asset_only]), "")
+        # in-account entry with offset combo: recommended, entity decoded
+        ok = E._mk_entry("K1", 25000, date(2026, 7, 1), "X", "", "EXT",
+                         "UNR", True, "MET",
+                         offset_segments="01-1100001-011413-546500-260-0000-00-0000")
+        got = E.recommend_gl_string(b, loaded, [asset_only, foreign, ok])
+        self.assertIn("01-1100001-011413-546500-260-0000-00-0000", got)
+        self.assertIn("UT System", got)
+
+    def test_config_audit_end_to_end(self):
+        # CFG files present: placements byte-identical, artifacts written,
+        # creation-failure vs uncovered classification correct.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            # claimed by the enabled TCR, but NO pool entry -> creation failure
+            ("2026-07-16", "290.50", "NA", "USDA TREAS 310 MISC PAY", "626001636",
+             "Automated clearing house", "Line 1 , 2026-07-16", "142"),
+            # recurring uncovered signature (x2)
+            ("2026-07-15", "-100.00", "NA", "STATE-TNRECEIPTSTNRECEIPTS 1", "NA",
+             "Automated clearing house", "Line 2 , 2026-07-15", "451"),
+            ("2026-07-16", "-200.00", "NA", "STATE-TNRECEIPTSTNRECEIPTS 2", "NA",
+             "Automated clearing house", "Line 3 , 2026-07-16", "451"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Counterparty"),
+              ("2026-07-02", "999.00", "OTHER", 601, "External", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        tcr = [("",) * 16] * 6 + [
+            ("", "BNK ACCNTNME", "ENBLD", "SQC NUM", "RLE NME", "DSCRPT",
+             "TRX CDE", "TRX TPE", "SRCH FLD", "SRCH STRNG", "CASH", "OFFSET",
+             "ACCNT FLG", "LST UPDTE", "UPDTEBY", ""),
+            ("", "FHB - Master Account", "Y", "334", "142-FHB - Master Account-626001636",
+             "d", "142", "ACH", "ACCOUNT_SERV_REFERENCE", "626001636",
+             "01-1100098-000000-100210-000-0000-00-0000", "", "Y", "", "A", ""),
+        ]
+        _write_xlsx(os.path.join(self.d, "CM_Configurations_Transaction_Creation_Rules.xlsx"),
+                    [("Sheet1", tcr)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        ca = runlog["config_audit"]
+        self.assertEqual(ca["tcr"]["creation_failures"], 1)
+        self.assertEqual(ca["tcr"]["uncovered_review_lines"], 2)
+        self.assertEqual(ca["tcr"]["uncovered_recurring_signatures"], 1)
+        self.assertTrue(os.path.exists(ca["report_path"]))
+        self.assertTrue(os.path.exists(ca["json_path"]))
+        text = open(ca["report_path"]).read()
+        self.assertIn("creation FAILURES", text)
+        self.assertIn("626001636", text)
+        self.assertIn("STATE-TNRECEIPTS", text)
+        self.assertIn("SIMULATED", text)
+
+    def test_edison_annotation(self):
+        # Edison (State of TN) exports annotate stranded State lines with the
+        # payment reference/invoice — text only, placements untouched.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            # ref-tied Edison payment (payment ref digits in the ASR)
+            ("2026-07-08", "586.66", "NA", "STATE-TN PAYMNTS", "0007041551",
+             "Automated clearing house", "Line 1 , 2026-07-08", "142"),
+            # amount matches TWO payments, no ref tie -> never guessed
+            ("2026-07-09", "400.00", "NA", "STATE-TN PAYMNTS", "NA",
+             "Automated clearing house", "Line 2 , 2026-07-09", "142"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Counterparty"),
+              ("2026-07-02", "999.00", "OTHER", 601, "External", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        _write_xlsx(os.path.join(self.d, "Edison_Payments.xlsx"), [("sheet1", [
+            ("Reference", "Invoice Number", "Payment Date", "Amount", "Currency"),
+            ("0007041551", "12052025", "2026-07-07", "586.66", "USD"),
+            ("0007000001", "INV-A", "2026-07-07", "400.00", "USD"),
+            ("0007000002", "INV-B", "2026-07-08", "400.00", "USD"),
+        ])])
+        _write_xlsx(os.path.join(self.d, "Edison_Invoices.xlsx"), [("sheet1", [
+            ("Invoice Number", "Invoice Date", "Gross Amt", "Currency",
+             "Approval Status", "Due Date", "Voucher"),
+            ("12052025", "2026-06-30", "586.66", "USD", "Approved",
+             "2026-07-15", "00169979"),
+        ])])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertEqual(runlog["recon_summary"]["reviews"], 2)
+        tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
+        rev = {A._N(r[2]): A._N(r[A.COL_EXPL])
+               for r in tabs["Review Notes"][3:] if any(A._N(c) for c in r)}
+        self.assertIn("Edison: State of TN payment 0007041551", rev["586.66"])
+        self.assertIn("invoice '12052025'", rev["586.66"])
+        self.assertIn("Approved", rev["586.66"])
+        self.assertIn("voucher 00169979", rev["586.66"])
+        # ambiguous amount-only: no Edison note at all
+        self.assertNotIn("Edison", rev["400.00"])
+
+    def test_run_recon_stages_bai2_txt(self):
+        # A native BAI2 .txt must be staged by the per-run wrapper; any other
+        # .txt stays ignored (preserves ignored_non_spreadsheets semantics).
+        self.assertTrue(R._stageable("20260718_FHB_Master_BAI2.txt"))
+        self.assertFalse(R._stageable("readme.txt"))
+        self.assertTrue(R._stageable("20260710_FHB_Master_BSL_UNR.xlsx"))
+
+    def test_student_refund_uthsc_utm_utso_accounts(self):
+        # Config export exposed three more Student Refund depositories; the
+        # generic campus token must not swallow them (misdirected scope, 8g).
+        self.assertEqual(E.account_of_bank_name("FHB - Student Refund - UTHSC"),
+                         "FHB_STUDENT_REFUND_UTHSC")
+        self.assertEqual(E.account_of_bank_name("FHB - Student Refund - UTM"),
+                         "FHB_STUDENT_REFUND_UTM")
+        self.assertEqual(E.account_of_bank_name("FHB - Student Refund - UTSO"),
+                         "FHB_STUDENT_REFUND_UTSO")
+        self.assertEqual(E.account_of_bank_name("FHB - UTHSC"), "FHB_UTHSC")
+        self.assertEqual(E.account_of_bank_name("FHB - Accounts Payable"), "FHB_AP")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
