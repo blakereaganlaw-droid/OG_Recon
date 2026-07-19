@@ -330,10 +330,18 @@ ROUTER_TABLE = [
     # this account's BSL reconciliation.  Must precede BSL/MET (it embeds both
     # 'bsl' and 'oracle_otbi'); the single-account BSL never carries an 'all'
     # segment, so it still binds BSL.
-    RouterRule("ALL_BSL", ["all", "bsl"], ["all_data", "enriched"], [], "first", False),
+    # RECONCILED forensic exports (owner uploads, 2026-07-19): reconciled
+    # BSL/ST/receipt/history reports.  Recognized so they can NEVER be
+    # misread as the open exports (a "Reconciled_..._Student_Refund_BSL"
+    # file used to bind the hard-required BSL role and would have poisoned
+    # the whole run with already-reconciled lines) — but never loaded by
+    # the forward engine (they fuel the config audit's offline analysis
+    # and Unreconcile2).  Must precede ALL_BSL/BSL/ST/MET.
+    RouterRule("RECONCILED", [], [], ["reconciled", "reconciliation_report"], "multi", False),
+    RouterRule("ALL_BSL", ["all", "bsl"], ["all_data", "enriched", "reconciled"], [], "first", False),
     # 'enriched' excluded: an Enriched_..._BSL_... workbook is the parsed
     # enrichment source (ENRICHED below), not a competing BSL export.
-    RouterRule("BSL", ["bsl"], ["all_data", "enriched"], [], "first", True),
+    RouterRule("BSL", ["bsl"], ["all_data", "enriched", "reconciled"], [], "first", True),
     RouterRule("ALL_DATA", ["all_data"], [], [], "multi", False),
     # 'oracle_otbi' also routes here: OTBI is the MET report's source system
     # and real exports sometimes omit the MET token
@@ -396,6 +404,10 @@ _ACCOUNT_TOKENS = [
     # carries neither "student" nor "refund", so it still binds FHB_UTC).
     ("FHB_STUDENT_REFUND_UTK", ["fhb", "student", "refund", "utk"]),
     ("FHB_STUDENT_REFUND_UTC", ["fhb", "student", "refund", "utc"]),
+    # Long-form campus spelling ("FHB_UT_Chatt_Student_Refund_BAI2") —
+    # without it the file carries account None and the mixed-account
+    # preflight guard is blind to it (critical review, 2026-07-19).
+    ("FHB_STUDENT_REFUND_UTC", ["fhb", "student", "refund", "chatt"]),
     # The TCR config export (owner, 2026-07-19) names Student Refund
     # depositories for UTHSC/UTM/UTSO too — without these entries the
     # generic campus token would swallow them ("FHB - Student Refund -
@@ -407,6 +419,7 @@ _ACCOUNT_TOKENS = [
     ("FHB_UTHSC", ["fhb", "uthsc"]),
     ("FHB_UTIA", ["fhb", "utia"]),
     ("FHB_UTC", ["fhb", "utc"]),
+    ("FHB_UTC", ["fhb", "chatt"]),   # "FHB - UT Chatt" long form
     ("FHB_UTM", ["fhb", "utm"]),
     ("FHB_UTSO", ["fhb", "utso"]),
     ("FHB_AP", ["fhb", "ap"]),
@@ -4612,8 +4625,9 @@ def load_and_bind(by_role, runlog):
     }
     bound_report = {}
     for role, files in by_role.items():
-        if role == "ALL_DATA":
-            continue  # recognized but never loaded (Unreconcile2 owns it)
+        if role in ("ALL_DATA", "RECONCILED"):
+            continue  # recognized but never loaded (Unreconcile2 / offline
+            #           config-audit fuel — never the forward engine's input)
         if role == "CHART_OF_ACCOUNTS":
             # Multi-file reference bundle: pass the WHOLE routed set to the
             # loader (never _pick_newest — the shards are complementary, not
@@ -4638,6 +4652,34 @@ def load_and_bind(by_role, runlog):
         specs = role_specs.get(role)
         if specs is None and role != "MID_MASTER":
             continue  # recognized; no binding required at this layer
+        # MET pagination union (owner review, 2026-07-19): real OTBI exports
+        # arrive as same-date "_2/_3" page shards (20260717_..._MET_..._2.csv).
+        # Same-date MET files are PAGES of one export — union them, requiring
+        # an identical column binding (else fail loud naming both files).
+        # Different-date MET files stay newest-wins (they are refreshes).
+        if role == "MET" and len(files) > 1 and \
+                len({_leading_date_key(f.filename) for f in files}) == 1:
+            shards = sorted(files, key=lambda f: f.filename)
+            rows, _ = read_rows(shards[0])
+            mapping, hi = bind_columns(rows, specs, filename=shards[0].filename)
+            rows = list(rows)
+            for extra in shards[1:]:
+                erows, _ = read_rows(extra)
+                emap, ehi = bind_columns(erows, specs, filename=extra.filename)
+                if emap != mapping:
+                    raise InvalidSourceData(
+                        extra.filename, role,
+                        f"MET page shard binds different columns than "
+                        f"{shards[0].filename} ({emap} vs {mapping}) — "
+                        "not pages of one export")
+                rows.extend(erows[ehi + 1:])
+            fname = " + ".join(f.filename for f in shards)
+            loaded[role] = {"rows": rows, "map": mapping, "header_index": hi,
+                            "file": fname}
+            bound_report[role] = {"file": fname, "columns": mapping,
+                                  "header_index": hi,
+                                  "union_of": [f.filename for f in shards]}
+            continue
         rf = _pick_newest(files, role)  # newest YYYYMMDD stamp wins
         if role == "MID_MASTER":
             loaded["MID_MASTER"] = load_mid_master(rf)
@@ -4845,6 +4887,18 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     by_role = route_folder(account_input_dir)
     runlog["files_routed"] = {role: [f.filename for f in files]
                               for role, files in by_role.items()}
+    # Doctrine rule 3 (never silently drop): name every data-shaped file the
+    # router did not recognize — direct engine invocations have no per-run
+    # manifest, so the runlog + stderr are the record.
+    routed_names = {f.filename for files in by_role.values() for f in files}
+    unrouted = [n for n in sorted(os.listdir(account_input_dir))
+                if os.path.isfile(os.path.join(account_input_dir, n))
+                and n.lower().endswith((".xlsx", ".xlsm", ".xlsb", ".csv", ".txt"))
+                and n not in routed_names]
+    if unrouted:
+        runlog["files_unrouted"] = unrouted
+        print(f"WARNING: {len(unrouted)} file(s) matched no role and were NOT "
+              f"read: {', '.join(unrouted)}", file=sys.stderr)
     account = _resolve_account(by_role)
     runlog["account"] = account
     runlog["stages"].append("route")
@@ -4855,6 +4909,10 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     if "ALL_DATA" in by_role:
         runlog["all_data"] = ("present: not loaded (forward-only engine; "
                               "run Unreconcile2 for the backward re-audit)")
+    if "RECONCILED" in by_role:
+        runlog["reconciled_exports"] = (
+            "present: not loaded (forensic reconciled exports — offline "
+            "config-audit / Unreconcile2 fuel, never forward-engine input)")
 
     loaded = load_and_bind(by_role, runlog)
     runlog["stages"].append("bind")

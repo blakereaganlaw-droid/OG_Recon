@@ -1635,6 +1635,110 @@ class TestChartOfAccounts(unittest.TestCase):
                          {"rows_seen": 1, "unrecognized_combo": 0, "non_postable_efdp": 0})
 
 
+class TestRoutingHardening(unittest.TestCase):
+    """File-name protection (critical review, 2026-07-19): reconciled
+    forensic exports must never be misread as open exports; paginated MET
+    shards union; the audit re-parses the SAME file the engine reconciled."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.out = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+        shutil.rmtree(self.out, ignore_errors=True)
+
+    def test_reconciled_exports_never_bind_open_roles(self):
+        cases = {
+            "20260719_Oracle_CM_Reconciled_FHB_UTC_Student_Refund_BSL.xlsx": "RECONCILED",
+            "Reconciled_BSL_FHB_Master.xlsx": "RECONCILED",
+            "20260719_Oracle_CM_Reconciled_System_Transactions_FHB_Master.xlsx": "RECONCILED",
+            "Reconciliation_Report_Reconciliation_History.xlsx": "RECONCILED",
+            "20260719_Oracle_CM_FHB_Master_BSL_UNR.xlsx": "BSL",
+            "20260719_Oracle_CM_FHB_Master_ST_UNR.xlsx": "ST",
+        }
+        for name, want in cases.items():
+            self.assertEqual(E.classify_file(name), want, msg=name)
+
+    def test_met_pagination_union(self):
+        # Two same-date MET page shards are pages of ONE export: unioned,
+        # identical binding required.
+        hdr = ("CET Transaction ID", "Amount", "Transaction Date", "CET Status",
+               "CBE Bank Account Name")
+        _write_xlsx(os.path.join(self.d, "20260710_Oracle_OTBI_MET_FHB_UTC.xlsx"),
+                    [("Sheet1", [hdr,
+                     ("MET1", "100.00", "2026-07-01", "UNR", "FHB - UTC")])])
+        _write_xlsx(os.path.join(self.d, "20260710_Oracle_OTBI_MET_FHB_UTC_2.xlsx"),
+                    [("Sheet1", [hdr,
+                     ("MET2", "200.00", "2026-07-02", "UNR", "FHB - UTC")])])
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_UTC_BSL_UNR.xlsx"),
+                    [("Exported", [("Date", "Amount (USD)", "Reference",
+                                    "Additional Information",
+                                    "Account Servicer Reference",
+                                    "Transaction Type", "Statement",
+                                    "Transaction Code"),
+                                   ("2026-07-01", "10.00", "R1", "", "R1",
+                                    "Miscellaneous", "L1", "174")])])
+        by_role = E.route_folder(self.d)
+        loaded = E.load_and_bind(by_role, {})
+        met = loaded["MET"]
+        ids = {E.N(r[met["map"]["trx_id"]]) for r in met["rows"][met["header_index"] + 1:]}
+        self.assertEqual(ids, {"MET1", "MET2"})
+
+    def test_audit_reparse_ignores_newer_all_bsl_and_reconciled(self):
+        bsl_rows = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                     "Account Servicer Reference", "Transaction Type", "Statement",
+                     "Transaction Code"),
+                    ("2026-07-01", "10.00", "R1", "", "R1", "Miscellaneous",
+                     "Line 1 , 2026-07-01", "174")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl_rows)])
+        # NEWER-dated all-accounts export + a reconciled forensic export:
+        # both carry 'bsl' in the name; neither may win the C1 re-parse.
+        big = [bsl_rows[0]] + [
+            ("2026-07-0%d" % (i % 9 + 1), "99.00", "X", "", "X",
+             "Miscellaneous", f"Line {i} x", "174") for i in range(5)]
+        _write_xlsx(os.path.join(self.d, "20260720_Oracle_OTBI_All_BSL_UNR.xlsx"),
+                    [("Exported", big)])
+        _write_xlsx(os.path.join(self.d, "20260721_Reconciled_BSL_FHB_Master.xlsx"),
+                    [("Exported", big)])
+        bag = A._reparse_source_bsls(self.d)
+        self.assertEqual(len(bag), 1)          # the single account line only
+
+    def test_audit_c2_resums_match_amounts(self):
+        # A Match whose cited ST amounts do not sum to the bank line must
+        # fail C2 — re-summed from the workbook itself, no pool needed.
+        bsl = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                "Account Servicer Reference", "Transaction Type", "Statement",
+                "Transaction Code"),
+               ("2026-07-01", "150.00", "REF88001", "", "REF88001",
+                "Miscellaneous", "Line 1 , 2026-07-01", "174")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              ("2026-06-30", "150.00", "REF88001", 601, "Receivables", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS")
+        self.assertEqual(runlog["recon_summary"]["matches"], 1)
+        # Tamper the ST Amounts cell -> audit must now FAIL C2.
+        from openpyxl import load_workbook
+        wb = load_workbook(runlog["recon_workbook"])
+        ws = wb["Matches"]
+        ws.cell(row=4, column=11, value="140.00")
+        wb.save(runlog["recon_workbook"])
+        res = A.audit(self.d, runlog["recon_workbook"], "FHB_MASTER")
+        self.assertEqual(res["checks"]["C2"], "FAIL")
+        self.assertTrue(any("do not sum" in f for f in res["failures"]))
+
+    def test_chatt_account_tokens(self):
+        self.assertEqual(E.infer_account("20260715_FHB_UT_Chatt_Student_Refund_BAI2.csv"),
+                         "FHB_STUDENT_REFUND_UTC")
+        self.assertEqual(E.account_of_bank_name("FHB - UT Chatt"), "FHB_UTC")
+
+
 class TestGuardrails2026(unittest.TestCase):
     """Hard-guardrail regressions (critical review, 2026-07-19): false-match
     and false-candidate holes closed at the pass level."""
