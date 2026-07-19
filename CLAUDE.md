@@ -346,10 +346,17 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   runlog `recon_history_orphans` + `<account>_orphan_findings.md/.json` —
   ADVISORY only; placements provably byte-identical with/without the
   export (tested synthetic + real Master: 136 dup-feed signatures found).
-  Availability is NEVER flipped from history (amount + Created By is not
-  identity — rule 4/R1; the flip needs the ORT intent bridge + owner
-  sign-off).  RR `Reconciliation_Report_*` renderings lack `Created By`
-  and are skipped.
+  RR `Reconciliation_Report_*` renderings lack `Created By` and are skipped.
+  **R2 option C (owner sign-off, 2026-07-19):** availability IS now flipped —
+  but ONLY through SAME-TRANSACTION IDENTITY, never amount.  An open pool ST
+  whose OWN transaction id (`by_txn_id`) is a reconciled leg of an
+  automation-created (ESSADMIN/OIC_SYSTEM_USER) REC group AT MATCHING SIGNED
+  CENTS is an orphan — `available=False`, runlog `recon_history_consumed`
+  (loaded before `build_pool`, mirrors R3's `met_status_overrides`).  A
+  human-reconciled group is left untouched (deliberate reconciliations are
+  not second-guessed).  Proven no-op on real FHB Master (open pool and the
+  reconciled set are cleanly disjoint — 0 id collisions); acts only where a
+  genuine orphan collision exists.
 - **Completeness trio (owner, 2026-07-19):** audit **C11** — every cited
   ST id must exist in a source export (permissive superset: ST/Receipts/
   Payments/MET ids, all files all dates; layered whole-cell → token →

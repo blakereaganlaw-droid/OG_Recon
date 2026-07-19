@@ -1903,6 +1903,74 @@ class TestRoutingHardening(unittest.TestCase):
                 self.assertIn("Group 4", text)
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_recon_history_option_c_orphan_suppression(self):
+        # R2 option C: an open pool ST whose transaction id is a leg of an
+        # ESSADMIN/OIC REC group at matching cents is an orphan — suppressed
+        # from matching (available=False), so the bank line it would have
+        # matched falls to Review instead of a Match.
+        bsl = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                "Account Servicer Reference", "Transaction Type", "Statement",
+                "Transaction Code"),
+               ("2026-07-01", "700.00", "OPENREF9", "", "OPENREF9",
+                "Miscellaneous", "Line 1 , 2026-07-01", "174")]
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              ("2026-06-30", "700.00", "OPENREF9", "900042", "Receivables", "V")]
+        rec = [("Reconciled Group", "Transaction Source", "Reference", "Date",
+                "Amount (USD)", "Transaction Type", "Transaction ID",
+                "Journal", "Journal Batch", "Journal Line", "Batch Name",
+                "Payment File Reference", "Receipt Batch Number",
+                "Cleared Date", "Automatically Reconciled", "Created By",
+                "Creation Date"),
+               ("Group 9", "Statement", "OPENREF9", "2026-06-29", "700.00",
+                "ACH", "", "", "", "", "", "", "", "", "Y", "ESSADMIN", "2026-06-29"),
+               # the SAME transaction id (900042) is a reconciled leg -> orphan
+               ("Group 9", "Receivables", "OPENREF9", "2026-06-29", "700.00",
+                "", "900042", "", "", "", "", "", "", "", "Y", "ESSADMIN", "2026-06-29")]
+
+        def run_it(with_rec):
+            d, out = tempfile.mkdtemp(), tempfile.mkdtemp()
+            _write_xlsx(os.path.join(d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                        [("Exported", bsl)])
+            _write_xlsx(os.path.join(d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                        [("Exported", st)])
+            if with_rec:
+                _write_xlsx(os.path.join(d, "20260710_Oracle_CM_Reconciled_FHB_Master_ST.xlsx"),
+                            [("Exported", rec)])
+            rl = E.run(d, out, present=True)
+            shutil.rmtree(d, ignore_errors=True)
+            return rl
+
+        without = run_it(False)
+        # without the reconciled export the open ST 900042 is a live
+        # reference-tied counterpart -> a Match.
+        self.assertEqual(without["recon_summary"]["matches"], 1)
+        with_rec = run_it(True)
+        self.assertEqual(with_rec["recon_history_consumed"], 1)
+        # the orphan is suppressed -> the line can no longer match it.
+        self.assertEqual(with_rec["recon_summary"]["matches"], 0)
+        self.assertEqual(with_rec["recon_summary"]["reviews"], 1)
+        self.assertEqual(with_rec["audit"]["status"], "PASS")
+
+    def test_recon_history_option_c_human_group_not_suppressed(self):
+        # A HUMAN-reconciled group (not ESSADMIN/OIC) must NOT flip
+        # availability — deliberate reconciliations are not second-guessed.
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source"), ("2026-06-30", "700.00", "R", "900042", "Receivables")]
+        rec = [("Reconciled Group", "Transaction Source", "Reference", "Date",
+                "Amount (USD)", "Transaction Type", "Transaction ID",
+                "Automatically Reconciled", "Created By"),
+               ("Group 9", "Receivables", "R", "2026-06-29", "700.00", "",
+                "900042", "N", "WKITTS2")]
+        rf = E.RoutedFile("RECONCILED", os.path.join(self.d, "r.xlsx"),
+                          "20260710_Oracle_CM_Reconciled_FHB_Master_ST.xlsx", "multi")
+        _write_xlsx(rf.path, [("Exported", rec)])
+        rh = E.load_recon_history([rf], "FHB_MASTER")
+        self.assertIn("900042", rh["by_txn_id"])
+        self.assertNotIn("ESSADMIN", rh["by_txn_id"]["900042"]["creators"])
+        # a pool entry at that id would NOT be flipped (creator not automation)
+        self.assertFalse(rh["by_txn_id"]["900042"]["creators"] & E._AUTOMATION_CREATORS)
+
     def test_recon_history_wrong_account_skipped(self):
         files = [E.RoutedFile("RECONCILED", "/nonexistent/x.xlsx",
                               "20260710_Oracle_CM_Reconciled_FHB_UTC_BSL.xlsx",

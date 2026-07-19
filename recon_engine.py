@@ -653,8 +653,9 @@ class RoutedFile:
 # the owner is told, per file, that the engine will not use it.
 _RECOGNIZED_NOT_LOADED = {
     "ALL_DATA": "lifecycle workbook — Unreconcile2's fuel",
-    "RECONCILED": "reconciled forensic export — advisory recon-history audit "
-                  "only (orphan-doctrine R2), never a pool/matching source",
+    "RECONCILED": "reconciled forensic export — recon-history audit "
+                  "(orphan-doctrine R2): advisory findings + same-transaction-id "
+                  "orphan suppression; never a bank-line matching source",
     "CONTRACTS_INV": "contracts-to-invoices reference — not consumed by the forward passes",
     "GMS_AGING": "sponsored AR aging — not consumed by the forward passes",
     "AR_INVOICES": "AR invoice listing — not consumed by the forward passes",
@@ -1950,6 +1951,35 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 dual_fire_twins += 1
     if dual_fire_twins:
         runlog["dual_fire_twins"] = dual_fire_twins
+
+    # Orphan doctrine R2 option C (owner sign-off, 2026-07-19): the
+    # reconciled-group export is the authoritative reconciliation record.
+    # An open-looking pool ST whose OWN transaction id is a leg of a REC
+    # group created by AUTOMATION (ESSADMIN AutoReconcile / OIC_SYSTEM_USER
+    # creation rule) is an orphan — its money is already consumed, whatever
+    # the UNR ST export says (R3: the reconciliation record outranks the ST
+    # export).  Suppress it so no pass consumes it.  This is SAME-TRANSACTION
+    # identity (exact transaction-id match) guarded by exact signed cents —
+    # NEVER amount alone (rule 4/R1); a human-reconciled group is left
+    # untouched (deliberate reconciliations are not second-guessed).  On the
+    # real FHB Master data the open pool and the reconciled set are cleanly
+    # disjoint (0 id collisions), so this is a proven no-op there; it acts
+    # only where a genuine orphan collision exists.
+    by_txn = (loaded.get("RECON_HISTORY") or {}).get("by_txn_id")
+    if by_txn:
+        r2_consumed = 0
+        for e in pool:
+            if not e.available or e.foreign_account:
+                continue
+            rec = by_txn.get(_norm_id(e.id)) or (
+                _norm_id(e.base_id) and by_txn.get(_norm_id(e.base_id)))
+            if rec and rec["creators"] & _AUTOMATION_CREATORS and \
+                    rec["cents"] == e.amount_cents:
+                e.available = False
+                e.status = "REC"
+                r2_consumed += 1
+        if r2_consumed:
+            runlog["recon_history_consumed"] = r2_consumed
 
     runlog["pool_sizes"] = counts
     runlog["pool_total"] = len(pool)
@@ -4788,6 +4818,7 @@ def load_recon_history(files, account):
         return None
     fine = {}       # (src, cents, znref, ztype) -> {ids, creators, groups}
     coarse = {}     # cents -> {group: {creators, auto, sources}}
+    by_txn = {}     # _norm_id(Transaction ID) -> {creators, cents} (R2 opt C)
     seen_rows = set()
     used_files, notes = [], []
     for rf in files:
@@ -4840,11 +4871,18 @@ def load_recon_history(files, account):
                 tid = N(_cell(r, col["trx_id"]))
                 if tid:
                     f["ids"].add(tid)
+                    # R2 option C same-transaction identity index: this
+                    # transaction is a reconciled leg — a pool ST at this id
+                    # + cents is an orphan (already consumed).
+                    t = by_txn.setdefault(_norm_id(tid),
+                                          {"creators": set(), "cents": amt})
+                    t["creators"].add(creator)
                 f["creators"].add(creator)
                 f["groups"].add(group)
     if not used_files:
         return {"notes": notes} if notes else None
-    return {"fine": fine, "coarse": coarse, "files": used_files, "notes": notes}
+    return {"fine": fine, "coarse": coarse, "by_txn_id": by_txn,
+            "files": used_files, "notes": notes}
 
 
 def recon_history_audit(rh, account, placements, pool, output_dir, runlog):
@@ -5364,13 +5402,15 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     if "ALL_DATA" in by_role:
         runlog["all_data"] = ("present: not loaded (forward-only engine; "
                               "run Unreconcile2 for the backward re-audit)")
-    if "RECONCILED" in by_role:
-        runlog["reconciled_exports"] = (
-            "present: not loaded (forensic reconciled exports — offline "
-            "config-audit / Unreconcile2 fuel, never forward-engine input)")
-
     loaded = load_and_bind(by_role, runlog)
     runlog["stages"].append("bind")
+
+    # Recon-history (orphan doctrine R2) is loaded BEFORE the pool so the
+    # option-C same-transaction-id orphan suppression can run inside
+    # build_pool; the same object feeds the end-of-run advisory audit.
+    rh = load_recon_history(by_role.get("RECONCILED"), account)
+    if rh:
+        loaded["RECON_HISTORY"] = rh
 
     pool = build_pool(loaded, account, runlog)
     runlog["stages"].append("pool")
@@ -5417,9 +5457,10 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     # Recon-history advisory audit (orphan-doctrine R2, 2026-07-19): when a
     # reconciled-group export is staged, cross-reference this run's outcomes
     # against WHO reconciled what before.  Advisory — runs after everything,
-    # reads placements/pool one-way, never gates.
-    rh = load_recon_history(by_role.get("RECONCILED"), account)
-    if recon_history_audit(rh, account, placements, pool, output_dir, runlog):
+    # reads placements/pool one-way, never gates.  (rh was loaded before the
+    # pool for the option-C orphan suppression; reused here.)
+    if recon_history_audit(loaded.get("RECON_HISTORY"), account, placements,
+                           pool, output_dir, runlog):
         runlog["stages"].append("recon_history_audit")
 
     # Write JSON run log (Section 15.7).
