@@ -1635,6 +1635,293 @@ class TestChartOfAccounts(unittest.TestCase):
                          {"rows_seen": 1, "unrecognized_combo": 0, "non_postable_efdp": 0})
 
 
+class TestTieIndexEquivalence(unittest.TestCase):
+    """The 6-gram tie index must equal the brute-force full-pool scan —
+    list equality INCLUDING order (perf refactor, 2026-07-19)."""
+
+    VOCAB = [
+        "HEARTLANDPAY",          # alpha-only >= 6
+        "8036830332",            # digits >= 6
+        "REF-12345",             # 5-digit run with separator
+        "ABC12",                 # short (< 6 znorm)
+        "12345678", "12345679",  # sibling pair (must NOT tie)
+        "PAYMENT REF 887799 X",  # containment source
+        "887799",                # contained token (= 6)
+        "88779",                 # 5 chars — no containment tie
+        "NA", "", "  - ",        # null-ish
+    ]
+
+    def _bsl(self, i, ref, info="", cust=""):
+        return E.make_bsl(f"L{i}", date(2026, 7, 10), 1000 + i, ref, ref,
+                          info, "Miscellaneous", "174", customer_reference=cust)
+
+    def _entry(self, i, ref, cp=""):
+        return E._mk_entry(f"E{i}", 2000 + i, date(2026, 7, 9), ref, cp,
+                           "AR", "UNR", True, "ST")
+
+    def test_index_equals_brute_force(self):
+        bsls, pool = [], []
+        n = 0
+        for ref in self.VOCAB:
+            bsls.append(self._bsl(n, ref)); n += 1
+        # cross-field-only ties: value in info/customer only
+        bsls.append(self._bsl(n, "NA", info="pay HEARTLANDPAY today")); n += 1
+        bsls.append(self._bsl(n, "NA", cust="887799")); n += 1
+        m = 0
+        for ref in self.VOCAB:
+            pool.append(self._entry(m, ref)); m += 1
+        pool.append(self._entry(m, "NA", cp="PAYMENT REF 887799 X")); m += 1
+        pool.append(self._entry(m + 1, "OTHER", cp="HEARTLANDPAY"))
+        idx = E._build_tie_index(bsls, pool)
+        for b in bsls:
+            brute = [e for e in pool if E.cross_reference_tie(b, e)]
+            self.assertEqual(idx[b.line_key], brute, msg=b.recon_reference)
+        # sanity: the fixture actually exercises ties and non-ties
+        total = sum(len(v) for v in idx.values())
+        self.assertGreater(total, 4)
+        self.assertLess(total, len(bsls) * len(pool))
+
+    def test_fast_path_equivalence(self):
+        vals = self.VOCAB + ["  X-887799 ", "8877990"]
+        for a in vals:
+            for b in vals:
+                self.assertEqual(
+                    E.reference_equal(a, b),
+                    E._reference_equal_z(E.znorm(a), E.znorm(b)), msg=(a, b))
+                self.assertEqual(
+                    E.sibling(a, b),
+                    E._sibling_z(E.znorm(a), E.znorm(b)), msg=(a, b))
+
+    def test_bucket_liveness_within_pass(self):
+        # Doctrine 6: an ST consumed by an earlier BSL in the same pass must
+        # be invisible to later BSLs even through the amount buckets.
+        b1 = E.make_bsl("L1", date(2026, 7, 10), 5000, "TIEREF77", "TIEREF77",
+                        "", "Miscellaneous", "174")
+        b2 = E.make_bsl("L2", date(2026, 7, 10), 5000, "TIEREF77", "TIEREF77",
+                        "", "Miscellaneous", "174")
+        e = E._mk_entry("ST1", 5000, date(2026, 7, 9), "TIEREF77", "", "AR",
+                        "UNR", True, "ST")
+        placements = E.forward_reconcile([b1, b2], [e], {}, "FHB_MASTER", {})
+        cited = [p for p in placements if p.st_entries]
+        self.assertEqual(len(cited), 1)
+
+
+class TestRoutingHardening(unittest.TestCase):
+    """File-name protection (critical review, 2026-07-19): reconciled
+    forensic exports must never be misread as open exports; paginated MET
+    shards union; the audit re-parses the SAME file the engine reconciled."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.out = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+        shutil.rmtree(self.out, ignore_errors=True)
+
+    def test_reconciled_exports_never_bind_open_roles(self):
+        cases = {
+            "20260719_Oracle_CM_Reconciled_FHB_UTC_Student_Refund_BSL.xlsx": "RECONCILED",
+            "Reconciled_BSL_FHB_Master.xlsx": "RECONCILED",
+            "20260719_Oracle_CM_Reconciled_System_Transactions_FHB_Master.xlsx": "RECONCILED",
+            "Reconciliation_Report_Reconciliation_History.xlsx": "RECONCILED",
+            "20260719_Oracle_CM_FHB_Master_BSL_UNR.xlsx": "BSL",
+            "20260719_Oracle_CM_FHB_Master_ST_UNR.xlsx": "ST",
+        }
+        for name, want in cases.items():
+            self.assertEqual(E.classify_file(name), want, msg=name)
+
+    def test_met_pagination_union(self):
+        # Two same-date MET page shards are pages of ONE export: unioned,
+        # identical binding required.
+        hdr = ("CET Transaction ID", "Amount", "Transaction Date", "CET Status",
+               "CBE Bank Account Name")
+        _write_xlsx(os.path.join(self.d, "20260710_Oracle_OTBI_MET_FHB_UTC.xlsx"),
+                    [("Sheet1", [hdr,
+                     ("MET1", "100.00", "2026-07-01", "UNR", "FHB - UTC")])])
+        _write_xlsx(os.path.join(self.d, "20260710_Oracle_OTBI_MET_FHB_UTC_2.xlsx"),
+                    [("Sheet1", [hdr,
+                     ("MET2", "200.00", "2026-07-02", "UNR", "FHB - UTC")])])
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_UTC_BSL_UNR.xlsx"),
+                    [("Exported", [("Date", "Amount (USD)", "Reference",
+                                    "Additional Information",
+                                    "Account Servicer Reference",
+                                    "Transaction Type", "Statement",
+                                    "Transaction Code"),
+                                   ("2026-07-01", "10.00", "R1", "", "R1",
+                                    "Miscellaneous", "L1", "174")])])
+        by_role = E.route_folder(self.d)
+        loaded = E.load_and_bind(by_role, {})
+        met = loaded["MET"]
+        ids = {E.N(r[met["map"]["trx_id"]]) for r in met["rows"][met["header_index"] + 1:]}
+        self.assertEqual(ids, {"MET1", "MET2"})
+
+    def test_audit_reparse_ignores_newer_all_bsl_and_reconciled(self):
+        bsl_rows = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                     "Account Servicer Reference", "Transaction Type", "Statement",
+                     "Transaction Code"),
+                    ("2026-07-01", "10.00", "R1", "", "R1", "Miscellaneous",
+                     "Line 1 , 2026-07-01", "174")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl_rows)])
+        # NEWER-dated all-accounts export + a reconciled forensic export:
+        # both carry 'bsl' in the name; neither may win the C1 re-parse.
+        big = [bsl_rows[0]] + [
+            ("2026-07-0%d" % (i % 9 + 1), "99.00", "X", "", "X",
+             "Miscellaneous", f"Line {i} x", "174") for i in range(5)]
+        _write_xlsx(os.path.join(self.d, "20260720_Oracle_OTBI_All_BSL_UNR.xlsx"),
+                    [("Exported", big)])
+        _write_xlsx(os.path.join(self.d, "20260721_Reconciled_BSL_FHB_Master.xlsx"),
+                    [("Exported", big)])
+        bag = A._reparse_source_bsls(self.d)
+        self.assertEqual(len(bag), 1)          # the single account line only
+
+    def test_audit_c2_resums_match_amounts(self):
+        # A Match whose cited ST amounts do not sum to the bank line must
+        # fail C2 — re-summed from the workbook itself, no pool needed.
+        bsl = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                "Account Servicer Reference", "Transaction Type", "Statement",
+                "Transaction Code"),
+               ("2026-07-01", "150.00", "REF88001", "", "REF88001",
+                "Miscellaneous", "Line 1 , 2026-07-01", "174")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              ("2026-06-30", "150.00", "REF88001", 601, "Receivables", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS")
+        self.assertEqual(runlog["recon_summary"]["matches"], 1)
+        # Tamper the ST Amounts cell -> audit must now FAIL C2.
+        from openpyxl import load_workbook
+        wb = load_workbook(runlog["recon_workbook"])
+        ws = wb["Matches"]
+        ws.cell(row=4, column=11, value="140.00")
+        wb.save(runlog["recon_workbook"])
+        res = A.audit(self.d, runlog["recon_workbook"], "FHB_MASTER")
+        self.assertEqual(res["checks"]["C2"], "FAIL")
+        self.assertTrue(any("do not sum" in f for f in res["failures"]))
+
+    def test_chatt_account_tokens(self):
+        self.assertEqual(E.infer_account("20260715_FHB_UT_Chatt_Student_Refund_BAI2.csv"),
+                         "FHB_STUDENT_REFUND_UTC")
+        self.assertEqual(E.account_of_bank_name("FHB - UT Chatt"), "FHB_UTC")
+
+
+class TestGuardrails2026(unittest.TestCase):
+    """Hard-guardrail regressions (critical review, 2026-07-19): false-match
+    and false-candidate holes closed at the pass level."""
+
+    def _fwd(self, bsls, pool):
+        runlog = {}
+        return E.forward_reconcile(bsls, pool, {}, "FHB_MASTER", runlog)
+
+    def _one(self, placements, line_key):
+        return next(p for p in placements if p.bsl.line_key == line_key)
+
+    def test_sibling_reference_is_conflict_not_candidate(self):
+        # Rule 7: equal-length numeric refs differing in the last 1-2 digits
+        # are CONFLICTS — barred even from the amount-only Candidate lane.
+        b = E.make_bsl("L1", date(2026, 7, 10), 12345, "12345678", "12345678",
+                       "", "Miscellaneous", "174")
+        e = E._mk_entry("ST1", 12345, date(2026, 7, 9), "12345679", "", "AR",
+                        "UNR", True, "ST")
+        p = self._one(self._fwd([b], [e]), "L1")
+        self.assertEqual(p.kind, E.REVIEW, msg=p.explanation)
+
+    def test_distinctive_match_demoted_by_pool_twin(self):
+        b = E.make_bsl("L1", date(2026, 7, 10), 245546969, "NA", "NA",
+                       "", "Miscellaneous", "174")
+        open_st = E._mk_entry("ST1", 245546969, date(2026, 7, 9), "REFA", "",
+                              "AR", "UNR", True, "ST")
+        # control: unique across the whole pool -> distinctive Match
+        p = self._one(self._fwd([b], [open_st]), "L1")
+        self.assertEqual(p.kind, E.MATCH)
+        self.assertIn("DISTINCTIVE_AMOUNT", p.codes)
+        # a CLOSED twin at the same signed cents kills pool-side uniqueness
+        closed_twin = E._mk_entry("ST2", 245546969, date(2026, 6, 1), "REFB",
+                                  "", "AR", "REC", False, "ST")
+        p = self._one(self._fwd([b], [open_st, closed_twin]), "L1")
+        self.assertEqual(p.kind, E.CANDIDATE, msg=p.explanation)
+        self.assertNotIn("DISTINCTIVE_AMOUNT", p.codes)
+        # a foreign-shadow twin kills it too
+        shadow = E._mk_entry("ST3", 245546969, date(2026, 7, 8), "REFC", "",
+                             "EXT", "UNR", True, "MET")
+        shadow.foreign_account = "FHB_UTHSC"
+        shadow.available = False
+        p = self._one(self._fwd([b], [open_st, shadow]), "L1")
+        self.assertEqual(p.kind, E.CANDIDATE, msg=p.explanation)
+
+    def test_pm_weak_digit_tie_rejected(self):
+        # A 5-digit-run coincidence in the addenda must NOT reroute money to
+        # a foreign account; a znorm >= 6 reference tie still does.
+        weak = E.make_bsl("L1", date(2026, 7, 10), 7099266, "NA", "NA",
+                          "ZIP 38105 REMIT", "Automated clearing house", "142")
+        f = E._mk_entry("300045836", 7099266, date(2026, 7, 9), "38105",
+                        "City of Memphis", "AR", "UNR", True, "RECEIPTS")
+        f.foreign_account = "FHB_MASTER_X"
+        f.available = False
+        p = self._one(self._fwd([weak], [f]), "L1")
+        self.assertEqual(p.kind, E.REVIEW, msg=p.explanation)
+        strong = E.make_bsl("L2", date(2026, 7, 10), 7099266, "300045836",
+                            "300045836", "", "Automated clearing house", "142")
+        f2 = E._mk_entry("300045836", 7099266, date(2026, 7, 9), "300045836",
+                         "City of Memphis", "AR", "UNR", True, "RECEIPTS")
+        f2.foreign_account = "FHB_MASTER_X"
+        f2.available = False
+        p = self._one(self._fwd([strong], [f2]), "L2")
+        self.assertEqual(p.kind, E.MISDIRECTED, msg=p.explanation)
+
+    def test_pm_never_cites_one_foreign_entry_twice(self):
+        mk = lambda k: E.make_bsl(k, date(2026, 7, 10), 7099266, "300045836",
+                                  "300045836", "", "Automated clearing house", "142")
+        f = E._mk_entry("300045836", 7099266, date(2026, 7, 9), "300045836",
+                        "City of Memphis", "AR", "UNR", True, "RECEIPTS")
+        f.foreign_account = "FHB_MASTER_X"
+        f.available = False
+        placements = self._fwd([mk("L1"), mk("L2")], [f])
+        kinds = sorted(p.kind for p in placements)
+        self.assertEqual(kinds, sorted([E.MISDIRECTED, E.REVIEW]))
+
+    def test_p7_spn_screens(self):
+        # Uncorroborated SPN singleton no longer produces a P7 Candidate; the
+        # line falls through to the screened later lanes.
+        b = E.make_bsl("L1", date(2026, 7, 10), 55555, "NA", "NA",
+                       "", "Miscellaneous", "174")
+        e = E._mk_entry("SPN-1", 55555, date(2026, 7, 9), "OTHERREF", "",
+                        "AR", "UNR", True, "RECEIPTS")
+        e.spn = "260709650"
+        p = self._one(self._fwd([b], [e]), "L1")
+        self.assertNotEqual(p.pass_name, "P7_spn", msg=p.explanation)
+        # Corroborated but 12+ days stale External member: barred from P7.
+        b2 = E.make_bsl("L2", date(2026, 7, 30), 55555, "260709650",
+                        "260709650", "", "Miscellaneous", "174")
+        e2 = E._mk_entry("SPN-2", 55555, date(2026, 7, 1), "260709650", "",
+                         "EXT", "UNR", True, "MET")
+        e2.spn = "260709650"
+        p = self._one(self._fwd([b2], [e2]), "L2")
+        self.assertNotEqual((p.pass_name, p.kind), ("P7_spn", E.MATCH),
+                            msg=p.explanation)
+
+    def test_p4_competing_equal_sum_group_is_candidate(self):
+        # Whole tied set sums exactly AND a proper sub-cluster also sums
+        # exactly (the rest is a reversal pair netting zero): ambiguous ->
+        # AMBIGUOUS_GROUP Candidate, never a Match.
+        b = E.make_bsl("L1", date(2026, 7, 10), 10000, "GRPREF99", "GRPREF99",
+                       "", "Miscellaneous", "174")
+        def rc(i, cents, cp):
+            e = E._mk_entry(f"R{i}", cents, date(2026, 7, 9), "GRPREF99", cp,
+                            "AR", "UNR", True, "RECEIPTS")
+            return e
+        pool = [rc(1, 6000, "Payer X"), rc(2, 4000, "Payer X"),
+                rc(3, -4000, "Payer Y"), rc(4, 4000, "Payer Y")]
+        p = self._one(self._fwd([b], pool), "L1")
+        self.assertEqual(p.kind, E.CANDIDATE, msg=p.explanation)
+        self.assertIn("AMBIGUOUS_GROUP", p.codes)
+
+
 class TestCMConfig(unittest.TestCase):
     """CM Configuration exports (owner, 2026-07-19): the five CFG_* loaders,
     the Oracle-LIKE simulator, and the raw BAI2 .txt reader."""

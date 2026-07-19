@@ -309,13 +309,25 @@ def _newest_date_key(name):
     return best
 
 
+def _is_all_accounts_bsl(low):
+    """Mirror the engine's ALL_BSL routing: a whole-segment 'all' beside
+    'bsl' marks the all-accounts export (Oracle_OTBI_All_BSL_UNR), which the
+    engine never reconciles — the audit must never re-parse it as the
+    account BSL (it would falsely fail C1 the moment its date stamp is
+    newer than the account export's)."""
+    segs = re.split(r"[^a-z0-9]+", low)
+    return "all" in segs
+
+
 def _reparse_source_bsls(input_dir):
     """Re-read the BSL source and return a multiset of (date, cents)."""
     candidates = []
     for name in sorted(os.listdir(input_dir)):
         low = name.lower()
         if "bsl" in low and "all_data" not in low and "enriched" not in low \
-                and "crossref" not in low and low.endswith((".xlsx", ".xlsm", ".csv", ".xlsb")):
+                and "crossref" not in low and "reconcil" not in low \
+                and not _is_all_accounts_bsl(low) \
+                and low.endswith((".xlsx", ".xlsm", ".csv", ".xlsb")):
             candidates.append(name)
     if not candidates:
         return None
@@ -351,8 +363,12 @@ def _reparse_met_pairs(input_dir):
     for name in sorted(os.listdir(input_dir)):
         low = name.lower()
         # 'oracle_otbi' names are MET exports even without the MET token
-        # (mirrors the engine's router).
-        if ("met" in low or "oracle_otbi" in low) and low.endswith((".xlsx", ".xlsm", ".csv", ".xlsb")):
+        # (mirrors the engine's router) — but the all-accounts BSL export
+        # (Oracle_OTBI_All_BSL_UNR) and reconciled forensic reports are not
+        # MET sources and are skipped, as the engine's router skips them.
+        if ("met" in low or "oracle_otbi" in low) \
+                and "bsl" not in low and "reconcil" not in low \
+                and low.endswith((".xlsx", ".xlsm", ".csv", ".xlsb")):
             path = os.path.join(input_dir, name)
             rows = _read_table(path)
             # Native DEPOSIT_ID / RECEIPT_ID columns (some exports carry the
@@ -468,28 +484,60 @@ def audit(input_dir, recon_path, account):
                             f"multiset match={_multiset(src_bag) == _multiset(out_bag)}")
 
     # C2 Match signed-cent equality — the cited ST group sums to the BSL.
-    # (We can only re-verify via the numbers present in the row; the deduped ST
-    #  group is opaque here, so we assert the row is a Match with an ST number
-    #  and a BSL amount; deep re-sum requires the pool, out of audit scope.)
+    # Strengthened (critical review, 2026-07-19): the workbook itself carries
+    # the ST Amount(s) column, so the audit RE-SUMS every Match in signed
+    # cents with zero pool access — a Match whose cited amounts do not sum to
+    # the bank line is a defect no matter how it was produced.
     c2_ok = True
     for r in match_rows:
-        if _cents(r[COL_AMT]) is None or not _N(r[COL_ST_NUMS]):
+        amt = _cents(r[COL_AMT])
+        if amt is None or not _N(r[COL_ST_NUMS]):
             c2_ok = False
             failures.append(f"C2: Match row missing amount or ST number: {r[:5]}")
+            continue
+        st_amts = [_cents(p) for p in _split_multi(r[COL_ST_AMTS])]
+        if st_amts and None not in st_amts and sum(st_amts) != amt:
+            c2_ok = False
+            failures.append(
+                f"C2: Match ST amounts do not sum to the BSL "
+                f"({sum(st_amts)} != {amt}): {r[:3]}")
     # Owner doctrine: a Candidate without an ST citation must not exist.
     for r in cand_rows:
         if not _N(r[COL_ST_NUMS]):
             c2_ok = False
             failures.append(f"C2: Candidate row cites no ST: {r[:3]}")
     # Misdirected rows (owner hard guardrail, 2026-07-18) must cite the
-    # foreign-account entry AND name the account it is booked to.
+    # foreign-account entry AND name the account it is booked to — and the
+    # named account must be a DIFFERENT one than this run's (2026-07-19).
     for r in misdir_rows:
         if not _N(r[COL_ST_NUMS]):
             c2_ok = False
             failures.append(f"C2: Misdirected row cites no ST: {r[:3]}")
-        if "booked to" not in _N(r[COL_EXPL]).lower():
+        expl_low = _N(r[COL_EXPL]).lower()
+        if "booked to" not in expl_low:
             c2_ok = False
             failures.append(f"C2: Misdirected row does not name the foreign account: {r[:3]}")
+        elif account and f"booked to {account.lower()}" in expl_low:
+            c2_ok = False
+            failures.append(
+                f"C2: Misdirected row claims the entry is booked to THIS "
+                f"account ({account}) — not misdirected: {r[:3]}")
+    # Confidence vocabulary (2026-07-19): every placed row carries one of the
+    # three levels, and a distinctive-amount Match is never High (the owner
+    # exception grants Medium at most).
+    for label, rows_ in (("Match", match_rows), ("Candidate", cand_rows),
+                         ("Misdirected", misdir_rows)):
+        for r in rows_:
+            conf = _N(r[15])
+            if conf not in ("High", "Medium", "Low"):
+                c2_ok = False
+                failures.append(f"C2: {label} row carries confidence "
+                                f"{conf!r} (not High/Medium/Low): {r[:3]}")
+            elif conf == "High" and "DISTINCTIVE_AMOUNT" in _N(r[COL_EXPL]):
+                c2_ok = False
+                failures.append(
+                    f"C2: DISTINCTIVE_AMOUNT placement at High confidence "
+                    f"(owner exception caps it at Medium): {r[:3]}")
     checks["C2"] = "PASS" if c2_ok else "FAIL"
 
     # C3 ST non-reuse across Matches + Candidates + Misdirected.

@@ -144,6 +144,16 @@ def collect_sources(paths):
     return spreadsheets, ignored
 
 
+def _ignored_file_warnings(ignored):
+    """Doctrine rule 3 (never silently drop): a non-stageable FILE in the
+    upload — a misnamed raw bank transmission, a PDF, a stray .txt without a
+    BAI token — gets a console warning, not just a manifest entry."""
+    return [f"{os.path.basename(ig)} is not a stageable file type "
+            "(spreadsheet or BAI2 .txt); it was NOT read — rename it with "
+            "the proper tokens if it is real data"
+            for ig in ignored if os.path.isfile(ig)]
+
+
 def _skipped_dir_warnings(ignored):
     """Folders inside the upload are not scanned (one level deep, matching the
     engine's route_folder) — but a folder holding spreadsheets must be called
@@ -300,7 +310,8 @@ def perform_run(paths, runs_root="./runs", run_id=None, strip_prefix=True,
     os.makedirs(run_dir)
     try:
         entries = stage(spreadsheets, input_dir, strip_prefix)
-        warnings = preflight(entries) + _skipped_dir_warnings(ignored)
+        warnings = (preflight(entries) + _skipped_dir_warnings(ignored)
+                    + _ignored_file_warnings(ignored))
         manifest_path = write_manifest(run_dir, run_id, argv or [], entries,
                                        ignored, warnings)
     except BaseException:
