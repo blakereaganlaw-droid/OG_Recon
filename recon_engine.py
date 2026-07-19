@@ -2318,6 +2318,17 @@ def amount_distinctive(c):
     return c % 100 != 0 and abs(c) >= 100000
 
 
+def _pool_amount_twin_free(amount, pool_amount_counts, cited):
+    """Hard guardrail (adversarial review, 2026-07-19): the distinctive-amount
+    exception claims the amount is UNIQUE on the pool side — so every pool
+    entry at that signed-cents value must be among the cited entries.  A
+    closed, foreign-shadow, or out-of-band open twin at the same amount means
+    the digit combination is not rare (the money may already be consumed, or
+    belong to another account) and amount-only evidence stays a Candidate."""
+    return pool_amount_counts.get(amount, 0) == \
+        sum(1 for e in cited if e.amount_cents == amount)
+
+
 def _is_convera(bsl):
     return "CONVERA" in _norm_header(bsl.additional_info) + _norm_header(bsl.line_info)
 
@@ -2495,6 +2506,14 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     bsl_amount_counts = {}
     for b in bsls:
         bsl_amount_counts[b.amount_cents] = bsl_amount_counts.get(b.amount_cents, 0) + 1
+    # Whole-pool amount census (hard guardrail, 2026-07-19): the distinctive-
+    # amount lanes must prove the amount is rare across the ENTIRE pool —
+    # a closed, foreign-shadow, or out-of-band twin at the same signed cents
+    # means the digit combination is NOT unique and amount-only evidence
+    # stays insufficient (rule 4).
+    pool_amount_counts = {}
+    for e in pool:
+        pool_amount_counts[e.amount_cents] = pool_amount_counts.get(e.amount_cents, 0) + 1
 
     # ---- P2 DATA_FEED_ERROR sweep -----------------------------------
     feed_errors = _p2_data_feed_errors(loaded, account)
@@ -2783,8 +2802,17 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             else:
                 if payer_contradiction(bsl, group):
                     continue
+                if all(_type_incongruent_uncorroborated(bsl, e) for e in group):
+                    continue  # Misc BSL vs all-electronic group, amount-only
+                # Type-incongruence (8e) is checked BEFORE the distinctive
+                # lane (adversarial review, 2026-07-19): doctrine names BOTH
+                # amount-only lanes (P9b + P4 deposit groups) — a distinctive
+                # amount is still amount-only evidence and never overrides an
+                # electronic-vs-Miscellaneous incongruence with zero ties.
                 if amount_distinctive(bsl.amount_cents) and \
                         bsl_amount_counts.get(bsl.amount_cents) == 1 and \
+                        _pool_amount_twin_free(bsl.amount_cents,
+                                               pool_amount_counts, group) and \
                         not correction:
                     place(bsl, MATCH, CONF_MEDIUM, _sorted(group),
                           ["DISTINCTIVE_AMOUNT"],
@@ -2795,8 +2823,6 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                           "doctrine).",
                           "P4_deposit_group")
                     continue
-                if all(_type_incongruent_uncorroborated(bsl, e) for e in group):
-                    continue  # Misc BSL vs all-electronic group, amount-only
                 codes = ["AMOUNT_ONLY_GROUP"]
                 note = ""
                 if correction:
@@ -2994,6 +3020,10 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 continue  # Misc BSL vs electronic ST, amount-only (owner 2026-07-13)
             if _check_number_conflict(bsl, e):
                 continue  # check rails: different check number = conflict (R8)
+            if sibling(bsl.recon_reference, e.reference):
+                continue  # sibling references are CONFLICTS (rule 7) — like
+                #           R8's check rails, a conflict bars even the
+                #           amount-only Candidate (hard guardrail 2026-07-19)
             elig.append(e)
         if not elig:
             continue
@@ -3003,6 +3033,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             ordered = _sorted(inband)
             if len(inband) == 1 and amount_distinctive(bsl.amount_cents) and \
                     bsl_amount_counts.get(bsl.amount_cents) == 1 and \
+                    _pool_amount_twin_free(bsl.amount_cents,
+                                           pool_amount_counts, [ordered[0]]) and \
                     not _is_deposit_correction(bsl):
                 place(bsl, MATCH, CONF_MEDIUM, [ordered[0]],
                       ["DISTINCTIVE_AMOUNT"],
@@ -3055,13 +3087,23 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         for bsl in unplaced():
             hits = []
             for e in foreign:
+                if e.id in ledger.barred():
+                    continue  # already cited by an earlier line's placement —
+                    #           one foreign entry never explains two bank lines
                 if not _amount_matches(bsl, e):
                     continue
                 if e.source in JOURNAL_SOURCES:
                     continue
                 if not _type_gate_ok(bsl, e):
                     continue
-                if not (cross_reference_tie(bsl, e) or cross_digit_tie(bsl, e)):
+                # Hard guardrail (adversarial review, 2026-07-19): a workbook
+                # placement to a FOREIGN account requires the strong tie —
+                # znorm equality/containment >= 6 chars (cross_reference_tie),
+                # the same standard as P9c and _reverse_misdirected.  The
+                # 5-digit-run grid tie (cross_digit_tie) can fire on a ZIP,
+                # date fragment, or truncated trace in the addenda and is NOT
+                # acceptable evidence for rerouting money across accounts.
+                if not cross_reference_tie(bsl, e):
                     continue
                 # No payer_contradiction screen here: it is consulted only by
                 # zero-corroboration placements (owner doctrine — reference
@@ -3369,7 +3411,22 @@ def _p4_reference_group(bsl, pool, ledger):
         return None, [], False
     total_open = sum(e.amount_cents for e in open_members)
     if total_open == bsl.amount_cents:
-        return open_members, [], False
+        # Competing equal-sum detection (hard guardrail, 2026-07-19 — this
+        # branch was specified but never implemented): when a PROPER
+        # sub-cluster of the tied set (clustered by deposit id, else payer,
+        # else the entry itself) ALSO sums exactly to the BSL, the remainder
+        # nets to zero — reversal-pair noise inside the group — and which
+        # assembly is the true counterpart is ambiguous.  Ambiguity is a
+        # Candidate, never a Match (rule 4: evidence must pick ONE story).
+        clusters = {}
+        for e in open_members:
+            key = ("d", e.deposit_id) if e.deposit_id else (
+                ("c", znorm(e.counterparty)) if N(e.counterparty) else ("i", e.id))
+            clusters.setdefault(key, []).append(e)
+        competing = len(clusters) > 1 and any(
+            sum(m.amount_cents for m in ms) == bsl.amount_cents
+            for ms in clusters.values())
+        return open_members, [], competing
     # Try open + closed sum (auto-rec-stranded case).
     total_all = sum(e.amount_cents for e in uniq)
     if total_all == bsl.amount_cents and closed_members:
@@ -3434,7 +3491,12 @@ def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account=None):
 
 
 def _p7_spn(unplaced, place, pool, ledger, loaded, runlog):
-    """Receivables SPN group (Section 9 P7)."""
+    """Receivables SPN group (Section 9 P7).  Hard-guardrailed (adversarial
+    review, 2026-07-19): P7 runs BEFORE the screened amount-only lanes, so it
+    applies the same screens they do — type gate, stale ceiling, directional
+    date plausibility — and its zero-corroboration singleton path is GONE
+    (an uncorroborated single receipt falls through to P9b, which screens
+    payer contradiction and type incongruence before any Candidate)."""
     for bsl in unplaced():
         if bsl.lane == LANE_MERCHANT:
             continue
@@ -3443,25 +3505,43 @@ def _p7_spn(unplaced, place, pool, ledger, loaded, runlog):
         for e in _open_entries(pool, ledger):
             if not e.spn:
                 continue
+            if not _type_gate_ok(bsl, e):
+                continue          # Convera->AP, card-vs-check bars (rule 8c)
+            if _ext_stale_barred(bsl, e):
+                continue          # 12+ days stale External member (rule 8d)
             root = _spn_root(e.spn)
             by_spn.setdefault(root, []).append(e)
         placed = False
         for root, members in sorted(by_spn.items()):
-            # corroborator: shared SPN root AND (reference tie to BSL OR single member)
+            # corroborator: shared SPN root AND a reference tie to the BSL —
+            # bare membership never suffices (rule 4).
             corroborated = reference_tie(bsl.recon_reference, root) or \
                 any(reference_tie(bsl.recon_reference, e.reference) or
                     reference_equal(bsl.recon_reference, e.reference) for e in members)
+            if not corroborated:
+                continue
             total = sum(e.amount_cents for e in members)
-            if total == bsl.amount_cents and (corroborated or len(members) == 1):
-                kind = MATCH if corroborated else CANDIDATE
-                place(bsl, kind, CONF_HIGH if corroborated else CONF_MEDIUM,
-                      _sorted(members),
-                      [] if corroborated else ["INCOMPLETE_REFERENCE_SUPPORT"],
-                      f"SPN group {root} of {len(members)} receipt(s) sums to BSL"
-                      + ("; corroborated." if corroborated else "; amount-only."),
+            if total != bsl.amount_cents:
+                continue
+            plausible = all(date_ok_directional(signed_lag(bsl.date, e.date))
+                            for e in members)
+            if not plausible:
+                # Same shape as P4's stale-group handling: corroborated but
+                # out of band is a flagged Candidate, never a Match.
+                place(bsl, CANDIDATE, CONF_MEDIUM, _sorted(members),
+                      ["DATE_CONFLICT"],
+                      f"SPN group {root} of {len(members)} receipt(s) sums to "
+                      "BSL with a reference tie, but a member date is out of "
+                      "band.",
                       "P7_spn")
                 placed = True
                 break
+            place(bsl, MATCH, CONF_HIGH, _sorted(members), [],
+                  f"SPN group {root} of {len(members)} receipt(s) sums to BSL"
+                  "; corroborated.",
+                  "P7_spn")
+            placed = True
+            break
         if placed:
             continue
     runlog["p7_spn"] = "ran"
@@ -3763,7 +3843,11 @@ def _assert_conservation(bsls, placements):
     for p in placements:
         assert p.bsl.line_key not in seen_lines, f"BSL {p.bsl.line_key} placed twice"
         seen_lines.add(p.bsl.line_key)
-        if p.kind in (MATCH, CANDIDATE):
+        # MISDIRECTED included (hard guardrail, 2026-07-19): one foreign
+        # entry must never be cited as the counterpart of two bank lines —
+        # the audit's C3 already spans the Misdirected tab; the engine's own
+        # invariant now matches it.
+        if p.kind in (MATCH, CANDIDATE, MISDIRECTED):
             for e in p.st_entries:
                 assert e.id not in consumed, (
                     f"ST {e.id} consumed twice ({consumed.get(e.id)} and {p.pass_name})")

@@ -1635,6 +1635,118 @@ class TestChartOfAccounts(unittest.TestCase):
                          {"rows_seen": 1, "unrecognized_combo": 0, "non_postable_efdp": 0})
 
 
+class TestGuardrails2026(unittest.TestCase):
+    """Hard-guardrail regressions (critical review, 2026-07-19): false-match
+    and false-candidate holes closed at the pass level."""
+
+    def _fwd(self, bsls, pool):
+        runlog = {}
+        return E.forward_reconcile(bsls, pool, {}, "FHB_MASTER", runlog)
+
+    def _one(self, placements, line_key):
+        return next(p for p in placements if p.bsl.line_key == line_key)
+
+    def test_sibling_reference_is_conflict_not_candidate(self):
+        # Rule 7: equal-length numeric refs differing in the last 1-2 digits
+        # are CONFLICTS — barred even from the amount-only Candidate lane.
+        b = E.make_bsl("L1", date(2026, 7, 10), 12345, "12345678", "12345678",
+                       "", "Miscellaneous", "174")
+        e = E._mk_entry("ST1", 12345, date(2026, 7, 9), "12345679", "", "AR",
+                        "UNR", True, "ST")
+        p = self._one(self._fwd([b], [e]), "L1")
+        self.assertEqual(p.kind, E.REVIEW, msg=p.explanation)
+
+    def test_distinctive_match_demoted_by_pool_twin(self):
+        b = E.make_bsl("L1", date(2026, 7, 10), 245546969, "NA", "NA",
+                       "", "Miscellaneous", "174")
+        open_st = E._mk_entry("ST1", 245546969, date(2026, 7, 9), "REFA", "",
+                              "AR", "UNR", True, "ST")
+        # control: unique across the whole pool -> distinctive Match
+        p = self._one(self._fwd([b], [open_st]), "L1")
+        self.assertEqual(p.kind, E.MATCH)
+        self.assertIn("DISTINCTIVE_AMOUNT", p.codes)
+        # a CLOSED twin at the same signed cents kills pool-side uniqueness
+        closed_twin = E._mk_entry("ST2", 245546969, date(2026, 6, 1), "REFB",
+                                  "", "AR", "REC", False, "ST")
+        p = self._one(self._fwd([b], [open_st, closed_twin]), "L1")
+        self.assertEqual(p.kind, E.CANDIDATE, msg=p.explanation)
+        self.assertNotIn("DISTINCTIVE_AMOUNT", p.codes)
+        # a foreign-shadow twin kills it too
+        shadow = E._mk_entry("ST3", 245546969, date(2026, 7, 8), "REFC", "",
+                             "EXT", "UNR", True, "MET")
+        shadow.foreign_account = "FHB_UTHSC"
+        shadow.available = False
+        p = self._one(self._fwd([b], [open_st, shadow]), "L1")
+        self.assertEqual(p.kind, E.CANDIDATE, msg=p.explanation)
+
+    def test_pm_weak_digit_tie_rejected(self):
+        # A 5-digit-run coincidence in the addenda must NOT reroute money to
+        # a foreign account; a znorm >= 6 reference tie still does.
+        weak = E.make_bsl("L1", date(2026, 7, 10), 7099266, "NA", "NA",
+                          "ZIP 38105 REMIT", "Automated clearing house", "142")
+        f = E._mk_entry("300045836", 7099266, date(2026, 7, 9), "38105",
+                        "City of Memphis", "AR", "UNR", True, "RECEIPTS")
+        f.foreign_account = "FHB_MASTER_X"
+        f.available = False
+        p = self._one(self._fwd([weak], [f]), "L1")
+        self.assertEqual(p.kind, E.REVIEW, msg=p.explanation)
+        strong = E.make_bsl("L2", date(2026, 7, 10), 7099266, "300045836",
+                            "300045836", "", "Automated clearing house", "142")
+        f2 = E._mk_entry("300045836", 7099266, date(2026, 7, 9), "300045836",
+                         "City of Memphis", "AR", "UNR", True, "RECEIPTS")
+        f2.foreign_account = "FHB_MASTER_X"
+        f2.available = False
+        p = self._one(self._fwd([strong], [f2]), "L2")
+        self.assertEqual(p.kind, E.MISDIRECTED, msg=p.explanation)
+
+    def test_pm_never_cites_one_foreign_entry_twice(self):
+        mk = lambda k: E.make_bsl(k, date(2026, 7, 10), 7099266, "300045836",
+                                  "300045836", "", "Automated clearing house", "142")
+        f = E._mk_entry("300045836", 7099266, date(2026, 7, 9), "300045836",
+                        "City of Memphis", "AR", "UNR", True, "RECEIPTS")
+        f.foreign_account = "FHB_MASTER_X"
+        f.available = False
+        placements = self._fwd([mk("L1"), mk("L2")], [f])
+        kinds = sorted(p.kind for p in placements)
+        self.assertEqual(kinds, sorted([E.MISDIRECTED, E.REVIEW]))
+
+    def test_p7_spn_screens(self):
+        # Uncorroborated SPN singleton no longer produces a P7 Candidate; the
+        # line falls through to the screened later lanes.
+        b = E.make_bsl("L1", date(2026, 7, 10), 55555, "NA", "NA",
+                       "", "Miscellaneous", "174")
+        e = E._mk_entry("SPN-1", 55555, date(2026, 7, 9), "OTHERREF", "",
+                        "AR", "UNR", True, "RECEIPTS")
+        e.spn = "260709650"
+        p = self._one(self._fwd([b], [e]), "L1")
+        self.assertNotEqual(p.pass_name, "P7_spn", msg=p.explanation)
+        # Corroborated but 12+ days stale External member: barred from P7.
+        b2 = E.make_bsl("L2", date(2026, 7, 30), 55555, "260709650",
+                        "260709650", "", "Miscellaneous", "174")
+        e2 = E._mk_entry("SPN-2", 55555, date(2026, 7, 1), "260709650", "",
+                         "EXT", "UNR", True, "MET")
+        e2.spn = "260709650"
+        p = self._one(self._fwd([b2], [e2]), "L2")
+        self.assertNotEqual((p.pass_name, p.kind), ("P7_spn", E.MATCH),
+                            msg=p.explanation)
+
+    def test_p4_competing_equal_sum_group_is_candidate(self):
+        # Whole tied set sums exactly AND a proper sub-cluster also sums
+        # exactly (the rest is a reversal pair netting zero): ambiguous ->
+        # AMBIGUOUS_GROUP Candidate, never a Match.
+        b = E.make_bsl("L1", date(2026, 7, 10), 10000, "GRPREF99", "GRPREF99",
+                       "", "Miscellaneous", "174")
+        def rc(i, cents, cp):
+            e = E._mk_entry(f"R{i}", cents, date(2026, 7, 9), "GRPREF99", cp,
+                            "AR", "UNR", True, "RECEIPTS")
+            return e
+        pool = [rc(1, 6000, "Payer X"), rc(2, 4000, "Payer X"),
+                rc(3, -4000, "Payer Y"), rc(4, 4000, "Payer Y")]
+        p = self._one(self._fwd([b], pool), "L1")
+        self.assertEqual(p.kind, E.CANDIDATE, msg=p.explanation)
+        self.assertIn("AMBIGUOUS_GROUP", p.codes)
+
+
 class TestCMConfig(unittest.TestCase):
     """CM Configuration exports (owner, 2026-07-19): the five CFG_* loaders,
     the Oracle-LIKE simulator, and the raw BAI2 .txt reader."""
