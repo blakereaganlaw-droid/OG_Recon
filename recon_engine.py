@@ -649,32 +649,85 @@ class RoutedFile:
     sheet_hint: str
 
 
-def route_folder(input_dir) -> dict:
+# Roles the router recognizes but the FORWARD engine never reads — named so
+# the owner is told, per file, that the engine will not use it.
+_RECOGNIZED_NOT_LOADED = {
+    "ALL_DATA": "lifecycle workbook — Unreconcile2's fuel",
+    "RECONCILED": "reconciled forensic export — offline config-audit / Unreconcile2 fuel",
+    "CONTRACTS_INV": "contracts-to-invoices reference — not consumed by the forward passes",
+    "GMS_AGING": "sponsored AR aging — not consumed by the forward passes",
+    "AR_INVOICES": "AR invoice listing — not consumed by the forward passes",
+    "AR_UNAPPLIED_SUMMARY": "unapplied summary — not consumed by the forward passes",
+    "GMS_SPONSOR_MAP": "sponsor map — not consumed by the forward passes",
+    "RELATIONSHIP_MAP": "relationship/rosetta doc — reference only",
+}
+
+
+def _skip_notice(name, reason, suggestion=""):
+    """Owner hard requirement (2026-07-19): the MOMENT the router decides to
+    ignore a file because of its NAME, say so — on stderr, with the reason
+    and a rename suggestion.  Nothing is ever ignored silently."""
+    msg = f"IGNORED (file name): {name} — {reason}"
+    if suggestion:
+        msg += f"  FIX: {suggestion}"
+    print(msg, file=sys.stderr)
+    return {"file": name, "reason": reason, "suggestion": suggestion}
+
+
+def route_folder(input_dir, skipped=None) -> dict:
     """Scan input_dir, classify each file, resolve multi-file-per-role by
     newest-YYYYMMDD (union+dedup handled downstream).  Returns
-    {role: [RoutedFile, ...]} plus asserts hard-required roles present."""
+    {role: [RoutedFile, ...]} plus asserts hard-required roles present.
+    EVERY skipped file is announced on stderr the moment it is skipped
+    (and appended to `skipped` when a list is passed) — name-based
+    ignoring is never silent."""
     if not os.path.isdir(input_dir):
         raise MissingRequiredFile("INPUT_DIR", f"{input_dir} is not a directory")
     by_role = {}
+    if skipped is None:
+        skipped = []
     rule_by_role = {r.role: r for r in ROUTER_TABLE}
     for name in sorted(os.listdir(input_dir)):
         path = os.path.join(input_dir, name)
         if not os.path.isfile(path):
             continue
         low = name.lower()
+        if low.endswith(".xls"):
+            skipped.append(_skip_notice(
+                name, "legacy .xls format is not readable",
+                "re-export as .xlsx or .csv"))
+            continue
         if not low.endswith((".xlsx", ".xlsm", ".xlsb", ".csv", ".txt")):
+            skipped.append(_skip_notice(
+                name, "not a supported data format (.xlsx/.xlsm/.xlsb/.csv, "
+                      "or .txt for raw BAI2)",
+                "convert to a spreadsheet export, or rename with a _BAI2 "
+                "token if it is a raw bank transmission"))
             continue
         role = classify_file(name)
         if role is None:
+            skipped.append(_skip_notice(
+                name, "no router rule matches this name",
+                "rename with the export's role token (see FILE_NAMING.md: "
+                "BSL / _ST_ / MET / Receipts / Payables_Payments / BAI2 ...)"))
             continue
         # Raw bank files (owner, 2026-07-19): a .txt is accepted ONLY as a
         # native BAI2 transmission ("FHB_UTHSC_BAI2.txt") — the raw reader
         # parses type-16/88 records with the FULL untruncated addenda the
         # Oracle BSL feed cuts off.  Any other .txt stays unrouted.
         if low.endswith(".txt") and role != "BAI2":
+            skipped.append(_skip_notice(
+                name, f".txt is accepted only for raw BAI2 transmissions "
+                      f"(this name routes as {role})",
+                "export as .xlsx/.csv, or add a _BAI2 token if it is a raw "
+                "bank file"))
             continue
         rf = RoutedFile(role, path, name, rule_by_role[role].sheet)
         by_role.setdefault(role, []).append(rf)
+        if role in _RECOGNIZED_NOT_LOADED:
+            print(f"NOTE (file name): {name} recognized as {role} — "
+                  f"{_RECOGNIZED_NOT_LOADED[role]}; the forward engine will "
+                  "not read it.", file=sys.stderr)
 
     # Newest-wins ordering within a role (leading YYYYMMDD desc); ties keep all
     # for union+dedup by the loaders.
@@ -4993,21 +5046,19 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     runlog = {"input_dir": account_input_dir, "stages": []}
 
     # P0 route + bind + validate
-    by_role = route_folder(account_input_dir)
+    skipped = []
+    by_role = route_folder(account_input_dir, skipped)
     runlog["files_routed"] = {role: [f.filename for f in files]
                               for role, files in by_role.items()}
-    # Doctrine rule 3 (never silently drop): name every data-shaped file the
-    # router did not recognize — direct engine invocations have no per-run
-    # manifest, so the runlog + stderr are the record.
-    routed_names = {f.filename for files in by_role.values() for f in files}
-    unrouted = [n for n in sorted(os.listdir(account_input_dir))
-                if os.path.isfile(os.path.join(account_input_dir, n))
-                and n.lower().endswith((".xlsx", ".xlsm", ".xlsb", ".csv", ".txt"))
-                and n not in routed_names]
-    if unrouted:
-        runlog["files_unrouted"] = unrouted
-        print(f"WARNING: {len(unrouted)} file(s) matched no role and were NOT "
-              f"read: {', '.join(unrouted)}", file=sys.stderr)
+    # Doctrine rule 3 (never silently drop): route_folder announced every
+    # skip on stderr the moment it happened; the runlog carries the record
+    # (file, reason, suggested fix) for the manifest/report trail.
+    if skipped:
+        runlog["files_ignored_by_name"] = skipped
+    not_loaded = sorted(r for r in by_role if r in _RECOGNIZED_NOT_LOADED)
+    if not_loaded:
+        runlog["roles_recognized_not_loaded"] = {
+            r: _RECOGNIZED_NOT_LOADED[r] for r in not_loaded}
     account = _resolve_account(by_role)
     runlog["account"] = account
     runlog["stages"].append("route")

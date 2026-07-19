@@ -1804,6 +1804,43 @@ class TestRoutingHardening(unittest.TestCase):
         self.assertEqual(res["checks"]["C2"], "FAIL")
         self.assertTrue(any("do not sum" in f for f in res["failures"]))
 
+    def test_ignored_files_announced_immediately(self):
+        # Owner hard requirement (2026-07-19): the router announces every
+        # name-based skip the moment it happens — reason + rename fix — and
+        # run() records it in the runlog.
+        import io, contextlib
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [("Date", "Amount (USD)", "Reference",
+                                    "Additional Information",
+                                    "Account Servicer Reference",
+                                    "Transaction Type", "Statement",
+                                    "Transaction Code"),
+                                   ("2026-07-01", "10.00", "R1", "", "R1",
+                                    "Miscellaneous", "L1", "174")])])
+        _write_xlsx(os.path.join(self.d, "mystery_export.xlsx"),
+                    [("Sheet1", [("a",)])])          # no router rule
+        with open(os.path.join(self.d, "notes.txt"), "w") as fh:
+            fh.write("not a BAI2 file")              # .txt without BAI token
+        with open(os.path.join(self.d, "legacy.xls"), "w") as fh:
+            fh.write("old excel")                    # unreadable legacy format
+        err = io.StringIO()
+        skipped = []
+        with contextlib.redirect_stderr(err):
+            by_role = E.route_folder(self.d, skipped)
+        text = err.getvalue()
+        self.assertEqual(len(skipped), 3)
+        for frag in ("mystery_export.xlsx", "notes.txt", "legacy.xls",
+                     "IGNORED (file name)", "FIX:"):
+            self.assertIn(frag, text)
+        self.assertNotIn("BSL_UNR", text)            # routed files: no warning
+        # every skip carries a reason and a suggestion
+        for s in skipped:
+            self.assertTrue(s["reason"] and s["suggestion"], msg=s)
+        # run() records the same list in the runlog
+        with contextlib.redirect_stderr(io.StringIO()):
+            runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(len(runlog["files_ignored_by_name"]), 3)
+
     def test_chatt_account_tokens(self):
         self.assertEqual(E.infer_account("20260715_FHB_UT_Chatt_Student_Refund_BAI2.csv"),
                          "FHB_STUDENT_REFUND_UTC")
