@@ -101,6 +101,7 @@ Match the **first** rule whose `contains` tokens all appear (case-insensitive) i
 | `AR_MATCHED` | `AR_Matched` or `Deposit_Receipts` | first (CSV) | — | optional (deposit/GL) |
 | `AR_UNAPPLIED_SUMMARY` | `AR_063` or (`Unapplied_Receipts_Summary`) | first | — | optional (Review cause) |
 | `DEPT_INFO` | `ORT_Department_Info` | first | — | optional (account strings) |
+| `CHART_OF_ACCOUNTS` | `AcctCombos`/`Segments`/`ComboSets`/`CombosTech`/`Chart_Of_Accounts`/`GL_Departments` | `Report`/first | — | optional (advisory GL decode; MULTI-FILE) |
 | `GMS_001/002/035` sponsor maps | `RPT_GMS_00` | first (header deep) | — | optional |
 | `CFG_MATCHING` | `Matching_Rules` | first | — | optional (rule fidelity) |
 | `CFG_PARSE` | `Parse_Rules` | first | — | optional |
@@ -176,6 +177,8 @@ Normalize headers by uppercasing, stripping non-alphanumerics, and collapsing sp
 
 **MET scope keys (owner COA export, 2026-07-18).** The pool keeps only rows belonging to the account under reconciliation. Primary key: the long bank-account name (`CBE_BANK_ACCOUNT_NAME` → `account_of_bank_name`). Independent secondary key: the Chart of Accounts assigns each depository a natural-account GL code, stamped in `ASSET_CONCATENATED_SEGMENTS` (`ENTITY-FUND-DEPT-ACCOUNT-…`) and mapped by `account_of_gl_segments` (`_GL_CASH_ACCOUNTS`: 100210=FHB_MASTER, 100221=FHB_UTIA, 100226=FHB_UTSO, 100310=FHB_UTC, 100330=REGIONS_UTM, 100335=REGIONS_MASTER, 100350=REGIONS_UTIPS, 100360=REGIONS_UTIA, 100384=REGIONS_UTSI, 100390=REGIONS_UTHSC, 100500=FHB_UTHSC; clearing/payroll/CBORD GLs deliberately unmapped). When the bank-name column is unbound, the GL key scopes the pool (an all-accounts export must not leak other accounts). When both bind, bank name is authoritative — it names the statement the row belongs to — and rows whose GL maps to a different depository are counted in the runlog as `met_gl_conflicts`, kept, never silently dropped (real exports carry such cross-account postings).
 
+**COA decode bundle — Tier 1 (owner, 2026-07-19).** `CHART_OF_ACCOUNTS` is an OPTIONAL multi-file reference bundle (the seven `AcctCombos` shards + `Segments.csv` + `ComboSets`/`CombosTech`), loaded by `load_chart_of_accounts` into `{combo_decode, entity_desc, postable_efdp}`. The combo split lives in ONE place (`segments_of`; `account_of_gl_segments`/`dept_segment_of`/`entity_segment_of` all reuse it — Account is position 4, not last). `coa_decode` turns a combo into human labels for two NON-GATING text surfaces only: `_p10_review_cause` annotates each named ST carrying `asset_segments` with "(dept …, entity …)", and `recommend_gl_string` falls back — after a MID_MASTER miss — to the exact-amount counterpart's decoded combo. This is ADVISORY: placements are byte-identical with the bundle present or absent (campus/entity consistency confers NOTHING — §guardrail rule 8c). The loader skips `ORT_Activity_GL_Departments` and `RelatedValueSets` (out of scope). Diagnostic runlog counter `coa_combo_validity` (rows_seen / unrecognized_combo / non_postable_efdp) sits beside `met_gl_conflicts` and, like it, never drops or downgrades a row. (The negative-only entity-divergence downgrade — Tier 2 — is designed but not yet wired.)
+
 **ALL_DATA sheets** — bind by the headers listed in 4.2. On **Recon History**, required: `recon_grp`, `amount`, `auto_flag`, `rule_name`, `match_type`, and the four criteria flags.
 
 **EDISON_PAY** — `reference`, `invoice_number`, `payment_date`, `amount` (amount is the **payment total repeated on every row — never sum it**; take one per reference). **EDISON_INV** — `invoice_number`, `gross_amount`.
@@ -210,7 +213,7 @@ Group every open ST/receipt sharing that reference; the deduped group sums to th
 `BSL.reference` (or addenda `Customer ID`) is a `MID`; the merchant card receipts carry the same MID as their reference and group to the settlement. `MID_MASTER` maps the MID to campus/department/GL for the account string. Card window: ST precedes BSL by 1–4 days.
 
 **Account-string sourcing for Review/ECT:**
-`MET.OFFSET_CONCATENATED_SEGMENTS`, `AR Matched.CONCATENATED_SEGMENTS`, `MISC Receipts.Offset`, `MID_MASTER.gl_codes`, and `GMS.Owning Org` each yield the GL string to recommend for a manual ECT.
+`MET.OFFSET_CONCATENATED_SEGMENTS`, `AR Matched.CONCATENATED_SEGMENTS`, `MISC Receipts.Offset`, `MID_MASTER.gl_codes`, and `GMS.Owning Org` each yield the GL string to recommend for a manual ECT. When `CHART_OF_ACCOUNTS` is loaded, `recommend_gl_string` also falls back — after a MID_MASTER miss — to the exact-amount counterpart's `asset_segments` decoded through `coa_decode` (combo `= ent / dept / account` labels); advisory text only, never a placement.
 
 ---
 
