@@ -155,7 +155,23 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    explanation naming the foreign account — they can never auto-reconcile
    without a reroute/ECT. Conservation spans all four tabs; audit enforces
    citation+sum, foreign-account naming ("booked to"), non-reuse, and the
-   4-tab structure.
+   4-tab structure. **Reverse direction (ALL_BSL, owner 2026-07-19):** the
+   all-accounts open-BSL export (`Oracle_OTBI_All_BSL_UNR`, role `ALL_BSL`)
+   feeds a read-only mirror search (`_reverse_misdirected`) — a THIS-account
+   open, unconsumed ST/receipt whose bank line landed in ANOTHER account
+   (exact signed cents + znorm-EXACT unique reference; MID/shared-originator
+   refs excluded). ST-anchored, so it is a runlog finding
+   (`reverse_misdirected`), never a workbook placement (BSL conservation
+   untouched).
+8g2. **PAYMENTS feed (owner, 2026-07-19).** `Oracle_Payables_Payments`
+   (role `PAYMENTS`, tokens `payables`+`payments`) is the AP analogue of
+   RECEIPTS: `Payment Number` is the AP identity (= ST Transaction Number on
+   AP rows), `Payment Amount` is a POSITIVE disbursement magnitude the pool
+   NEGATES to the bank's signed cents, and only OUTSTANDING payments
+   (`Negotiable`; Cleared=Reconciled/Voided excluded, `OPEN_PAYMENT_STATUSES`)
+   enter the pool as open AP entries — merged onto the ST export's AP rows by
+   payment number at equal signed cents, else appended. On real FHB data this
+   adds ~8,900 open AP payments the UNR ST export lacks.
 8h. **Orphan doctrine (owner, 2026-07-19 — `UT_Recon_Forward_Orphan_Doctrine.md`,
    binding).** The open pool is shaped by prior (often automated, often wrong)
    reconciliations: it CONTAINS orphans (open STs whose money is already

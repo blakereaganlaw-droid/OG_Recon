@@ -325,6 +325,12 @@ class RouterRule:
 # First matching rule wins (Section 4.1).  `any_of` handles "several filename
 # shapes"; `excludes` handles the "not All_Data" style negative constraints.
 ROUTER_TABLE = [
+    # ALL_BSL (owner, 2026-07-19): the all-accounts open bank-statement-line
+    # export (OTBI) — feeds the misdirected search's foreign-BSL index, NOT
+    # this account's BSL reconciliation.  Must precede BSL/MET (it embeds both
+    # 'bsl' and 'oracle_otbi'); the single-account BSL never carries an 'all'
+    # segment, so it still binds BSL.
+    RouterRule("ALL_BSL", ["all", "bsl"], ["all_data", "enriched"], [], "first", False),
     # 'enriched' excluded: an Enriched_..._BSL_... workbook is the parsed
     # enrichment source (ENRICHED below), not a competing BSL export.
     RouterRule("BSL", ["bsl"], ["all_data", "enriched"], [], "first", True),
@@ -340,6 +346,10 @@ ROUTER_TABLE = [
     # All_NonMisc" embeds 'receipts_all' but is the receipt-APPLICATION feed
     # (ACRA/ABA), not a receipts export — it routes to AR_MATCHED below.
     RouterRule("RECEIPTS", [], ["ar_matched"], ["receivables_receipts", "receipts_all", "oracle_receipts"], "Export to Excel", False),
+    # PAYMENTS (owner, 2026-07-19): the AP payment feed — the Payables
+    # analogue of RECEIPTS.  Requires BOTH tokens so Edison_Payments (no
+    # 'payables') and account files never match.
+    RouterRule("PAYMENTS", ["payables", "payments"], [], [], "first", False),
     RouterRule("DEPT_INFO", [], [], ["ort_department", "department_info"], "Report", False),
     RouterRule("CHART_OF_ACCOUNTS", [], [], ["chart_of_accounts", "gl_departments"], "Report", False),
     RouterRule("ORT_AR", ["ort", "_ar"], [], [], "Report", False),
@@ -863,6 +873,34 @@ RECEIPTS_ROLES = {
                                    lambda v: account_of_bank_name(v) is not None),
 }
 
+# AP payment feed (owner, 2026-07-19): the Payables analogue of RECEIPTS.
+# `Payment Number` is the AP identity (= ST Transaction Number on the AP
+# rows); `Payment Amount` is a POSITIVE disbursement magnitude the pool
+# negates to the bank's signed cents; `Payment Status` / `Reconciled` give
+# the open/closed lifecycle.
+PAYMENTS_ROLES = {
+    "payment_number": _rs(True, ["Payment Number", "Payment Num", "Check Number"], pred_reference),
+    "amount": _rs(True, ["Payment Amount", "Amount"], pred_signed_amount),
+    "status": _rs(True, ["Payment Status", "Status"], pred_any),
+    "payee": _rs(True, ["Payee", "Supplier or Party", "Payee Name", "Supplier"], pred_customer),
+    "reconciled": _rs(False, ["Reconciled"], pred_any),
+    "payment_date": _rs(False, ["Payment Date", "Date"], pred_date),
+    "payment_document": _rs(False, ["Payment Document"], pred_any),
+}
+
+# All-accounts open bank-statement-line export (owner, 2026-07-19): the
+# reverse-direction evidence for the misdirected search — an open BSL in
+# ANOTHER account that a THIS-account open ST/receipt actually funds.  The
+# OTBI shape uses CSL_/CBA_ headers.
+ALL_BSL_ROLES = {
+    "bank_account_name": _rs(True, ["CBA Bank Account Name", "Bank Account Name", "Bank Account"], pred_any),
+    "amount": _rs(True, ["Amount", "Signed Amount"], pred_signed_amount),
+    "date": _rs(False, ["CSL Booking Date", "Booking Date", "Statement Date", "Date"], pred_date),
+    "reference": _rs(False, ["CSL Recon Reference", "Recon Reference", "Reference"], pred_reference),
+    "customer_reference": _rs(False, ["CSL Customer Reference", "Customer Reference"], pred_reference),
+    "addenda": _rs(False, ["CSL Addenda Txt", "Addenda", "Additional Information"], pred_any),
+}
+
 MET_ROLES = {
     "trx_id": _rs(True, ["CET Transaction ID", "Transaction Number", "Trx Id", "Transaction Id"], pred_reference),
     "amount": _rs(True, ["Amount", "Transaction Amount"], pred_signed_amount),
@@ -1075,6 +1113,10 @@ def read_rows(routed_file: RoutedFile):
 # Status vocabularies for availability (Section 8.2).
 OPEN_RECEIPT_STATUSES = {"UNR", "REMITTED", "CONFIRMED", "UNAPPLIED", "OPEN", "OP"}
 CLOSED_RECEIPT_STATUSES = {"CLEARED", "APP", "APPLIED", "REVERSED", "VOID", "REC", "CLOSED", "CL"}
+# AP payment lifecycle (owner, 2026-07-19): "Negotiable" = issued/outstanding
+# (open money that has not cleared the bank); "Cleared" (Reconciled=Yes) is
+# already reconciled; "Voided" is cancelled — neither is open.
+OPEN_PAYMENT_STATUSES = {"NEGOTIABLE", "ISSUED", "UNR", "OPEN"}
 JOURNAL_SOURCES = {"GL", "JOURNAL", "JE", "MANUAL"}
 
 
@@ -1304,6 +1346,67 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
         if foreign_rc:
             counts["RECEIPTS_FOREIGN"] = foreign_rc
             runlog["receipts_foreign_account"] = foreign_rc
+
+    # 2b. Open Payables payments from PAYMENTS (owner, 2026-07-19): the AP
+    #     analogue of RECEIPTS.  Only OUTSTANDING payments are open money —
+    #     "Negotiable" (Reconciled=No, not Voided); "Cleared"/"Voided" are
+    #     reconciled or cancelled.  Payment Amount is a positive disbursement
+    #     magnitude; negate it to the bank line's signed cents.  Merge onto the
+    #     ST export's AP rows by payment number (the check identity) at equal
+    #     signed cents; otherwise append a new open AP entry.
+    pm = loaded.get("PAYMENTS")
+    if pm:
+        rows, m, hi = pm["rows"], pm["map"], pm["header_index"]
+        raw = []
+        for r in rows[hi + 1:]:
+            mag = cents(_cell(r, m.get("amount")))
+            pno = N(_cell(r, m.get("payment_number")))
+            if mag is None or not pno:
+                continue
+            status = _norm_header(_cell(r, m.get("status")))
+            reconciled = _norm_header(_cell(r, m.get("reconciled")))
+            voided = "VOID" in status
+            is_open = (not voided) and (status in OPEN_PAYMENT_STATUSES
+                                        or (reconciled == "NO" and status not in CLOSED_RECEIPT_STATUSES))
+            if not is_open:
+                continue  # reconciled/cleared/voided payments are not open money
+            e = _mk_entry(
+                id=pno,
+                amount_cents=-mag,           # disbursement: the bank sees it negative
+                dt=parse_date(_cell(r, m.get("payment_date"))),
+                reference=pno,               # the payment/check number is the identity
+                counterparty=_cell(r, m.get("payee")),
+                source="AP",
+                status=status or "UNR",
+                available=True,
+                origin="PAYMENTS",
+                transaction_type="Check",
+            )
+            raw.append(e)
+        deduped = _dedup_keep_largest(raw, lambda e: e.id)
+        by_id = {}
+        for p in pool:
+            if p.source == "AP":
+                by_id.setdefault(p.base_id or p.id, []).append(p)
+        merged_pm = appended_pm = 0
+        for e in deduped:
+            group = by_id.get(e.base_id or e.id) or []
+            equal = [p for p in group if p.amount_cents == e.amount_cents]
+            prev = equal[0] if len(equal) == 1 else None
+            if prev is not None:
+                # ST export already carries this payment — payment feed is
+                # authoritative for AP payee/date, never re-opens a consumed ST.
+                if not prev.counterparty and e.counterparty:
+                    prev.counterparty = e.counterparty
+                    prev.payer_tokens = prev.payer_tokens | payer_tokens(e.counterparty)
+                if prev.date is None:
+                    prev.date = e.date
+                merged_pm += 1
+            else:
+                pool.append(e)
+                appended_pm += 1
+        counts["PAYMENTS"] = appended_pm
+        runlog["payments_merged_to_st"] = merged_pm
 
     # 3. ORT receipts from MET for the ECT chain (index by d: and reference).
     met = loaded.get("MET")
@@ -2848,6 +2951,17 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
             expl += f" Recommended GL: {gl}."
         place(bsl, REVIEW, CONF_LOW, [], codes, expl, "P10_review")
 
+    # ---- Reverse misdirected search (owner, 2026-07-19) -------------
+    # The mirror of PM: a THIS-account open ST/receipt whose bank line
+    # actually landed in ANOTHER account.  ALL_BSL supplies every open bank
+    # line system-wide; we scan the account's still-open, unconsumed pool
+    # entries for an exact signed-cent + reference tie to a foreign open BSL.
+    # Read-only: these are ST-anchored findings (no THIS-account BSL to
+    # place), so they go to the run log for the reconciler — never a workbook
+    # placement, and never affecting BSL conservation.
+    runlog["reverse_misdirected"] = _reverse_misdirected(
+        pool, ledger, loaded, account)
+
     runlog["forward_pass_counts"] = pass_counts
     ordered = [placements[b.line_key] for b in bsls]
 
@@ -2872,6 +2986,60 @@ def _norm_id(v):
     if s.endswith(".0"):
         s = s[:-2]
     return s
+
+
+def _reverse_misdirected(pool, ledger, loaded, account):
+    """Mirror of PM (owner, 2026-07-19): find THIS-account open, unconsumed
+    ST/receipts whose bank line actually landed in ANOTHER account, using the
+    all-accounts open-BSL export (ALL_BSL).  Match on exact signed cents AND a
+    reference tie (znorm-exact, >= 6 chars, or the ST reference embedded in the
+    foreign line's addenda).  Read-only and ST-anchored — there is no
+    THIS-account BSL to place, so findings go to the run log for the
+    reconciler, never a workbook row (BSL conservation is untouched)."""
+    ab = loaded.get("ALL_BSL")
+    if not ab or not account or account == "UNKNOWN":
+        return []
+    rows, m, hi = ab["rows"], ab["map"], ab["header_index"]
+    by_amt = {}
+    for r in rows[hi + 1:]:
+        acc = account_of_bank_name(_cell(r, m.get("bank_account_name")))
+        if acc is None or acc == account:
+            continue  # only OTHER configured accounts are "foreign"
+        amt = cents(_cell(r, m.get("amount")))
+        if amt is None:
+            continue
+        fref = clean_ref(_cell(r, m.get("reference")))
+        ftext = znorm(" ".join(N(_cell(r, m.get(k)))
+                               for k in ("reference", "customer_reference", "addenda")
+                               if m.get(k) is not None))
+        by_amt.setdefault(amt, []).append((acc, fref, ftext,
+                                           parse_date(_cell(r, m.get("date")))))
+    if not by_amt:
+        return []
+    findings, seen = [], set()
+    for e in pool:
+        if not ledger.is_available(e) or e.foreign_account or e.source in JOURNAL_SOURCES:
+            continue
+        # Require a UNIQUE per-transaction reference: a MID / merchant id is a
+        # shared originator carried by many transactions, so exact amount + MID
+        # is a coincidence, not proof the same money landed elsewhere.
+        if not (e.znref and len(e.znref) >= 6) or e.is_mid or is_mid(e.reference):
+            continue
+        for acc, fref, ftext, fdate in by_amt.get(e.amount_cents, ()):
+            if e.znref == znorm(fref):
+                key = (e.id, acc)
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append({
+                    "st_id": e.id, "source": e.source,
+                    "amount": e.amount_cents / 100, "landed_in": acc,
+                    "foreign_bsl_reference": fref,
+                    "date": fdate.isoformat() if fdate else None,
+                })
+                break
+    findings.sort(key=lambda f: (f["landed_in"], f["amount"], f["st_id"]))
+    return findings
 
 
 def _p2_data_feed_errors(loaded, account=None):
@@ -3430,6 +3598,8 @@ def load_and_bind(by_role, runlog):
         "BSL": BSL_ROLES,
         "ST": ST_ROLES,
         "RECEIPTS": RECEIPTS_ROLES,
+        "PAYMENTS": PAYMENTS_ROLES,
+        "ALL_BSL": ALL_BSL_ROLES,
         "MET": MET_ROLES,
         "BAI2": BAI2_ROLES,
         "DEPT_INFO": DEPT_INFO_ROLES,

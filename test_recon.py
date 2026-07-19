@@ -1237,6 +1237,58 @@ class TestRealDataShapes(unittest.TestCase):
         self.assertIn("cherry-picked", expl)
         self.assertIn("POSSIBLE_AUTO_REC_SPLIT", A._N(target[0][A.COL_EXPL]) + " " + expl)
 
+    def test_payments_feed_matches_check(self):
+        # PAYMENTS feed (owner, 2026-07-19): an open (Negotiable) AP payment
+        # becomes a negative AP pool entry that matches its check bank line;
+        # Cleared/reconciled payments are not pooled.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-13", "-500.00", "5924", "EPAY 5924", "5924",
+             "Check", "Line 1 , 2026-07-13", "475"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [
+            ("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Transaction Type"),
+            ("2026-07-01", "999.00", "Z1", "Z1", "External", "ACH"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        pay = [
+            ("Payment Number", "Payment Status", "Reconciled", "Payment Amount", "Payee", "Payment Date"),
+            ("5924", "Negotiable", "No", "500.00", "ACME VENDOR", "2026-07-13"),
+            ("6000", "Cleared", "Yes", "500.00", "OTHER VENDOR", "2026-07-10"),   # reconciled: not pooled
+        ]
+        _write_xlsx(os.path.join(self.d, "20260719_Oracle_Payables_Payments.xlsx"),
+                    [("Exported", pay)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertEqual(runlog["pool_sizes"].get("PAYMENTS"), 1)  # only the open one
+        self.assertEqual(runlog["recon_summary"]["matches"], 1)    # -500 check <-> payment 5924
+
+    def test_reverse_misdirected_from_all_bsl(self):
+        # ALL_BSL reverse search (owner, 2026-07-19): a THIS-account open
+        # receipt whose bank line landed in ANOTHER account is a read-only,
+        # ST-anchored finding (never a workbook placement).
+        rows = [
+            ("CBA_BANK_ACCOUNT_NAME", "Amount", "CSL_RECON_REFERENCE", "CSL_BOOKING_DATE"),
+            ("FHB - UTHSC", "70992.66", "300045836", "2026-07-03"),
+            ("FHB - Master Account", "500.00", "999999", "2026-07-01"),  # same account: ignored
+        ]
+        m, hi = E.bind_columns(rows, E.ALL_BSL_ROLES, filename="all_bsl.xlsx")
+        loaded = {"ALL_BSL": {"rows": rows, "map": m, "header_index": hi}}
+        e = E._mk_entry("300045836", 7099266, date(2026, 7, 3), "300045836",
+                        "City of Memphis", "AR", "UNR", True, "RECEIPTS")
+        out = E._reverse_misdirected([e], E.Ledger(), loaded, "FHB_MASTER")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["landed_in"], "FHB_UTHSC")
+        self.assertEqual(out[0]["st_id"], "300045836")
+        # a receipt with no foreign match yields nothing
+        e2 = E._mk_entry("111", 12345, date(2026, 7, 3), "111", "X", "AR", "UNR", True, "RECEIPTS")
+        self.assertEqual(E._reverse_misdirected([e2], E.Ledger(), loaded, "FHB_MASTER"), [])
+
     def test_misdirected_receipt_gets_own_tab(self):
         # Owner HARD GUARDRAIL (2026-07-18, City of Memphis $70,992.66): the
         # bank line lands in THIS account but the receipt remits to ANOTHER
