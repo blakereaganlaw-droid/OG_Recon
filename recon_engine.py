@@ -4814,6 +4814,25 @@ def load_and_bind(by_role, runlog):
         specs = role_specs.get(role)
         if specs is None and role != "MID_MASTER":
             continue  # recognized; no binding required at this layer
+        # Multi-BAI2 union (owner review, 2026-07-19): a run's open lines
+        # can span months, but newest-wins read only ONE BAI2 file — a July
+        # transmission could never enrich June's lines.  Load EVERY BAI2
+        # file (each with its OWN binding; raw-.txt and spreadsheet shapes
+        # legitimately differ) and union at the INDEX level in _bai2_index.
+        # BAI2 is enrichment-only — never a pool entry — so this changes
+        # only which addenda are available, never conservation.
+        if role == "BAI2" and len(files) > 1:
+            parsed = []
+            for rf in files:                  # newest-first route order
+                rows, _ = read_rows(rf)
+                mapping, hi = bind_columns(rows, specs, filename=rf.filename)
+                parsed.append({"rows": rows, "map": mapping,
+                               "header_index": hi, "file": rf.filename})
+            loaded[role] = {"files": parsed,
+                            "file": " + ".join(p["file"] for p in parsed)}
+            bound_report[role] = {"files": [p["file"] for p in parsed],
+                                  "union": "index-level"}
+            continue
         # Pagination union (owner review, 2026-07-19; generalized beyond MET
         # 2026-07-19): real Oracle exports arrive as same-date "_2/_3" page
         # shards.  Same-date files of a paginatable role are PAGES of one
@@ -4921,29 +4940,61 @@ def _pick_newest(files, role):
 
 
 def _bai2_index(loaded):
-    """Index BAI2 rows by (date, signed cents).  DETAIL1..DETAIL10 columns are
-    located by exact header name (deterministic; they carry the full addenda
-    the Oracle BSL feed truncates at ~1000 chars)."""
+    """Index BAI2 rows by (date, signed cents).  DETAIL1..DETAILn columns are
+    located by exact header name PER FILE (deterministic; they carry the full
+    addenda the Oracle BSL feed truncates at ~1000 chars).  Accepts both the
+    multi-file shape ({"files": [...]}) and the legacy single-file dict;
+    candidate lists union across files in newest-first order — _bai2_enrich's
+    decline-on-ambiguity already arbitrates merged lists conservatively."""
     bai = loaded.get("BAI2")
     if not bai:
         return None
-    rows, m, hi = bai["rows"], bai["map"], bai["header_index"]
-    header = rows[hi]
-    detail_cols = [i for i, h in enumerate(header)
-                   if re.fullmatch(r"DETAIL\d+", _norm_header(h) or "")]
+    parts = bai["files"] if "files" in bai else [bai]
     idx = {}
-    for r in rows[hi + 1:]:
-        dt = parse_date(_cell(r, m.get("post_date")))
-        amt = cents(_cell(r, m.get("amount")))
-        if dt is None or amt is None:
-            continue
-        details = "".join(N(_cell(r, c)) for c in detail_cols)
-        idx.setdefault((dt, amt), []).append({
-            "details": details,
-            "description": N(_cell(r, m.get("description"))),
-            "bank_reference": clean_ref(_cell(r, m.get("bank_reference"))),
-            "customer_reference": clean_ref(_cell(r, m.get("customer_reference"))),
-        })
+    for part in parts:
+        rows, m, hi = part["rows"], part["map"], part["header_index"]
+        header = rows[hi]
+        detail_cols = [i for i, h in enumerate(header)
+                       if re.fullmatch(r"DETAIL\d+", _norm_header(h) or "")]
+        for r in rows[hi + 1:]:
+            dt = parse_date(_cell(r, m.get("post_date")))
+            amt = cents(_cell(r, m.get("amount")))
+            if dt is None or amt is None:
+                continue
+            details = "".join(N(_cell(r, c)) for c in detail_cols)
+            cand = {
+                "details": details,
+                "description": N(_cell(r, m.get("description"))),
+                "bank_reference": clean_ref(_cell(r, m.get("bank_reference"))),
+                "customer_reference": clean_ref(_cell(r, m.get("customer_reference"))),
+            }
+            bucket = idx.setdefault((dt, amt), [])
+            # Same-transaction dedup across overlapping BAI2 windows (the
+            # 0715 csv and 0718 txt both carry July 1-15): the bank
+            # reference identifies the transaction — verified identical
+            # across file formats on real UTC data (326/350 overlapping
+            # keys).  Keep ONE candidate per bank reference, preferring the
+            # richer addenda (the raw transmission); without it, treating
+            # the duplicate as a second candidate made _bai2_enrich decline
+            # 31 previously-clean joins.  Blank-reference twins dedup on a
+            # space-normalized details prefix; genuinely distinct same-day
+            # same-amount transactions keep both (the decline is then
+            # correct).
+            dup = None
+            for prev in bucket:
+                if cand["bank_reference"] and \
+                        prev["bank_reference"] == cand["bank_reference"]:
+                    dup = prev
+                    break
+                pa = prev["details"].replace(" ", "")
+                ca = cand["details"].replace(" ", "")
+                if pa and ca and (pa.startswith(ca) or ca.startswith(pa)):
+                    dup = prev
+                    break
+            if dup is None:
+                bucket.append(cand)
+            elif len(cand["details"]) > len(dup["details"]):
+                dup.update(cand)
     return idx
 
 

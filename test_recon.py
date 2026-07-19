@@ -1841,6 +1841,52 @@ class TestRoutingHardening(unittest.TestCase):
             runlog = E.run(self.d, self.out, present=True)
         self.assertEqual(len(runlog["files_ignored_by_name"]), 3)
 
+    def test_multi_bai2_index_union_and_dedup(self):
+        # Two BAI2 files with overlapping windows: the index unions their
+        # coverage but dedups the SAME transaction (same bank reference),
+        # keeping the richer addenda — a duplicate must not become a second
+        # candidate that makes enrichment decline.
+        raw = "\n".join([
+            "01,000000000,000000000,260718,0759,1,,,2/",
+            "02,084000026,084000026,1,260710,,USD,2/",
+            "16,142,5100,Z,26191005187395,001,",
+            "88,MERCHANT SERVICEDEPOSIT",
+            "88,Customer ID: 8035701948",
+            "99,0,1,2/",
+        ])
+        with open(os.path.join(self.d, "20260718_FHB_Master_BAI2.txt"), "w") as fh:
+            fh.write(raw)
+        # spreadsheet BAI2 covering an EARLIER window + the same 07-10 record
+        _write_xlsx(os.path.join(self.d, "20260715_FHB_Master_BAI2.xlsx"),
+                    [("first", [("Post Date", "Amount", "Bank Reference",
+                                 "Customer Reference", "BAI Code"),
+                                ("2026-07-10", "51.00", "26191005187395", "001", "142"),
+                                ("2026-06-05", "77.00", "26156000000001", "002", "142")])])
+        files = [E.RoutedFile("BAI2", os.path.join(self.d, n), n, "first")
+                 for n in sorted(os.listdir(self.d), reverse=True)
+                 if "BAI2" in n]
+        loaded = E.load_and_bind({"BAI2": files}, {})
+        self.assertEqual(len(loaded["BAI2"]["files"]), 2)
+        idx = E._bai2_index(loaded)
+        # overlapping record deduped to ONE candidate, richer (txt) details
+        cands = idx[(date(2026, 7, 10), 5100)]
+        self.assertEqual(len(cands), 1)
+        self.assertIn("Customer ID: 8035701948", cands[0]["details"])
+        # June record from the older file present (window union)
+        self.assertIn((date(2026, 6, 5), 7700), idx)
+
+    def test_single_bai2_shape_unchanged(self):
+        _write_xlsx(os.path.join(self.d, "20260715_FHB_Master_BAI2.xlsx"),
+                    [("first", [("Post Date", "Amount", "Bank Reference",
+                                 "Customer Reference", "BAI Code"),
+                                ("2026-07-10", "51.00", "26191005187395", "001", "142")])])
+        files = [E.RoutedFile("BAI2", os.path.join(self.d, n), n, "first")
+                 for n in sorted(os.listdir(self.d)) if "BAI2" in n]
+        loaded = E.load_and_bind({"BAI2": files}, {})
+        self.assertNotIn("files", loaded["BAI2"])     # legacy single-dict shape
+        idx = E._bai2_index(loaded)
+        self.assertIn((date(2026, 7, 10), 5100), idx)
+
     def test_bsl_pagination_union_end_to_end(self):
         # Two same-date BSL page shards: engine unions them, conservation
         # spans both pages, and the audit's C1 re-parse unions the same
