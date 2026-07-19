@@ -1841,6 +1841,75 @@ class TestRoutingHardening(unittest.TestCase):
             runlog = E.run(self.d, self.out, present=True)
         self.assertEqual(len(runlog["files_ignored_by_name"]), 3)
 
+    def test_recon_history_advisory_audit(self):
+        # R2 (orphan doctrine): a staged Reconciled_* export yields advisory
+        # orphan findings — placements byte-identical with or without it.
+        bsl = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                "Account Servicer Reference", "Transaction Type", "Statement",
+                "Transaction Code"),
+               ("2026-07-01", "150.00", "NA", "MYSTERY PAYMENT", "NA",
+                "Miscellaneous", "Line 1 , 2026-07-01", "174")]
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              ("2026-06-30", "700.00", "OPENREF9", 601, "Receivables", "V")]
+        rec = [("Reconciled Group", "Transaction Source", "Reference", "Date",
+                "Amount (USD)", "Transaction Type", "Transaction ID",
+                "Journal", "Journal Batch", "Journal Line", "Batch Name",
+                "Payment File Reference", "Receipt Batch Number",
+                "Cleared Date", "Automatically Reconciled", "Created By",
+                "Creation Date"),
+               # ESSADMIN group at the open ST's cents (R2 neighborhood)
+               ("Group 1", "Statement", "OPENREF9", "2026-06-29", "700.00",
+                "ACH", "", "", "", "", "", "", "", "", "Y", "ESSADMIN", "2026-06-29"),
+               ("Group 1", "External", "OPENREF9", "2026-06-29", "700.00",
+                "", "900001", "", "", "", "", "", "", "", "Y", "ESSADMIN", "2026-06-29"),
+               # duplicate feed: same signature, two DISTINCT transaction ids
+               ("Group 2", "External", "DUPREF88", "2026-06-20", "55.00",
+                "", "800001", "", "", "", "", "", "", "", "Y", "OIC_SYSTEM_USER", "2026-06-20"),
+               ("Group 3", "External", "DUPREF88", "2026-06-21", "55.00",
+                "", "800002", "", "", "", "", "", "", "", "Y", "OIC_SYSTEM_USER", "2026-06-21"),
+               # group at the Review line's cents (history neighborhood)
+               ("Group 4", "Statement", "X1", "2026-06-15", "150.00",
+                "MSC", "", "", "", "", "", "", "", "", "N", "WKITTS2", "2026-06-15"),
+               ("Group 4", "Receivables", "X1", "2026-06-15", "150.00",
+                "", "700001", "", "", "", "", "", "", "", "N", "WKITTS2", "2026-06-15")]
+        for with_rec in (False, True):
+            d, out = tempfile.mkdtemp(), tempfile.mkdtemp()
+            _write_xlsx(os.path.join(d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                        [("Exported", bsl)])
+            _write_xlsx(os.path.join(d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                        [("Exported", st)])
+            if with_rec:
+                _write_xlsx(os.path.join(d, "20260710_Oracle_CM_Reconciled_FHB_Master_BSL.xlsx"),
+                            [("Exported", rec)])
+            runlog = E.run(d, out, present=True)
+            tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
+            dump = {t: [[A._N(c) for c in r] for r in rows]
+                    for t, rows in tabs.items()}
+            if not with_rec:
+                base_dump = dump
+                self.assertNotIn("recon_history_orphans", runlog)
+                self.assertFalse(os.path.exists(os.path.join(
+                    out, "FHB_MASTER_orphan_findings.md")))
+            else:
+                self.assertEqual(dump, base_dump)     # placements untouched
+                rep = runlog["recon_history_orphans"]
+                self.assertEqual(rep["dup_feed_signatures"], 1)
+                self.assertEqual(rep["open_st_automation_neighborhood"], 1)
+                self.assertEqual(rep["review_lines_with_history_neighborhood"], 1)
+                text = open(rep["report_path"]).read()
+                self.assertIn("800001", text)
+                self.assertIn("ESSADMIN", text)
+                self.assertIn("Group 4", text)
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_recon_history_wrong_account_skipped(self):
+        files = [E.RoutedFile("RECONCILED", "/nonexistent/x.xlsx",
+                              "20260710_Oracle_CM_Reconciled_FHB_UTC_BSL.xlsx",
+                              "multi")]
+        rh = E.load_recon_history(files, "FHB_MASTER")
+        self.assertTrue(rh is None or not rh.get("coarse"))
+
     def test_multi_bai2_index_union_and_dedup(self):
         # Two BAI2 files with overlapping windows: the index unions their
         # coverage but dedups the SAME transaction (same bank reference),

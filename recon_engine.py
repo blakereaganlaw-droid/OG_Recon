@@ -653,7 +653,8 @@ class RoutedFile:
 # the owner is told, per file, that the engine will not use it.
 _RECOGNIZED_NOT_LOADED = {
     "ALL_DATA": "lifecycle workbook — Unreconcile2's fuel",
-    "RECONCILED": "reconciled forensic export — offline config-audit / Unreconcile2 fuel",
+    "RECONCILED": "reconciled forensic export — advisory recon-history audit "
+                  "only (orphan-doctrine R2), never a pool/matching source",
     "CONTRACTS_INV": "contracts-to-invoices reference — not consumed by the forward passes",
     "GMS_AGING": "sponsored AR aging — not consumed by the forward passes",
     "AR_INVOICES": "AR invoice listing — not consumed by the forward passes",
@@ -4756,6 +4757,199 @@ def config_audit(loaded, account, placements, pool, output_dir, runlog):
     return report
 
 
+# ---- Recon-history advisory audit (orphan-doctrine R2, 2026-07-19) ----
+# The reconciled-group exports carry the `Created By` actor (ESSADMIN =
+# AutoReconcile, OIC_SYSTEM_USER = transaction-creation rule, else a human)
+# — the one column that attributes every prior reconciliation.  ADVISORY
+# ONLY: findings go to the runlog + an orphan-findings artifact; the pool,
+# ledger, placements, and workbook are never touched (R2 says "prefer
+# referral (R9) over a low-evidence match" — referral is a finding, and an
+# amount + Created By hit is NOT identity (rule 4/R1), so availability is
+# never flipped here; that would need the ORT intent bridge + owner
+# sign-off).
+
+_AUTOMATION_CREATORS = {"ESSADMIN", "OIC_SYSTEM_USER"}
+
+_RECONCILED_SOURCE_SHORT = {
+    "RECEIVABLES": "AR", "PAYABLES": "AP", "EXTERNAL": "EXT",
+    "JOURNAL": "GL", "STATEMENT": "BSL",
+}
+
+
+def load_recon_history(files, account):
+    """Parse the RECONCILED family's `Exported` sheets (one row per
+    reconciled-group leg; 17 cols, header row located by 'Reconciled
+    Group') into the R2 indexes.  Files naming a DIFFERENT account are
+    skipped with a notice; files without the Exported schema (the paginated
+    Reconciliation_Report_* renderings) are skipped quietly — they carry no
+    Created By.  Fail-soft: any read/bind failure returns what was parsed
+    plus a note, never an exception (advisory must not gate delivery)."""
+    if not files:
+        return None
+    fine = {}       # (src, cents, znref, ztype) -> {ids, creators, groups}
+    coarse = {}     # cents -> {group: {creators, auto, sources}}
+    seen_rows = set()
+    used_files, notes = [], []
+    for rf in files:
+        facc = infer_account(rf.filename)
+        if facc and account and account != "UNKNOWN" and facc != account:
+            notes.append(f"{rf.filename}: names {facc}, run is {account} — skipped")
+            continue
+        try:
+            rows, _ = read_rows(rf)
+        except Exception as e:      # noqa: BLE001 — advisory fail-soft
+            notes.append(f"{rf.filename}: unreadable ({e}) — skipped")
+            continue
+        hi = _coa_header_index(rows, "Reconciled Group")
+        if hi is None:
+            continue                # a Reconciliation_Report rendering, not Exported
+        idx = _coa_colmap(rows[hi])
+        col = {k: idx.get(_norm_header(a)) for k, a in (
+            ("group", "Reconciled Group"), ("source", "Transaction Source"),
+            ("reference", "Reference"), ("amount", "Amount (USD)"),
+            ("ttype", "Transaction Type"), ("trx_id", "Transaction ID"),
+            ("auto", "Automatically Reconciled"), ("created_by", "Created By"))}
+        if col["group"] is None or col["created_by"] is None:
+            notes.append(f"{rf.filename}: Exported header incomplete — skipped")
+            continue
+        used_files.append(rf.filename)
+        for r in rows[hi + 1:]:
+            key_row = tuple(N(_cell(r, c)) for c in col.values() if c is not None)
+            if not any(key_row) or key_row in seen_rows:
+                continue            # blank or a leg duplicated across the
+            seen_rows.add(key_row)  # overlapping BSL/ST exports
+            group = N(_cell(r, col["group"]))
+            src = _RECONCILED_SOURCE_SHORT.get(
+                _norm_header(_cell(r, col["source"])), "")
+            amt = cents(_cell(r, col["amount"]))
+            creator = N(_cell(r, col["created_by"]))
+            if not group or amt is None:
+                continue
+            auto = _norm_header(_cell(r, col["auto"])) == "Y"
+            g = coarse.setdefault(amt, {}).setdefault(
+                group, {"creators": set(), "auto": auto, "sources": set()})
+            g["creators"].add(creator)
+            g["auto"] = g["auto"] or auto
+            if src:
+                g["sources"].add(src)
+            if src and src != "BSL":
+                fkey = (src, amt, znorm(_cell(r, col["reference"])),
+                        _norm_header(_cell(r, col["ttype"])))
+                f = fine.setdefault(fkey, {"ids": set(), "creators": set(),
+                                           "groups": set()})
+                tid = N(_cell(r, col["trx_id"]))
+                if tid:
+                    f["ids"].add(tid)
+                f["creators"].add(creator)
+                f["groups"].add(group)
+    if not used_files:
+        return {"notes": notes} if notes else None
+    return {"fine": fine, "coarse": coarse, "files": used_files, "notes": notes}
+
+
+def recon_history_audit(rh, account, placements, pool, output_dir, runlog):
+    """Cross-reference this run's outcomes against the reconciled history
+    (R2).  Pure read of placements/pool — one-way data flow, provably
+    incapable of influencing them (runs after the writer + audit)."""
+    if not rh or not rh.get("coarse"):
+        if rh and rh.get("notes"):
+            runlog["recon_history"] = {"notes": rh["notes"]}
+        return None
+    fine, coarse = rh["fine"], rh["coarse"]
+    lines_md = [f"# Orphan findings (recon history R2) — {account}", "",
+                f"History source(s): {', '.join(rh['files'])}. ADVISORY — "
+                "these findings refer groups to Unreconcile2 (R9: refer, "
+                "don't route around); nothing here moved a placement.", ""]
+    report = {"files": rh["files"]}
+
+    # 1. Duplicate feeds: one (source, cents, reference, type) signature
+    #    carrying >1 DISTINCT transaction id — the same money fed twice.
+    dups = sorted(((k, v) for k, v in fine.items() if len(v["ids"]) > 1),
+                  key=lambda kv: (-len(kv[1]["ids"]), kv[0]))
+    report["dup_feed_signatures"] = len(dups)
+    if dups:
+        lines_md += ["## Duplicate feeds (same signature, distinct "
+                     "transaction ids)", ""]
+        for (src, amt, zref, ztype), v in dups[:25]:
+            lines_md.append(
+                f"- {src} {_usd(amt)} ref `{zref or '(blank)'}`: "
+                f"{len(v['ids'])} ids ({', '.join(sorted(v['ids'])[:4])}) "
+                f"by {', '.join(sorted(v['creators']))} in "
+                + ", ".join(sorted(v["groups"])[:3]))
+        lines_md.append("")
+
+    # 2. R2 on the open pool: an open, unconsumed ST whose signed cents an
+    #    ESSADMIN/OIC-created REC group already worked — the classic orphan
+    #    neighborhood.  Advisory referral, never a bar (amount is not
+    #    identity).
+    consumed = set()
+    for p in placements:
+        if p.kind in (MATCH, CANDIDATE, MISDIRECTED):
+            for e in p.st_entries:
+                consumed.add(e.id)
+                if e.base_id:
+                    consumed.add(e.base_id)
+    orphan_hits = []
+    for e in pool:
+        if not e.available or e.foreign_account or e.id in consumed:
+            continue
+        groups = coarse.get(e.amount_cents)
+        if not groups:
+            continue
+        autom = sorted(g for g, info in groups.items()
+                       if info["creators"] & _AUTOMATION_CREATORS)
+        if autom:
+            orphan_hits.append((e, autom))
+    report["open_st_automation_neighborhood"] = len(orphan_hits)
+    if orphan_hits:
+        lines_md += ["## Open STs in an automation-worked amount "
+                     "neighborhood (R2)",
+                     "Automation (ESSADMIN/OIC_SYSTEM_USER) already "
+                     "reconciled a group at this exact signed cents — "
+                     "before consuming these open STs elsewhere, run the "
+                     "intent test / refer to Unreconcile2 (R9).", ""]
+        for e, autom in sorted(orphan_hits,
+                               key=lambda t: (t[0].amount_cents, t[0].id))[:30]:
+            lines_md.append(
+                f"- {e.id} {_usd(e.amount_cents)} ({e.source}) — REC "
+                + ", ".join(autom[:3]))
+        lines_md.append("")
+
+    # 3. Review lines whose amount a REC group already worked: name the
+    #    consuming groups + creators for the reconciler (signature #6
+    #    neighborhood — the counterpart may sit inside a prior group).
+    review_hits = []
+    for p in placements:
+        if p.kind != REVIEW:
+            continue
+        groups = coarse.get(p.bsl.amount_cents)
+        if groups:
+            review_hits.append((p.bsl, sorted(groups)[:3], sorted(
+                {c for info in groups.values() for c in info["creators"]})))
+    report["review_lines_with_history_neighborhood"] = len(review_hits)
+    if review_hits:
+        lines_md += ["## Review lines whose amount appears in reconciled "
+                     "history", ""]
+        for bsl, groups, creators in review_hits[:30]:
+            lines_md.append(
+                f"- {bsl.date} {_usd(bsl.amount_cents)}: "
+                + ", ".join(groups) + f" (by {', '.join(creators[:4])})")
+        lines_md.append("")
+
+    path = os.path.join(output_dir, f"{account}_orphan_findings.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines_md) + "\n")
+    jpath = os.path.join(output_dir, f"{account}_orphan_findings.json")
+    with open(jpath, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True, default=str)
+    report["report_path"] = path
+    report["json_path"] = jpath
+    if rh.get("notes"):
+        report["notes"] = rh["notes"]
+    runlog["recon_history_orphans"] = report
+    return report
+
+
 # ======================================================================
 # Section 9 P0 — Load & validate; build BSL list
 # ======================================================================
@@ -5219,6 +5413,14 @@ def run(account_input_dir, output_dir="./outputs", present=True):
     # no CFG exports, no-op; never affects placements, workbook, or audit.
     if config_audit(loaded, account, placements, pool, output_dir, runlog):
         runlog["stages"].append("config_audit")
+
+    # Recon-history advisory audit (orphan-doctrine R2, 2026-07-19): when a
+    # reconciled-group export is staged, cross-reference this run's outcomes
+    # against WHO reconciled what before.  Advisory — runs after everything,
+    # reads placements/pool one-way, never gates.
+    rh = load_recon_history(by_role.get("RECONCILED"), account)
+    if recon_history_audit(rh, account, placements, pool, output_dir, runlog):
+        runlog["stages"].append("recon_history_audit")
 
     # Write JSON run log (Section 15.7).
     log_path = os.path.join(output_dir, f"{account}_runlog.json")
