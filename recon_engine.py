@@ -280,16 +280,32 @@ def _blankish(v):
     return not s or znorm(s) in _NULL_REF_TOKENS or not re.search(r"[A-Za-z0-9]", s)
 
 
-def reference_equal(a, b) -> bool:
-    """znorm equality OR full containment of one znorm token inside the other
-    for length >= 6.  A sibling pair is a conflict, never equal."""
-    za, zb = znorm(a), znorm(b)
+def _sibling_z(za, zb) -> bool:
+    """`sibling` over PRE-COMPUTED znorms (perf fast path; identical result —
+    sibling is a pure function of the two znorms)."""
+    if not (za.isdigit() and zb.isdigit()):
+        return False
+    if len(za) != len(zb) or len(za) < 7:
+        return False
+    if za == zb:
+        return False
+    return za[:-2] == zb[:-2]
+
+
+def _reference_equal_z(za, zb) -> bool:
+    """`reference_equal` over PRE-COMPUTED znorms (perf fast path)."""
     if not za or not zb:
         return False
     hit = (za == zb) or (len(za) >= 6 and za in zb) or (len(zb) >= 6 and zb in za)
     if not hit:
         return False
-    return not sibling(a, b)
+    return not _sibling_z(za, zb)
+
+
+def reference_equal(a, b) -> bool:
+    """znorm equality OR full containment of one znorm token inside the other
+    for length >= 6.  A sibling pair is a conflict, never equal."""
+    return _reference_equal_z(znorm(a), znorm(b))
 
 
 def reference_tie(a, b) -> bool:
@@ -2094,12 +2110,6 @@ def date_ok_directional(lag):
     return lag is None or lag < 8
 
 
-def date_ok_general(lag):
-    return lag is not None and abs(lag) <= DATE_CEILING
-
-
-
-
 def date_ok_merchant(lag):
     """Card window: ST precedes BSL by 1-4 days (lag in 1..4)."""
     return lag is not None and 1 <= lag <= 4
@@ -2172,6 +2182,41 @@ class Placement:
 # Section 9 — FORWARD pipeline (fixed order; later never overrides earlier)
 # ======================================================================
 
+def _bsl_znorms(bsl):
+    """Non-empty znorms of the BSL's 5 identifier fields (perf fast path —
+    an empty znorm can never satisfy reference_equal)."""
+    out = []
+    for v in (bsl.reference_raw, bsl.additional_info, bsl.customer_reference,
+              bsl.account_servicer_reference, bsl.recon_reference):
+        if v:
+            z = znorm(v)
+            if z:
+                out.append(z)
+    return tuple(out)
+
+
+def _entry_znorms(e):
+    """Non-empty znorms of the ST entry's 4 identifier fields."""
+    out = []
+    for v in (e.reference, e.id, e.spr, e.counterparty):
+        if v:
+            z = znorm(v)
+            if z:
+                out.append(z)
+    return tuple(out)
+
+
+def _cross_reference_tie_z(bz, ez):
+    """cross_reference_tie over precomputed znorm tuples (identical result:
+    a truthy raw with an empty znorm can never hit reference_equal, so
+    restricting to non-empty znorms loses nothing)."""
+    for zb in bz:
+        for zs in ez:
+            if _reference_equal_z(zb, zs):
+                return True
+    return False
+
+
 def cross_reference_tie(bsl, e):
     """Owner-mandated multi-cross-reference screen (2026-07-11): EVERY BSL
     identifier field — Reference, Additional Information (full text, BAI2-
@@ -2179,16 +2224,57 @@ def cross_reference_tie(bsl, e):
     against EVERY ST identifier field — Reference, Transaction Number,
     Structured Payment Reference, Counterparty.  Full cell contents; no
     field skipped, no truncation."""
-    bsl_vals = (bsl.reference_raw, bsl.additional_info, bsl.customer_reference,
-                bsl.account_servicer_reference, bsl.recon_reference)
-    st_vals = (e.reference, e.id, e.spr, e.counterparty)
-    for b in bsl_vals:
-        if not b:
+    return _cross_reference_tie_z(_bsl_znorms(bsl), _entry_znorms(e))
+
+
+def _grams6(z):
+    """All character 6-grams of a znorm string (index keys)."""
+    return [z[i:i + 6] for i in range(len(z) - 5)]
+
+
+def _build_tie_index(bsls, pool):
+    """{bsl.line_key -> [pool entries with cross_reference_tie, POOL ORDER]}.
+
+    Candidate generation is a provable superset of reference_equal hits
+    (equality or containment >= 6 always shares a 6-gram with the indexed
+    side; below-6 hits require exact equality, kept in a separate exact
+    dict; cross-length-class hits below 6 are impossible), then every
+    candidate pair is verified with the EXACT tie predicate — so the result
+    equals the brute-force full-pool scan, including order.  Built ONCE per
+    run: cross_reference_tie depends only on fields immutable after
+    build_pool.  Availability is deliberately NOT indexed (doctrine rule 6:
+    it is derived through the ledger at every access)."""
+    grams = {}      # 6-gram -> set of bsl indices
+    exact = {}      # znorm shorter than 6 -> set of bsl indices
+    bz_list = []
+    for bi, b in enumerate(bsls):
+        bz = _bsl_znorms(b)
+        bz_list.append(bz)
+        for z in bz:
+            if len(z) >= 6:
+                for g in set(_grams6(z)):
+                    grams.setdefault(g, set()).add(bi)
+            else:
+                exact.setdefault(z, set()).add(bi)
+    tie_index = {b.line_key: [] for b in bsls}
+    for e in pool:
+        ez = _entry_znorms(e)
+        if not ez:
             continue
-        for s in st_vals:
-            if s and reference_equal(b, s):
-                return True
-    return False
+        cand = set()
+        for z in ez:
+            if len(z) >= 6:
+                for g in _grams6(z):
+                    s = grams.get(g)
+                    if s:
+                        cand |= s
+            s = exact.get(z)
+            if s:
+                cand |= s
+        for bi in cand:
+            if _cross_reference_tie_z(bz_list[bi], ez):
+                tie_index[bsls[bi].line_key].append(e)
+    return tie_index
 
 
 def cross_digit_tie(bsl, e):
@@ -2468,10 +2554,6 @@ def _type_gate_ok(bsl, e):
     return True
 
 
-def _open_entries(pool, ledger):
-    return [e for e in pool if ledger.is_available(e)]
-
-
 def _amount_matches(bsl, entry):
     return entry.amount_cents == bsl.amount_cents
 
@@ -2527,6 +2609,29 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     pool_amount_counts = {}
     for e in pool:
         pool_amount_counts[e.amount_cents] = pool_amount_counts.get(e.amount_cents, 0) + 1
+    # Cross-reference tie relation, computed ONCE (perf refactor 2026-07-19):
+    # provably equal to the per-BSL full-pool scans it replaces (see
+    # _build_tie_index).  Indexed over the FULL pool — P4's reference-group
+    # lane needs closed/shadow members for its auto-rec-split evidence.
+    tie_index = _build_tie_index(bsls, pool)
+    # Static-field buckets (perf, 2026-07-19): order-preserving partitions of
+    # the pool keyed ONLY on fields immutable after build_pool.  Availability
+    # is deliberately NOT indexed — every consumer still filters through
+    # ledger.is_available at access (doctrine rule 6).
+    by_amount = {}
+    ar_pool = []
+    mid_pool = {}
+    znref_pool = {}
+    pool_pos = {}
+    for i, e in enumerate(pool):
+        pool_pos[id(e)] = i
+        by_amount.setdefault(e.amount_cents, []).append(e)
+        if e.source == "AR":
+            ar_pool.append(e)
+        if e.is_mid:
+            mid_pool.setdefault(e.znref, []).append(e)
+        for z in {z for z in (e.znref, znorm(e.id)) if len(z) >= 6}:
+            znref_pool.setdefault(z, []).append(e)
 
     # ---- P2 DATA_FEED_ERROR sweep -----------------------------------
     feed_errors = _p2_data_feed_errors(loaded, account)
@@ -2536,10 +2641,10 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     stale_1to1 = {}          # line_key -> out-of-band ties, placed after P4
     for bsl in unplaced():
         cands = []
-        for e in _open_entries(pool, ledger):
-            if not _amount_matches(bsl, e):
+        for e in tie_index.get(bsl.line_key, ()):
+            if not ledger.is_available(e):
                 continue
-            if not cross_reference_tie(bsl, e):
+            if not _amount_matches(bsl, e):
                 continue
             # Guardrails: journal never matches; MID-into-non-merchant
             # conflict; deterministic type gate (Credit Card ST never pairs
@@ -2583,7 +2688,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
 
     # ---- P4 1:M ECT / ORT reference group (the workhorse) -----------
     for bsl in unplaced():
-        group, closed_members, competing = _p4_reference_group(bsl, pool, ledger)
+        group, closed_members, competing = _p4_reference_group(
+            bsl, tie_index.get(bsl.line_key, ()), ledger)
         if group is None:
             continue
         total = sum(e.amount_cents for e in group)
@@ -2636,14 +2742,12 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     # entries — so the sum is taken per (AR, counterparty) group.
     for bsl in unplaced():
         groups = {}
-        for e in pool:
+        for e in tie_index.get(bsl.line_key, ()):
             if e.source != "AR" or not e.counterparty:
                 continue
             if not ledger.is_available(e):
                 continue
             if not _type_gate_ok(bsl, e):
-                continue
-            if not cross_reference_tie(bsl, e):
                 continue
             groups.setdefault(znorm(e.counterparty), []).append(e)
         exact = [(cp, g) for cp, g in groups.items()
@@ -2897,13 +3001,13 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     runlog["p5_state"] = "retired (owner doctrine 2026-07-11: Edison pass eliminated)"
 
     # ---- P6 Merchant / MID ------------------------------------------
-    _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account)
+    _p6_merchant(unplaced, place, mid_pool, ledger, loaded, runlog, account)
 
     # ---- P7 Receivables SPN group -----------------------------------
     _p7_spn(unplaced, place, pool, ledger, loaded, runlog)
 
     # ---- P8 Named-payer rules (Amount + Payer) ----------------------
-    _p8_named_payer(unplaced, place, pool, ledger, runlog)
+    _p8_named_payer(unplaced, place, by_amount, ledger, runlog)
 
     # ---- P8c Payer-family receipt-sum group (owner 2026-07-14) -------
     # A managed-care remittance lands as ONE positive ACH covering several
@@ -2922,8 +3026,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         if not fams:
             continue
         groups = {}
-        for e in _open_entries(pool, ledger):
-            if e.source != "AR":
+        for e in ar_pool:
+            if not ledger.is_available(e):
                 continue
             if not _type_gate_ok(bsl, e):
                 continue
@@ -2984,8 +3088,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     for bsl in unplaced():
         if bsl.amount_cents >= 0:
             continue
-        cands = [e for e in _open_entries(pool, ledger)
-                 if e.source == "AP" and _amount_matches(bsl, e)]
+        cands = [e for e in by_amount.get(bsl.amount_cents, ())
+                 if e.source == "AP" and ledger.is_available(e)]
         tied = [e for e in cands if cross_reference_tie(bsl, e)]
         if len(tied) == 1:
             e = tied[0]
@@ -3018,8 +3122,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     # corroboration, and a payer contradiction bars even the Candidate.
     for bsl in unplaced():
         elig = []
-        for e in _open_entries(pool, ledger):
-            if not _amount_matches(bsl, e):
+        for e in by_amount.get(bsl.amount_cents, ()):
+            if not ledger.is_available(e):
                 continue
             if e.source in JOURNAL_SOURCES:
                 continue
@@ -3163,7 +3267,16 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         if not bkeys:
             continue
         members = []
-        for e in _open_entries(pool, ledger):
+        cand, seen = [], set()
+        for k in sorted(bkeys):
+            for e in znref_pool.get(k, ()):
+                if id(e) not in seen:
+                    seen.add(id(e))
+                    cand.append(e)
+        cand.sort(key=lambda e: pool_pos[id(e)])
+        for e in cand:
+            if not ledger.is_available(e):
+                continue
             if e.source in JOURNAL_SOURCES:
                 continue
             if e.is_mid and bsl.lane != LANE_MERCHANT:
@@ -3172,11 +3285,9 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 continue
             if _ext_stale_barred(bsl, e):
                 continue  # 12+ day stale External member: not citable (owner 8d)
-            # An ST joins only on EXACT equality of its deposit/batch number
-            # (Reference or Transaction Number) with a BSL reference key.
-            ekeys = {z for z in (znorm(e.reference), znorm(e.id)) if len(z) >= 6}
-            if ekeys & bkeys:
-                members.append(e)
+            # (znref_pool membership == the original EXACT-equality key join:
+            # each entry is indexed under znorm(reference) and znorm(id) >= 6.)
+            members.append(e)
         # A genuine 1:M deposit batch has >= 2 open members sharing the exact
         # reference; a lone coincidental tie is left to the ordinary review.
         if len(members) < 2:
@@ -3229,12 +3340,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
 
     # ---- P10 Residual -> Review -------------------------------------
     coa = loaded.get("CHART_OF_ACCOUNTS")
-    # One amount index for the whole residual pass: _p10_review_cause and the
-    # recommended-GL fallback both need the exact-amount slice — build it once
-    # instead of scanning the pool twice per Review line.
-    by_amount = {}
-    for e in pool:
-        by_amount.setdefault(e.amount_cents, []).append(e)
+    # P10 reuses the run-level by_amount bucket (same construction: full
+    # pool, pool order) for _p10_review_cause and the recommended-GL fallback.
     edison_idx, edison_inv = _edison_index(loaded)
     for bsl in unplaced():
         exact_entries = by_amount.get(bsl.amount_cents, [])
@@ -3290,9 +3397,10 @@ def _norm_id(v):
 def _reverse_misdirected(pool, ledger, loaded, account):
     """Mirror of PM (owner, 2026-07-19): find THIS-account open, unconsumed
     ST/receipts whose bank line actually landed in ANOTHER account, using the
-    all-accounts open-BSL export (ALL_BSL).  Match on exact signed cents AND a
-    reference tie (znorm-exact, >= 6 chars, or the ST reference embedded in the
-    foreign line's addenda).  Read-only and ST-anchored — there is no
+    all-accounts open-BSL export (ALL_BSL).  Match on exact signed cents AND
+    znorm-EXACT reference equality (>= 6 chars; containment/addenda-embedding
+    deliberately NOT accepted — a runlog claim about another account's line
+    keeps the strictest tie).  Read-only and ST-anchored — there is no
     THIS-account BSL to place, so findings go to the run log for the
     reconciler, never a workbook row (BSL conservation is untouched)."""
     ab = loaded.get("ALL_BSL")
@@ -3308,10 +3416,7 @@ def _reverse_misdirected(pool, ledger, loaded, account):
         if amt is None:
             continue
         fref = clean_ref(_cell(r, m.get("reference")))
-        ftext = znorm(" ".join(N(_cell(r, m.get(k)))
-                               for k in ("reference", "customer_reference", "addenda")
-                               if m.get(k) is not None))
-        by_amt.setdefault(amt, []).append((acc, fref, ftext,
+        by_amt.setdefault(amt, []).append((acc, fref,
                                            parse_date(_cell(r, m.get("date")))))
     if not by_amt:
         return []
@@ -3324,7 +3429,7 @@ def _reverse_misdirected(pool, ledger, loaded, account):
         # is a coincidence, not proof the same money landed elsewhere.
         if not (e.znref and len(e.znref) >= 6) or e.is_mid or is_mid(e.reference):
             continue
-        for acc, fref, ftext, fdate in by_amt.get(e.amount_cents, ()):
+        for acc, fref, fdate in by_amt.get(e.amount_cents, ()):
             if e.znref == znorm(fref):
                 key = (e.id, acc)
                 if key in seen:
@@ -3385,18 +3490,18 @@ def _p2_data_feed_errors(loaded, account=None):
     return sorted(set(errors))
 
 
-def _p4_reference_group(bsl, pool, ledger):
+def _p4_reference_group(bsl, tied_entries, ledger):
     """Assemble the all-status deduped reference group for a BSL via the
-    owner-mandated 4x4 cross-reference screen.  Returns
-    (group_entries or None, closed_members, competing_bool)."""
+    owner-mandated 4x4 cross-reference screen (`tied_entries` = the
+    precomputed cross-tie slice for this BSL, pool order, ALL statuses).
+    Returns (group_entries or None, closed_members, competing_bool)."""
     members = []
-    for e in pool:
+    for e in tied_entries:
         if e.source in JOURNAL_SOURCES:
             continue
         if not _type_gate_ok(bsl, e):
             continue
-        if cross_reference_tie(bsl, e):
-            members.append(e)
+        members.append(e)
     if not members:
         return None, [], False
     # Dedup by id keeping largest (already deduped in pool, but ORT+RECEIPTS
@@ -3453,7 +3558,7 @@ def _p4_reference_group(bsl, pool, ledger):
 
 
 
-def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account=None):
+def _p6_merchant(unplaced, place, mid_pool, ledger, loaded, runlog, account=None):
     """Merchant / MID (Section 9 P6)."""
     mid_dir = _mid_directory(loaded, account)
 
@@ -3464,8 +3569,8 @@ def _p6_merchant(unplaced, place, pool, ledger, loaded, runlog, account=None):
         if not mid:
             # merchant text but no MID: defer to reference/chain lane, not straight to Review.
             continue
-        group = [e for e in _open_entries(pool, ledger)
-                 if e.is_mid and znorm(e.reference) == mid]
+        group = [e for e in mid_pool.get(mid, ())
+                 if ledger.is_available(e)]
         # card window: ST precedes BSL by 1-4 days.
         in_window = [e for e in group if date_ok_merchant(signed_lag(bsl.date, e.date))]
         stale = [e for e in group if (signed_lag(bsl.date, e.date) or 0) > 30]
@@ -3510,20 +3615,24 @@ def _p7_spn(unplaced, place, pool, ledger, loaded, runlog):
     date plausibility — and its zero-corroboration singleton path is GONE
     (an uncorroborated single receipt falls through to P9b, which screens
     payer contradiction and type incongruence before any Candidate)."""
+    # SPN partition is BSL-independent: build once (perf, 2026-07-19); the
+    # per-BSL screens (type gate, stale ceiling) and availability are applied
+    # inside the loop, so behavior is unchanged.
+    spn_groups = {}
+    for e in pool:
+        if e.spn:
+            spn_groups.setdefault(_spn_root(e.spn), []).append(e)
     for bsl in unplaced():
         if bsl.lane == LANE_MERCHANT:
             continue
-        # Group open receipts by SPN root or shared structured payment reference.
         by_spn = {}
-        for e in _open_entries(pool, ledger):
-            if not e.spn:
-                continue
-            if not _type_gate_ok(bsl, e):
-                continue          # Convera->AP, card-vs-check bars (rule 8c)
-            if _ext_stale_barred(bsl, e):
-                continue          # 12+ days stale External member (rule 8d)
-            root = _spn_root(e.spn)
-            by_spn.setdefault(root, []).append(e)
+        for root, entries in spn_groups.items():
+            live = [e for e in entries
+                    if ledger.is_available(e)
+                    and _type_gate_ok(bsl, e)
+                    and not _ext_stale_barred(bsl, e)]
+            if live:
+                by_spn[root] = live
         placed = False
         for root, members in sorted(by_spn.items()):
             # corroborator: shared SPN root AND a reference tie to the BSL —
@@ -3579,15 +3688,15 @@ NAMED_PAYER_RULES = [
 ]
 
 
-def _p8_named_payer(unplaced, place, pool, ledger, runlog):
+def _p8_named_payer(unplaced, place, by_amount, ledger, runlog):
     for bsl in unplaced():
         info_z = znorm(bsl.additional_info) + znorm(bsl.recon_reference)
         for keyword, cp_tokens in NAMED_PAYER_RULES:
             if znorm(keyword) not in info_z:
                 continue
             cands = []
-            for e in _open_entries(pool, ledger):
-                if not _amount_matches(bsl, e):
+            for e in by_amount.get(bsl.amount_cents, ()):
+                if not ledger.is_available(e):
                     continue
                 if not _type_gate_ok(bsl, e):
                     continue

@@ -32,7 +32,7 @@ and spec disagree, the spec wins — fix the code.
 ```bash
 python3 run_recon.py <upload_dir_or_files>          # one upload = one run folder
 python3 recon_engine.py <input_dir> -o ./outputs    # direct engine invocation
-python3 -m unittest test_recon -v                   # 56 tests
+python3 -m unittest test_recon -v                   # 112 tests
 ```
 
 Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
@@ -56,10 +56,16 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    rules). Transaction type alone confers nothing. Date supports, never
    suffices.
 5. **Conservation.** Each BSL appears exactly once across the three tabs; each
-   ST is consumed at most once across Matches + Candidates (shared `Ledger`).
-   Both asserted at end of `forward_reconcile`.
-6. **Fixed pipeline.** A later pass never overrides an earlier one. Availability
-   is re-derived inside every loop (`ledger.is_available`), never precomputed.
+   ST is consumed at most once across Matches + Candidates + Misdirected
+   (shared `Ledger`). Both asserted at end of `forward_reconcile`.
+6. **Fixed pipeline.** A later pass never overrides an earlier one.
+   Availability is derived through the ledger (`ledger.is_available`) at
+   EVERY access; indexes may pre-bucket entries by immutable fields
+   (amount, reference znorm, SPN, MID, source — set before
+   `forward_reconcile` starts), but never by availability.  The
+   cross-reference tie relation is precomputed once (`_build_tie_index`,
+   6-gram candidate generation + exact verification — provably equal to
+   the per-BSL full-pool scans it replaced, order included).
 7. **Guardrails:** Journal-source STs never match bank lines. A MID receipt
    reconciles only through the merchant lane. Sibling references (equal-length
    numerics differing in the last 1–2 digits) are **conflicts**, never ties.

@@ -1635,6 +1635,77 @@ class TestChartOfAccounts(unittest.TestCase):
                          {"rows_seen": 1, "unrecognized_combo": 0, "non_postable_efdp": 0})
 
 
+class TestTieIndexEquivalence(unittest.TestCase):
+    """The 6-gram tie index must equal the brute-force full-pool scan —
+    list equality INCLUDING order (perf refactor, 2026-07-19)."""
+
+    VOCAB = [
+        "HEARTLANDPAY",          # alpha-only >= 6
+        "8036830332",            # digits >= 6
+        "REF-12345",             # 5-digit run with separator
+        "ABC12",                 # short (< 6 znorm)
+        "12345678", "12345679",  # sibling pair (must NOT tie)
+        "PAYMENT REF 887799 X",  # containment source
+        "887799",                # contained token (= 6)
+        "88779",                 # 5 chars — no containment tie
+        "NA", "", "  - ",        # null-ish
+    ]
+
+    def _bsl(self, i, ref, info="", cust=""):
+        return E.make_bsl(f"L{i}", date(2026, 7, 10), 1000 + i, ref, ref,
+                          info, "Miscellaneous", "174", customer_reference=cust)
+
+    def _entry(self, i, ref, cp=""):
+        return E._mk_entry(f"E{i}", 2000 + i, date(2026, 7, 9), ref, cp,
+                           "AR", "UNR", True, "ST")
+
+    def test_index_equals_brute_force(self):
+        bsls, pool = [], []
+        n = 0
+        for ref in self.VOCAB:
+            bsls.append(self._bsl(n, ref)); n += 1
+        # cross-field-only ties: value in info/customer only
+        bsls.append(self._bsl(n, "NA", info="pay HEARTLANDPAY today")); n += 1
+        bsls.append(self._bsl(n, "NA", cust="887799")); n += 1
+        m = 0
+        for ref in self.VOCAB:
+            pool.append(self._entry(m, ref)); m += 1
+        pool.append(self._entry(m, "NA", cp="PAYMENT REF 887799 X")); m += 1
+        pool.append(self._entry(m + 1, "OTHER", cp="HEARTLANDPAY"))
+        idx = E._build_tie_index(bsls, pool)
+        for b in bsls:
+            brute = [e for e in pool if E.cross_reference_tie(b, e)]
+            self.assertEqual(idx[b.line_key], brute, msg=b.recon_reference)
+        # sanity: the fixture actually exercises ties and non-ties
+        total = sum(len(v) for v in idx.values())
+        self.assertGreater(total, 4)
+        self.assertLess(total, len(bsls) * len(pool))
+
+    def test_fast_path_equivalence(self):
+        vals = self.VOCAB + ["  X-887799 ", "8877990"]
+        for a in vals:
+            for b in vals:
+                self.assertEqual(
+                    E.reference_equal(a, b),
+                    E._reference_equal_z(E.znorm(a), E.znorm(b)), msg=(a, b))
+                self.assertEqual(
+                    E.sibling(a, b),
+                    E._sibling_z(E.znorm(a), E.znorm(b)), msg=(a, b))
+
+    def test_bucket_liveness_within_pass(self):
+        # Doctrine 6: an ST consumed by an earlier BSL in the same pass must
+        # be invisible to later BSLs even through the amount buckets.
+        b1 = E.make_bsl("L1", date(2026, 7, 10), 5000, "TIEREF77", "TIEREF77",
+                        "", "Miscellaneous", "174")
+        b2 = E.make_bsl("L2", date(2026, 7, 10), 5000, "TIEREF77", "TIEREF77",
+                        "", "Miscellaneous", "174")
+        e = E._mk_entry("ST1", 5000, date(2026, 7, 9), "TIEREF77", "", "AR",
+                        "UNR", True, "ST")
+        placements = E.forward_reconcile([b1, b2], [e], {}, "FHB_MASTER", {})
+        cited = [p for p in placements if p.st_entries]
+        self.assertEqual(len(cited), 1)
+
+
 class TestRoutingHardening(unittest.TestCase):
     """File-name protection (critical review, 2026-07-19): reconciled
     forensic exports must never be misread as open exports; paginated MET
