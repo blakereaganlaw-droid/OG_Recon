@@ -1841,6 +1841,75 @@ class TestRoutingHardening(unittest.TestCase):
             runlog = E.run(self.d, self.out, present=True)
         self.assertEqual(len(runlog["files_ignored_by_name"]), 3)
 
+    def test_c11_fabricated_st_id_fails(self):
+        # A Match citing an ST id absent from every source export fails C11.
+        bsl = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                "Account Servicer Reference", "Transaction Type", "Statement",
+                "Transaction Code"),
+               ("2026-07-01", "150.00", "REF88001", "", "REF88001",
+                "Miscellaneous", "Line 1 , 2026-07-01", "174")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              ("2026-06-30", "150.00", "REF88001", 601, "Receivables", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS")
+        self.assertEqual(runlog["audit"]["checks"]["C11"], "PASS")
+        # Tamper the cited ST number to a fabricated id -> C11 FAIL.
+        from openpyxl import load_workbook
+        wb = load_workbook(runlog["recon_workbook"])
+        ws = wb["Matches"]
+        ws.cell(row=4, column=10, value="999999999")
+        wb.save(runlog["recon_workbook"])
+        res = A.audit(self.d, runlog["recon_workbook"], "FHB_MASTER")
+        self.assertEqual(res["checks"]["C11"], "FAIL")
+        self.assertTrue(any("C11" in f and "999999999" in f for f in res["failures"]))
+
+    def test_split_ids_semantics(self):
+        # '; '-joined cell: one id embeds ', ' — must NOT be over-split.
+        cell = "Correct Parsing Rule - Reference: a, b; 601"
+        self.assertEqual(A._split_ids(cell),
+                         ["Correct Parsing Rule - Reference: a, b", "601"])
+        # ', '-joined cell: plain multi-id split.
+        self.assertEqual(A._split_ids("601, 602"), ["601", "602"])
+        # Disambiguation suffix KEPT by default (it IS the identity, rule 8)
+        self.assertEqual(A._split_ids("1 [0.01], 1 [10.00]"),
+                         ["1 [0.01]", "1 [10.00]"])
+        # ... and stripped for the C11 source-membership lookup.
+        self.assertEqual(A._split_ids("1 [0.01], 1 [10.00]", strip_disambig=True),
+                         ["1", "1"])
+        self.assertEqual(A._split_ids("1024656 [-728.95]", strip_disambig=True),
+                         ["1024656"])
+
+    def test_reparse_valid_st_ids_sources(self):
+        # Superset spans ST + receipts (incl. DOC synth) + payments + MET,
+        # with .xlsb-style '.0' collapse; Edison/reconciled files excluded.
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", [("Date", "Amount (USD)", "Reference",
+                                    "Transaction Number", "Source"),
+                                   ("2026-06-30", "1.00", "R", "601", "Receivables")])])
+        _write_xlsx(os.path.join(self.d, "20260710_Oracle_Receivables_Receipts.xlsx"),
+                    [("Export to Excel", [("Receipt Number", "Document Number",
+                                           "Receipt Amount"),
+                                          ("364912", "9001", "5.00"),
+                                          ("", "77001", "6.00")])])
+        _write_xlsx(os.path.join(self.d, "20260710_Oracle_Payables_Payments.xlsx"),
+                    [("first", [("Payment Number", "Payment Amount", "Payment Status"),
+                                ("60410073", "7.00", "Negotiable")])])
+        _write_xlsx(os.path.join(self.d, "20260710_Oracle_OTBI_MET_FHB.xlsx"),
+                    [("Sheet1", [("CET_TRANSACTION_ID", "AMOUNT"),
+                                 ("65105.0", "8.00")])])
+        _write_xlsx(os.path.join(self.d, "Edison_Payments.xlsx"),
+                    [("sheet1", [("Reference", "Amount"), ("0007000001", "9.00")])])
+        ids, digits = A._reparse_valid_st_ids(self.d)
+        for want in ("601", "364912", "DOC 77001", "60410073", "65105"):
+            self.assertIn(want, ids, msg=sorted(ids))
+        self.assertNotIn("0007000001", ids)      # Edison excluded
+        self.assertIn("60410073", digits)
+
     def test_chatt_account_tokens(self):
         self.assertEqual(E.infer_account("20260715_FHB_UT_Chatt_Student_Refund_BAI2.csv"),
                          "FHB_STUDENT_REFUND_UTC")

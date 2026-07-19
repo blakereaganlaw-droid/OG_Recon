@@ -358,6 +358,114 @@ def _reparse_source_bsls(input_dir):
 
 # ---- MET pairs re-parse (independent) --------------------------------
 
+_DISAMBIG_RE = re.compile(r"\s*\[-?\d+\.\d{2}\]$")
+
+
+def _split_ids(cell, strip_disambig=False):
+    """EXACT inverse of the engine's _join_multi for the ST Number(s) column:
+    the writer joins with '; ' whenever ANY id embeds a comma, else ', '.
+    So a '; ' in the cell means split ONLY on '; ' (each part may itself
+    contain ', ' as part of ONE id — 'Correct Parsing Rule - Reference: a, b');
+    otherwise no id contains a comma and ', ' splits safely.
+
+    The '<id> [<amount>]' disambiguation suffix (doctrine rule 8) is kept by
+    DEFAULT — it is what distinguishes two same-label receipts, so the C3/C5
+    non-reuse checks must compare the full disambiguated identity.  C11's
+    source-membership lookup passes strip_disambig=True (sources carry the
+    bare id)."""
+    s = _N(cell)
+    if not s:
+        return []
+    parts = s.split("; ") if "; " in s else s.split(", ")
+    if strip_disambig:
+        parts = [_DISAMBIG_RE.sub("", p) for p in parts]
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _longest_digit_run(s):
+    """Longest run of >= 4 digits in a string ('' if none)."""
+    runs = re.findall(r"\d{4,}", _N(s))
+    return max(runs, key=len) if runs else ""
+
+
+def _add_valid_id(v, ids, digits):
+    v = _N(v)
+    if not v:
+        return
+    if v.endswith(".0"):
+        v = v[:-2]          # .xlsb float-coerced integral id
+    ids.add(v)
+    run = _longest_digit_run(v)
+    if run:
+        digits.add(run)
+
+
+def _reparse_valid_st_ids(input_dir):
+    """Independent superset of every plausible system-side id — ST
+    transaction numbers, receipt numbers (+ the engine's 'DOC <doc>' synth
+    for blank receipt numbers), AP payment numbers, MET CET transaction
+    ids — across ALL matching files, every date (a permissive superset can
+    only prevent false C11 failures, never cause one).  Returns
+    (ids:set, digit_runs:set)."""
+    ids, digits = set(), set()
+
+    def _cols(rows, wanted):
+        for i, r in enumerate(rows[:12]):
+            hmap = {_norm_header(c): j for j, c in enumerate(r) if _N(c)}
+            if any(w in hmap for w in wanted):
+                return i, hmap
+        return None, {}
+
+    for name in sorted(os.listdir(input_dir)):
+        low = name.lower()
+        if not low.endswith((".xlsx", ".xlsm", ".csv", ".xlsb")):
+            continue
+        if "reconcil" in low or "edison" in low or "all_data" in low:
+            continue
+        is_st = ("_st_" in low or "_st." in low or "account_st" in low)
+        is_rcpt = any(k in low for k in ("receivables_receipts", "receipts_all",
+                                         "oracle_receipts")) and "ar_matched" not in low
+        is_pay = "payables" in low and "payments" in low
+        is_met = ("met" in low or "oracle_otbi" in low) and "bsl" not in low
+        if not (is_st or is_rcpt or is_pay or is_met):
+            continue
+        rows = _read_table(os.path.join(input_dir, name))
+        if not rows:
+            continue
+        if is_st:
+            hi, hmap = _cols(rows, ("TRANSACTIONNUMBER",))
+            col = hmap.get("TRANSACTIONNUMBER")
+            if col is not None:
+                for r in rows[hi + 1:]:
+                    if col < len(r):
+                        _add_valid_id(r[col], ids, digits)
+        if is_rcpt:
+            hi, hmap = _cols(rows, ("RECEIPTNUMBER",))
+            rc, dc = hmap.get("RECEIPTNUMBER"), hmap.get("DOCUMENTNUMBER")
+            if rc is not None:
+                for r in rows[hi + 1:]:
+                    v = _N(r[rc]) if rc < len(r) else ""
+                    if v and v.upper() not in ("NA", "NONE"):
+                        _add_valid_id(v, ids, digits)
+                    elif dc is not None and dc < len(r) and _N(r[dc]):
+                        _add_valid_id(f"DOC {_N(r[dc])}", ids, digits)
+        if is_pay:
+            hi, hmap = _cols(rows, ("PAYMENTNUMBER",))
+            col = hmap.get("PAYMENTNUMBER")
+            if col is not None:
+                for r in rows[hi + 1:]:
+                    if col < len(r):
+                        _add_valid_id(r[col], ids, digits)
+        if is_met:
+            hi, hmap = _cols(rows, ("CETTRANSACTIONID", "TRANSACTIONNUMBER"))
+            col = hmap.get("CETTRANSACTIONID", hmap.get("TRANSACTIONNUMBER"))
+            if col is not None:
+                for r in rows[hi + 1:]:
+                    if col < len(r):
+                        _add_valid_id(r[col], ids, digits)
+    return ids, digits
+
+
 def _reparse_met_pairs(input_dir):
     pairs = set()
     for name in sorted(os.listdir(input_dir)):
@@ -546,7 +654,7 @@ def audit(input_dir, recon_path, account):
     for label, rows in (("Match", match_rows), ("Candidate", cand_rows),
                         ("Misdirected", misdir_rows)):
         for r in rows:
-            for st in _split_multi(r[COL_ST_NUMS]):
+            for st in _split_ids(r[COL_ST_NUMS]):
                 if st in seen:
                     c3_ok = False
                     failures.append(f"C3: ST {st} reused ({seen[st]} and {label})")
@@ -579,7 +687,7 @@ def audit(input_dir, recon_path, account):
     # C5 dual-fire excluded from Matches (a Match may not cite the same ST twice).
     c5_ok = True
     for r in match_rows:
-        sts = _split_multi(r[COL_ST_NUMS])
+        sts = _split_ids(r[COL_ST_NUMS])
         if len(sts) != len(set(sts)):
             c5_ok = False
             failures.append(f"C5: dual-fire ST in a Match row: {sts}")
@@ -717,6 +825,39 @@ def audit(input_dir, recon_path, account):
                 c10_ok = False
                 failures.append(f"C10: extra provenance column in {t}: {r}")
     checks["C10"] = "PASS" if c10_ok else "FAIL"
+
+    # C11 ST-id membership (owner critical review, 2026-07-19): a placement
+    # citing a system-transaction id that exists in NO source export is a
+    # fabrication.  The superset is deliberately permissive (all sources,
+    # all dates, no status filter) and matching is layered — whole cell,
+    # then per-id token, then the id's primary digit run — so a REAL id can
+    # never false-fail (disambiguation suffixes, PAYMENTS/MET-only ids,
+    # DOC synth receipts, .xlsb .0 artifacts, internal-comma parse-rule ids
+    # and space-joined SPN ids are all covered).
+    valid_ids, valid_digits = _reparse_valid_st_ids(input_dir)
+    if not valid_ids:
+        checks["C11"] = "SKIP (no ST-side sources found)"
+    else:
+        c11_ok = True
+        for label, rows_ in (("Match", match_rows), ("Candidate", cand_rows),
+                             ("Misdirected", misdir_rows)):
+            for r in rows_:
+                cell = _N(r[COL_ST_NUMS])
+                if not cell:
+                    continue
+                if _DISAMBIG_RE.sub("", cell).strip() in valid_ids:
+                    continue
+                for tok in _split_ids(cell, strip_disambig=True):
+                    if tok in valid_ids:
+                        continue
+                    run = _longest_digit_run(tok)
+                    if run and run in valid_digits:
+                        continue
+                    c11_ok = False
+                    failures.append(
+                        f"C11: {label} cites ST id {tok!r} absent from every "
+                        "ST/receipt/payment/MET source")
+        checks["C11"] = "PASS" if c11_ok else "FAIL"
 
     status = "PASS" if not failures else "FAIL"
     return {"status": status, "checks": checks, "failures": failures}
