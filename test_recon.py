@@ -1449,5 +1449,191 @@ class TestRealDataShapes(unittest.TestCase):
         self.assertTrue(E._type_gate_ok(b, eft))
 
 
+def _write_csv(path, rows):
+    import csv
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerows(rows)
+
+
+class TestChartOfAccounts(unittest.TestCase):
+    """Tier-1 Chart of Accounts decode (owner COA export, 2026-07-19): a
+    loaded, advisory human-label decoder consumed only in the non-gating
+    Review / recommended-GL text.  Placements stay byte-identical with and
+    without the CoA bundle (campus/entity consistency confers nothing —
+    rule 8c)."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.out = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+        shutil.rmtree(self.out, ignore_errors=True)
+
+    # ---- decode helpers ------------------------------------------------
+    def test_segment_helpers(self):
+        combo = "01-1100001-123456-100210-000-0000-40-0000"
+        self.assertEqual(E.segments_of(combo),
+                         ["01", "1100001", "123456", "100210", "000", "0000", "40", "0000"])
+        self.assertEqual(E.segments_of(""), [])
+        self.assertEqual(E.dept_segment_of(combo), "123456")
+        self.assertEqual(E.entity_segment_of(combo), "01")
+        self.assertIsNone(E.dept_segment_of("01-11"))
+        self.assertIsNone(E.entity_segment_of(""))
+        # account_of_gl_segments still reads position 4 (behavior unchanged).
+        self.assertEqual(E.account_of_gl_segments(combo), "FHB_MASTER")
+
+    def test_coa_decode_and_valid(self):
+        combo = "01-1100001-123456-100210-000-0000-00-0000"
+        coa = {
+            "combo_decode": {combo: {
+                "ent": "01", "ent_desc": "UT System",
+                "fund": "1100001", "dept": "123456", "dep_desc": "Test Department",
+                "account": "100210", "act_desc": "FHB Master Account",
+                "intercompany": "00", "itc_desc": "Default Intercompany",
+                "act_grp_desc": "TTL Assets"}},
+            "entity_desc": {"01": "UT System", "40": "UT Chattanooga"},
+            "postable_efdp": {"01-1100001-123456-000"},
+        }
+        d = E.coa_decode(combo, coa)
+        self.assertEqual(d["dep_desc"], "Test Department")
+        self.assertEqual(d["ent_desc"], "UT System")
+        # CoA absent, or too-short combo -> None (callers no-op).
+        self.assertIsNone(E.coa_decode(combo, None))
+        self.assertIsNone(E.coa_decode("01-11", coa))
+        # unknown combo falls back to per-segment entity/intercompany labels.
+        miss = E.coa_decode("40-2200002-999999-100310-000-0000-01-0000", coa)
+        self.assertEqual(miss["ent_desc"], "UT Chattanooga")
+        self.assertEqual(miss["dep_desc"], "")
+        # validity: recognized + postable for the known combo.
+        v = E.coa_combo_valid(combo, coa)
+        self.assertTrue(v["recognized"] and v["postable"])
+        v2 = E.coa_combo_valid("40-2200002-999999-100310-000-0000-01-0000", coa)
+        self.assertFalse(v2["recognized"])
+        self.assertFalse(v2["postable"])
+        self.assertEqual(E.coa_combo_valid(combo, None),
+                         {"recognized": False, "postable": False})
+
+    # ---- loader + routing ---------------------------------------------
+    def test_router_coa_structural_files(self):
+        for name in ("AcctCombos_base.csv", "AcctCombos_6.csv", "Segments.csv",
+                     "ComboSets.xlsx", "CombosTech_UTSystem.xlsx",
+                     "RelatedValueSets.csv"):
+            self.assertEqual(E.classify_file(name), "CHART_OF_ACCOUNTS", msg=name)
+        # ORT_Department_* stays DEPT_INFO (bound before CHART_OF_ACCOUNTS).
+        self.assertEqual(E.classify_file("ORT_Department_Info.xlsx"), "DEPT_INFO")
+
+    def _write_coa_bundle(self, d):
+        _write_csv(os.path.join(d, "AcctCombos_base.csv"), [
+            ["ENT_DESC", "FND_DESC", "DEP_DESC", "PGM_DESC", "ACCOUNT_COMBO",
+             "ACT_DESC", "ATV_DESC", "ITC_DESC", "ACT_GRP_DESC"],
+            ["01-UT System", "1100001-E&G Funds", "123456-Test Department",
+             "000-Default Program", "01-1100001-123456-100210-000-0000-00-0000",
+             "100210-FHB Master Account", "0000-Default Activity",
+             "00-Default Intercompany", "1ZZZZZ-TTL Assets"],
+        ])
+        _write_csv(os.path.join(d, "Segments.csv"), [
+            ["ENABLED_FLAG", "SUMMARY_FLAG", "DESCRIPTION", "SEGMENT_TYPE",
+             "START_DATE", "END_DATE", "VALUE"],
+            ["Y", "N", "UT System", "Entity", "01/01/2019", "12/31/4712", "01"],
+            ["Y", "N", "UT Chattanooga", "Entity", "01/01/2019", "12/31/4712", "40"],
+            ["N", "N", "Retired Code", "Entity", "01/01/2019", "12/31/4712", "99"],
+        ])
+        _write_xlsx(os.path.join(d, "ComboSets.xlsx"), [("Sheet1", [
+            ("COA Combination Sets", None),
+            ("Run Date:\xa0Jul 18, 2026", None),
+            ("Combination Set", "Entity"),
+            ("01-1100001-123456-000", "01-UT System"),
+            ("1 of 1", None),
+        ])])
+
+    def test_load_chart_of_accounts(self):
+        self._write_coa_bundle(self.d)
+        files = [E.RoutedFile("CHART_OF_ACCOUNTS", os.path.join(self.d, n), n, "Report")
+                 for n in ("AcctCombos_base.csv", "Segments.csv", "ComboSets.xlsx")]
+        coa = E.load_chart_of_accounts(files)
+        self.assertIn("01-1100001-123456-100210-000-0000-00-0000", coa["combo_decode"])
+        dec = coa["combo_decode"]["01-1100001-123456-100210-000-0000-00-0000"]
+        self.assertEqual(dec["dep_desc"], "Test Department")
+        self.assertEqual(dec["ent_desc"], "UT System")
+        self.assertEqual(dec["act_desc"], "FHB Master Account")
+        self.assertEqual(coa["entity_desc"]["01"], "UT System")
+        self.assertNotIn("99", coa["entity_desc"])          # ENABLED_FLAG=N dropped
+        self.assertIn("01-1100001-123456-000", coa["postable_efdp"])
+        self.assertNotIn("1 of 1", coa["postable_efdp"])    # footer dropped
+        # nothing usable -> None (files-optional graceful degradation).
+        self.assertIsNone(E.load_chart_of_accounts([]))
+
+    # ---- end-to-end: byte-identical placements, enriched Review --------
+    def _met_with_segments(self):
+        return [
+            ("CBE_BANK_ACCOUNT_NAME", "CET_REFERENCE_TEXT", "CET_STATUS",
+             "CET_TRANSACTION_DATE", "CET_TRANSACTION_ID", "AMOUNT",
+             "TRANSACTION_DATE", "CET_DESCRIPTION", "DEPOSIT_ID", "RECEIPT_ID",
+             "ASSET_CONCATENATED_SEGMENTS"),
+            # already-reconciled counterpart at 250.00 carrying an asset combo:
+            # falls to P10 Review (closed), where the CoA decodes its dept/entity.
+            ("FHB - Master Account", "TIEREF9", "REC", "2026-07-01", 555,
+             "250.00", "2026-07-01", "d:970 | r:71 | PAYER A", 970, 71,
+             "01-1100001-123456-100210-000-0000-00-0000"),
+        ]
+
+    def _build_master(self, with_coa):
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-03", "250.00", "TIEREF9", "ACH CREDIT", "TIEREF9",
+             "Automated clearing house", "Line 1 , 2026-07-03", "142"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Counterparty"),
+              ("2026-07-02", "999.00", "OTHER", 601, "External", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        _write_xlsx(os.path.join(self.d, "20260710_MET_All_Accounts.xlsx"),
+                    [("Miscellaneous External Transact", self._met_with_segments())])
+        if with_coa:
+            self._write_coa_bundle(self.d)
+
+    def _placement_tabs(self, wb_path):
+        tabs, _ = A._read_output_tabs(wb_path)
+        return {t: [tuple(A._N(c) for c in r) for r in tabs[t][3:] if any(A._N(c) for c in r)]
+                for t in ("Matches", "Candidate Matches", "Misdirected")}
+
+    def test_coa_absent_output_and_enrichment(self):
+        # Run WITHOUT the CoA bundle.
+        self._build_master(with_coa=False)
+        rb = E.run(self.d, self.out, present=True)
+        self.assertEqual(rb["audit"]["status"], "PASS", msg=str(rb["audit"].get("failures")))
+        tabs_b = A._read_output_tabs(rb["recon_workbook"])[0]
+        rev_b = [r for r in tabs_b["Review Notes"][3:] if any(A._N(c) for c in r)]
+        expl_b = A._N(rev_b[0][A.COL_EXPL])
+        place_b = self._placement_tabs(rb["recon_workbook"])
+        self.assertNotIn("coa_combo_validity", rb)
+        self.assertNotIn("dept Test Department", expl_b)
+
+        # Fresh run WITH the CoA bundle.
+        shutil.rmtree(self.out, ignore_errors=True); self.out = tempfile.mkdtemp()
+        self._build_master(with_coa=True)
+        rc = E.run(self.d, self.out, present=True)
+        self.assertEqual(rc["audit"]["status"], "PASS", msg=str(rc["audit"].get("failures")))
+        tabs_c = A._read_output_tabs(rc["recon_workbook"])[0]
+        rev_c = [r for r in tabs_c["Review Notes"][3:] if any(A._N(c) for c in r)]
+        expl_c = A._N(rev_c[0][A.COL_EXPL])
+        place_c = self._placement_tabs(rc["recon_workbook"])
+
+        # Placements byte-identical; only the Review explanation is enriched.
+        self.assertEqual(place_b, place_c)
+        self.assertEqual([r[:A.COL_EXPL] for r in rev_b],
+                         [r[:A.COL_EXPL] for r in rev_c])
+        self.assertIn("ALREADY_RECONCILED_COUNTERPART", A._N(rev_c[0][A.COL_EXPL]))
+        self.assertIn("dept Test Department", expl_c)
+        self.assertIn("entity UT System", expl_c)
+        # diagnostic counter present, everything recognized + postable.
+        self.assertEqual(rc["coa_combo_validity"],
+                         {"rows_seen": 1, "unrecognized_combo": 0, "non_postable_efdp": 0})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

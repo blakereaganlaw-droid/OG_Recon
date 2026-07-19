@@ -259,6 +259,24 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   inside the UTIA MET). Entity segment codes (10=UTK, 40=UTC, 50=UTM,
   60=UTSO, 70=UTHSC, 17/18/19=UTIA family) are reference only — campus
   "consistency" confers NOTHING (rule 8c).
+- **COA decode bundle — Tier 1 (owner, 2026-07-19).** The Chart of Accounts
+  reference set (role `CHART_OF_ACCOUNTS`: the seven `AcctCombos` shards +
+  `Segments.csv` + `ComboSets`/`CombosTech`) is a multi-file, OPTIONAL bundle
+  loaded by `load_chart_of_accounts` into `{combo_decode, entity_desc,
+  postable_efdp}` (5,515 distinct combos / 29 entities / 1,257 postable
+  E-F-D-P keys on real data). Its ONLY job is to DECODE a GL combo into human
+  labels (`coa_decode`, `segments_of`/`dept_segment_of`/`entity_segment_of`)
+  for two NON-GATING text surfaces: `_p10_review_cause` annotates each named
+  ST that carries `asset_segments` with "(dept …, entity …)", and
+  `recommend_gl_string` falls back — after a MID_MASTER miss — to the
+  exact-amount counterpart's decoded combo. It is ADVISORY: placements stay
+  byte-identical with the bundle present or absent (campus/entity consistency
+  confers nothing — rule 8c); when absent, every consumer no-ops. The loader
+  skips the huge `ORT_Activity_GL_Departments` routing table and
+  `RelatedValueSets` (out of scope). Diagnostic only: build_pool logs
+  `coa_combo_validity` (rows_seen / unrecognized_combo / non_postable_efdp)
+  beside `met_gl_conflicts` — a counter that never drops or downgrades a row.
+  The entity-divergence downgrade (Tier 2) is designed but not yet wired.
 - UNR-only exports are residuals: Oracle already took the easy matches, so
   low Match counts with precise Candidate/Review causes are CORRECT there,
   not a defect. Receipts/Edison/GMS exports enrich what can match.

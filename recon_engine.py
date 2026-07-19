@@ -351,7 +351,15 @@ ROUTER_TABLE = [
     # 'payables') and account files never match.
     RouterRule("PAYMENTS", ["payables", "payments"], [], [], "first", False),
     RouterRule("DEPT_INFO", [], [], ["ort_department", "department_info"], "Report", False),
-    RouterRule("CHART_OF_ACCOUNTS", [], [], ["chart_of_accounts", "gl_departments"], "Report", False),
+    # CHART_OF_ACCOUNTS (owner COA export, 2026-07-19): the combination-universe
+    # reference bundle — the seven AcctCombos shards, Segments.csv, ComboSets /
+    # CombosTech.  A multi-file role; load_chart_of_accounts dispatches each file
+    # by name and skips the rest (RelatedValueSets, the ORT_Activity routing
+    # table).  Placed AFTER DEPT_INFO so ORT_Department_* still bind DEPT_INFO.
+    RouterRule("CHART_OF_ACCOUNTS", [], [],
+               ["chart_of_accounts", "gl_departments", "acctcombos",
+                "combosets", "combostech", "segments", "relatedvaluesets"],
+               "Report", False),
     RouterRule("ORT_AR", ["ort", "_ar"], [], [], "Report", False),
     RouterRule("ORT_MISC", ["ort", "misc"], [], [], "Report", False),
     RouterRule("BAI2", ["bai"], [], [], "first", False),
@@ -491,15 +499,94 @@ _GL_CASH_ACCOUNTS = {
 }
 
 
+def segments_of(segments):
+    """Split a concatenated GL combination into its dash-delimited segments.
+    The SINGLE split point for combo strings — positional layout
+    [ENTITY, FUND, DEPT, ACCOUNT, PROGRAM, ACTIVITY, INTERCOMPANY, FUTURE]
+    (widths 2/7/6/6/3/4/2/4) — so every decoder reuses one parse and the
+    "Account is position 4, not last" gotcha lives in exactly one place.
+    Returns [] for an empty/blank string."""
+    s = N(segments)
+    if not s:
+        return []
+    return [p.strip() for p in s.split("-")]
+
+
 def account_of_gl_segments(segments):
     """Map a concatenated GL combination ("01-1100001-000000-100221-...") to
     the short engine account via its natural-account segment (position 4 of
     the ENTITY-FUND-DEPT-ACCOUNT-... combo).  Returns None for malformed
     combos and for GLs belonging to no configured depository account."""
-    parts = N(segments).split("-")
+    parts = segments_of(segments)
     if len(parts) < 4:
         return None
-    return _GL_CASH_ACCOUNTS.get(parts[3].strip())
+    return _GL_CASH_ACCOUNTS.get(parts[3])
+
+
+def dept_segment_of(segments):
+    """Department segment (position 3) of a GL combo, or None if absent."""
+    parts = segments_of(segments)
+    return parts[2] if len(parts) > 2 else None
+
+
+def entity_segment_of(segments):
+    """Entity segment (position 1) of a GL combo, or None if absent."""
+    parts = segments_of(segments)
+    return parts[0] if parts else None
+
+
+def _coa_label(v):
+    """The human label carried in an AcctCombos "<code>-<label>" *_DESC cell
+    ("01-UT System" -> "UT System").  A cell with no dash is returned as-is."""
+    s = N(v)
+    return s.split("-", 1)[1].strip() if "-" in s else s
+
+
+def coa_decode(segments, coa):
+    """Decode a concatenated GL combination into human labels through the
+    loaded Chart of Accounts (or None).  ADVISORY ONLY — campus/entity
+    "consistency" confers no matching evidence (rule 8c); this feeds Review
+    and recommended-GL text, never a placement.  Returns a dict
+    {ent, ent_desc, fund, dept, dep_desc, account, act_desc, intercompany,
+    itc_desc, act_grp_desc} or None when the CoA is absent or the string
+    yields <4 segments (callers no-op)."""
+    if not coa:
+        return None
+    parts = segments_of(segments)
+    if len(parts) < 4:
+        return None
+    combo = "-".join(parts)
+    decoded = coa.get("combo_decode", {}).get(combo)
+    if decoded is not None:
+        return decoded
+    # Miss: fall back to per-segment labels.  The Entity value set decodes
+    # BOTH the Entity segment (pos1) and the Intercompany segment (pos7),
+    # which reuse the same value set; Account/Dept stay raw codes.
+    entity_desc = coa.get("entity_desc", {})
+    itc = parts[6] if len(parts) > 6 else ""
+    return {
+        "ent": parts[0], "ent_desc": entity_desc.get(parts[0], ""),
+        "fund": parts[1], "dept": parts[2], "dep_desc": "",
+        "account": parts[3], "act_desc": "",
+        "intercompany": itc, "itc_desc": entity_desc.get(itc, ""),
+        "act_grp_desc": "",
+    }
+
+
+def coa_combo_valid(segments, coa):
+    """{'recognized': the full 8-seg combo is in the AcctCombos universe,
+    'postable': its E-F-D-P subkey (segments 1,2,3,5) is in the ComboSet
+    whitelist}.  Feeds ONLY the coa_combo_validity diagnostic counter — it
+    never drops or downgrades a row."""
+    if not coa:
+        return {"recognized": False, "postable": False}
+    parts = segments_of(segments)
+    if len(parts) < 5:
+        return {"recognized": False, "postable": False}
+    combo = "-".join(parts)
+    efdp = "-".join((parts[0], parts[1], parts[2], parts[4]))
+    return {"recognized": combo in coa.get("combo_decode", {}),
+            "postable": efdp in coa.get("postable_efdp", set())}
 
 
 def _leading_date_key(filename):
@@ -1145,11 +1232,14 @@ class PoolEntry:
     #                            account (misdirected-SPN shadow pool; owner
     #                            hard guardrail 2026-07-18) — never eligible
     #                            for normal Matches/Candidates
+    asset_segments: str = ""   # raw MET ASSET_CONCATENATED_SEGMENTS combo,
+    #                            decoded through the CoA for Review/GL text only
+    #                            (advisory; campus consistency confers nothing)
 
 
 def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
               available, origin, deposit_id="", receipt_id="", transaction_type="",
-              spr=""):
+              spr="", asset_segments=""):
     ref = clean_ref(reference)
     return PoolEntry(
         id=N(id),
@@ -1170,6 +1260,7 @@ def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
         receipt_id=N(receipt_id),
         transaction_type=N(transaction_type),
         spr=clean_ref(spr),
+        asset_segments=N(asset_segments),
     )
 
 
@@ -1414,6 +1505,9 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
         rows, m, hi = met["rows"], met["map"], met["header_index"]
         raw = []
         met_total = 0
+        coa = loaded.get("CHART_OF_ACCOUNTS")
+        coa_validity = {"rows_seen": 0, "unrecognized_combo": 0,
+                        "non_postable_efdp": 0}
         have_account = bool(account) and account != "UNKNOWN"
         scoped = m.get("bank_account_name") is not None and have_account
         # COA fallback scope (owner, 2026-07-18): when the export lacks a
@@ -1455,6 +1549,7 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
             trx = N(_cell(r, m.get("trx_id")))
             if amt is None or not trx:
                 continue
+            asset_seg = N(_cell(r, m.get("asset_segments")))
             desc = N(_cell(r, m.get("description")))
             dep_desc, rec_desc, _payer = parse_met_description(desc)
             # Native DEPOSIT_ID / RECEIPT_ID columns are authoritative; the
@@ -1485,6 +1580,7 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 deposit_id=dep_id,
                 receipt_id=rec_id,
                 transaction_type=_cell(r, m.get("transaction_type")),
+                asset_segments=asset_seg,
             )
             if foreign_acc:
                 # Shadow entry: only the misdirected search may cite it, and
@@ -1494,6 +1590,16 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                     e.available = False
                     foreign_raw.append(e)
                 continue
+            # CoA combo-validity diagnostic (owner, 2026-07-19): decode each
+            # in-account MET combo against the CoA universe.  Counter only —
+            # like met_gl_conflicts it never drops or downgrades a row.
+            if coa is not None and asset_seg:
+                coa_validity["rows_seen"] += 1
+                v = coa_combo_valid(asset_seg, coa)
+                if not v["recognized"]:
+                    coa_validity["unrecognized_combo"] += 1
+                if not v["postable"]:
+                    coa_validity["non_postable_efdp"] += 1
             raw.append(e)
         deduped = _dedup_keep_largest(raw, lambda e: e.id)
         counts["MET"] = len(deduped)
@@ -1514,6 +1620,8 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
         elif gl_scoped:
             runlog["met_scope"] = {"rows_total": met_total, "rows_in_account": len(raw),
                                    "key": "gl_cash_account"}
+        if coa is not None and coa_validity["rows_seen"]:
+            runlog["coa_combo_validity"] = coa_validity
         # MET <-> ST bridge (CET_TRANSACTION_ID == ST Transaction Number, a
         # 1:1 bijection): the same transaction must never sit in the pool
         # twice, or reference groups double-count.  The ST export row is
@@ -1548,6 +1656,8 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 prev.deposit_id = e.deposit_id
             if not prev.receipt_id:
                 prev.receipt_id = e.receipt_id
+            if not prev.asset_segments and e.asset_segments:
+                prev.asset_segments = e.asset_segments  # CoA decode (advisory)
             if not prev.counterparty and e.counterparty:
                 prev.counterparty = e.counterparty
                 prev.payer_tokens = prev.payer_tokens | payer_tokens(e.counterparty)
@@ -2940,13 +3050,14 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
 
 
     # ---- P10 Residual -> Review -------------------------------------
+    coa = loaded.get("CHART_OF_ACCOUNTS")
     for bsl in unplaced():
-        codes, expl = _p10_review_cause(bsl, pool, feed_errors, deposit_index)
+        codes, expl = _p10_review_cause(bsl, pool, feed_errors, deposit_index, coa)
         if _is_deposit_correction(bsl):
             codes = ["MANUAL_ECT"] + [c for c in codes if c != "MANUAL_ECT"]
             expl = ("Deposit correction — rarely has an ST; manual ECT "
                     "required. " + expl)
-        gl = recommend_gl_string(bsl, loaded)
+        gl = recommend_gl_string(bsl, loaded, pool)
         if gl:
             expl += f" Recommended GL: {gl}."
         place(bsl, REVIEW, CONF_LOW, [], codes, expl, "P10_review")
@@ -3306,12 +3417,35 @@ def _mid_note(bsl, mid_dir, account):
     return note
 
 
-def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None):
+def _coa_tag(e, coa):
+    """" (dept <DEP_DESC>, entity <ENT_DESC>)" for a named ST that carries a
+    CoA-decodable asset combo, else "".  ADVISORY text only (rule 8c); returns
+    "" when the CoA is absent, so Review output is byte-identical without it."""
+    seg = getattr(e, "asset_segments", "")
+    if not coa or not seg:
+        return ""
+    d = coa_decode(seg, coa)
+    if not d:
+        return ""
+    bits = []
+    if d.get("dep_desc"):
+        bits.append(f"dept {d['dep_desc']}")
+    if d.get("ent_desc"):
+        bits.append(f"entity {d['ent_desc']}")
+    return f" ({', '.join(bits)})" if bits else ""
+
+
+def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None, coa=None):
     """Name the dominant Review cause (Section 9 P10), distinguishing open
-    counterparts from already-reconciled ones and testing the ties it names."""
+    counterparts from already-reconciled ones and testing the ties it names.
+    When a Chart of Accounts is loaded, each named ST that carries an asset
+    combo is annotated with its decoded department/entity (advisory only)."""
     exact = [e for e in pool if e.amount_cents == bsl.amount_cents]
     open_exact = [e for e in exact if e.available]
     closed_exact = [e for e in exact if not e.available]
+
+    def _named(entries):
+        return ", ".join(f"{e.id}{_coa_tag(e, coa)}" for e in entries)
 
     def _tied(entries):
         return [e for e in entries
@@ -3341,7 +3475,7 @@ def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None):
                 codes.append("POSSIBLE_AUTO_REC_SPLIT")
                 expl = (f"No open counterpart, but CLOSED ORT deposit d:{dep} "
                         f"({len(members)} already-reconciled receipt(s): "
-                        + ", ".join(e.id for e in _sorted(members)[:8])
+                        + _named(_sorted(members)[:8])
                         + ") sums exactly to this line — its receipts were "
                         "cherry-picked onto other lines. Run Unreconcile2; "
                         "the line closes only after those groups release.")
@@ -3367,7 +3501,7 @@ def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None):
             expl = ("Only already-reconciled counterpart(s) at this amount — "
                     + ("payer/reference tie " if tied else "")
                     + "suggests an auto-rec error: "
-                    + ", ".join(sorted(e.id for e in tied))
+                    + _named(sorted(tied, key=lambda e: e.id))
                     + ". Run Unreconcile2.")
         else:
             expl = ("Only already-reconciled (closed) counterpart(s) at this "
@@ -3377,7 +3511,7 @@ def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None):
     return list(dict.fromkeys(codes)), expl
 
 
-def recommend_gl_string(bsl, loaded):
+def recommend_gl_string(bsl, loaded, pool=None):
     """Best-effort GL account string for a manual ECT (Section 6 sources)."""
     # MID master only (merchant lane); MISC Receipts is an ALL_DATA sheet,
     # never loaded here — returns "" when there is no MID hit.
@@ -3386,6 +3520,21 @@ def recommend_gl_string(bsl, loaded):
         gl = mid_master.get("mid_gl", {}).get(bsl.mid)
         if gl:
             return gl
+    # CoA fallback (owner, 2026-07-19): after a MID miss, an exact-amount ST
+    # counterpart carrying an asset combo yields a human-readable GL/department
+    # for the manual ECT.  Advisory only — never a placement (rule 8c); returns
+    # "" when the CoA is absent, so the Review text is byte-identical without it.
+    coa = loaded.get("CHART_OF_ACCOUNTS")
+    if coa and pool:
+        for e in _sorted([p for p in pool
+                          if p.amount_cents == bsl.amount_cents
+                          and getattr(p, "asset_segments", "")]):
+            d = coa_decode(e.asset_segments, coa)
+            if d:
+                label = " / ".join(x for x in
+                                   (d.get("ent_desc"), d.get("dep_desc"),
+                                    d.get("act_desc")) if x)
+                return f"{e.asset_segments} = {label}" if label else e.asset_segments
     return ""
 
 
@@ -3586,6 +3735,136 @@ def load_mid_master(routed_file: RoutedFile):
     return {"mid_gl": mid_gl}
 
 
+# ---- Chart of Accounts decode bundle (owner COA export, 2026-07-19) ----
+
+def _coa_header_index(rows, marker):
+    """First row carrying a header cell whose normalized form == marker.
+    OTBI workbooks prepend title/run-date preamble rows, so the header is
+    located, never assumed row 0 (matches the engine's header-scan doctrine)."""
+    want = _norm_header(marker)
+    for i, row in enumerate(rows):
+        for c in row:
+            if _norm_header(c) == want:
+                return i
+    return None
+
+
+def _coa_colmap(header_row):
+    """Normalized-header -> leftmost column index (duplicate headers bind the
+    leftmost, per the binder's convention)."""
+    idx = {}
+    for j, h in enumerate(header_row):
+        idx.setdefault(_norm_header(h), j)
+    return idx
+
+
+def _coa_read_acctcombos(rf, combo_decode):
+    """Parse one AcctCombos shard into combo_decode[ACCOUNT_COMBO] -> labels.
+    The *_DESC columns are pre-joined "<code>-<label>" pairs, so no per-segment
+    dictionary lookup is needed on the common path."""
+    rows, _ = read_rows(rf)
+    hi = _coa_header_index(rows, "ACCOUNT_COMBO")
+    if hi is None:
+        return
+    idx = _coa_colmap(rows[hi])
+    ci = idx.get("ACCOUNTCOMBO")
+    if ci is None:
+        return
+    c_ent = idx.get("ENTDESC")
+    c_fnd = idx.get("FNDDESC")
+    c_dep = idx.get("DEPDESC")
+    c_act = idx.get("ACTDESC")
+    c_itc = idx.get("ITCDESC")
+    c_grp = idx.get("ACTGRPDESC")
+    for r in rows[hi + 1:]:
+        combo = N(_cell(r, ci))
+        parts = segments_of(combo)
+        if len(parts) < 4:
+            continue
+        key = "-".join(parts)
+        combo_decode.setdefault(key, {
+            "ent": parts[0], "ent_desc": _coa_label(_cell(r, c_ent)),
+            "fund": parts[1], "fund_desc": _coa_label(_cell(r, c_fnd)),
+            "dept": parts[2], "dep_desc": _coa_label(_cell(r, c_dep)),
+            "account": parts[3], "act_desc": _coa_label(_cell(r, c_act)),
+            "intercompany": parts[6] if len(parts) > 6 else "",
+            "itc_desc": _coa_label(_cell(r, c_itc)),
+            "act_grp_desc": _coa_label(_cell(r, c_grp)),
+        })
+
+
+def _coa_read_segments(rf, entity_desc):
+    """Parse Segments.csv into entity_desc[VALUE] -> DESCRIPTION for
+    SEGMENT_TYPE=Entity rows with ENABLED_FLAG='Y'.  This value set also decodes
+    the Intercompany segment (it reuses the Entity codes).  Effective-date
+    gating is intentionally omitted: the engine carries no clock (rule 9)."""
+    rows, _ = read_rows(rf)
+    hi = _coa_header_index(rows, "SEGMENT_TYPE")
+    if hi is None:
+        return
+    idx = _coa_colmap(rows[hi])
+    c_type = idx.get("SEGMENTTYPE")
+    c_val = idx.get("VALUE")
+    c_desc = idx.get("DESCRIPTION")
+    c_en = idx.get("ENABLEDFLAG")
+    if c_type is None or c_val is None or c_desc is None:
+        return
+    for r in rows[hi + 1:]:
+        if _norm_header(_cell(r, c_type)) != "ENTITY":
+            continue
+        if c_en is not None and _norm_header(_cell(r, c_en)) not in ("Y", ""):
+            continue
+        val = N(_cell(r, c_val))
+        if val:
+            entity_desc.setdefault(val, N(_cell(r, c_desc)))
+
+
+def _coa_read_combosets(rf, postable_efdp):
+    """Parse ComboSets/CombosTech into the postable E-F-D-P whitelist.  The
+    "Combination Set" column already carries the 4-segment key
+    (Entity-Fund-Department-Program); the "1 of 1" footer and any non-4-part
+    cell are dropped, and non-breaking spaces are stripped."""
+    rows, _ = read_rows(rf)
+    hi = _coa_header_index(rows, "Combination Set")
+    if hi is None:
+        return
+    ci = _coa_colmap(rows[hi]).get("COMBINATIONSET")
+    if ci is None:
+        return
+    for r in rows[hi + 1:]:
+        key = N(_cell(r, ci)).replace("\xa0", "").strip()
+        parts = [p.strip() for p in key.split("-")]
+        if len(parts) == 4 and all(parts):
+            postable_efdp.add("-".join(parts))
+
+
+def load_chart_of_accounts(files):
+    """Load the Chart of Accounts reference bundle (owner COA export,
+    2026-07-19): the combination universe that DECODES a GL combo into human
+    department/entity labels for Review and recommended-GL text.  ADVISORY
+    ONLY — campus/entity "consistency" confers no matching evidence (rule 8c),
+    so nothing here ever gates a placement.
+
+    Accepts the routed CoA file set (the seven AcctCombos shards, Segments.csv,
+    ComboSets/CombosTech); dispatches each by filename token and skips anything
+    else (RelatedValueSets and the huge ORT_Activity_GL_Departments routing
+    table are out of scope here).  Returns {combo_decode, entity_desc,
+    postable_efdp} or None when nothing usable loaded (every consumer no-ops)."""
+    combo_decode, entity_desc, postable_efdp = {}, {}, set()
+    for rf in files:
+        low = rf.filename.lower()
+        if "acctcombos" in low:
+            _coa_read_acctcombos(rf, combo_decode)
+        elif "combosets" in low or "combostech" in low:
+            _coa_read_combosets(rf, postable_efdp)
+        elif "segments" in low:
+            _coa_read_segments(rf, entity_desc)
+    if not combo_decode and not entity_desc:
+        return None
+    return {"combo_decode": combo_decode, "entity_desc": entity_desc,
+            "postable_efdp": postable_efdp}
+
+
 # ======================================================================
 # Section 9 P0 — Load & validate; build BSL list
 # ======================================================================
@@ -3617,6 +3896,18 @@ def load_and_bind(by_role, runlog):
     for role, files in by_role.items():
         if role == "ALL_DATA":
             continue  # recognized but never loaded (Unreconcile2 owns it)
+        if role == "CHART_OF_ACCOUNTS":
+            # Multi-file reference bundle: pass the WHOLE routed set to the
+            # loader (never _pick_newest — the shards are complementary, not
+            # date-competing).  Optional at every consumer, so None is fine.
+            coa = load_chart_of_accounts(files)
+            if coa is not None:
+                loaded["CHART_OF_ACCOUNTS"] = coa
+                bound_report[role] = {"files": [f.filename for f in files],
+                                      "combos": len(coa["combo_decode"]),
+                                      "entities": len(coa["entity_desc"]),
+                                      "postable_efdp": len(coa["postable_efdp"])}
+            continue
         specs = role_specs.get(role)
         if specs is None and role != "MID_MASTER":
             continue  # recognized; no binding required at this layer
