@@ -168,8 +168,9 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    keep exactly ONE available (deterministic; runlog `dual_fire_twins` — 33
    live on real UTIA data). **R8 — check rails**: the check number IS the
    identity; same amount + different check number is a CONFLICT
-   (`_check_number_conflict`, P9b amount-only lane) — the FHB AP $1,100
-   cascade; blank references are silence. **Signature #6 — cherry-pick
+   (`_check_number_conflict`, both the P9b amount-only lane AND the
+   P9_payables candidate lane) — the FHB AP $1,100 cascade; blank
+   references are silence. **Signature #6 — cherry-pick
    split**: a stranded line with no exact counterpart but an ALL-closed MET
    deposit summing exactly gets an enriched Review naming d:/members
    (`POSSIBLE_AUTO_REC_SPLIT` → run Unreconcile2), never a forced match.

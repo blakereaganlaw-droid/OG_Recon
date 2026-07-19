@@ -33,7 +33,7 @@
 - **Backward un-reconciliation** — take the already-reconciled groups for the same account and re-verify each against doctrine; flag any group whose reconciliation is unsound (wrong amount, wrong reference, implausible date, one-to-many mis-pairing, illegal source) and recommend an **unwind**. This is not optional; catching and fixing bad reconciliations is core to the work.
 
 ### 1.2 Accounts
-FHB (First Horizon Bank): Master, UTHSC, UTIA, UTC, UTM, UTSO, AP.
+FHB (First Horizon Bank): Master, UTHSC, UTIA, UTC, UTM, UTSO, AP, and the Student Refund depositories (UTK, UTC — distinct 4-token accounts, `FHB_STUDENT_REFUND_*`, that win over the generic campus token).
 Regions: UTIA, UTIPS, UTM.
 The engine is account-agnostic; the account is inferred from the file router (Section 4) and every match is scoped to a single account.
 

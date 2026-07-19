@@ -955,6 +955,46 @@ class TestRealDataShapes(unittest.TestCase):
         self.assertEqual(E.account_of_bank_name("Regions - UTM"), "REGIONS_UTM")
         self.assertIsNone(E.account_of_bank_name("TRUIST BANK - Chattanooga"))
 
+    def test_student_refund_accounts(self):
+        # Owner (2026-07-19): Student Refund accounts are distinct depositories
+        # and must win over the generic campus token (4-token match first).
+        self.assertEqual(E.infer_account("20260719_Oracle_CM_FHB_Student_Refund_UTK_BSL_UNR.xlsx"),
+                         "FHB_STUDENT_REFUND_UTK")
+        self.assertEqual(E.infer_account("20260719_Oracle_CM_FHB_UTC_Student_Refund_BSL_UNR.xlsx"),
+                         "FHB_STUDENT_REFUND_UTC")
+        self.assertEqual(E.account_of_bank_name("FHB - Student Refund - UTK"),
+                         "FHB_STUDENT_REFUND_UTK")
+        self.assertEqual(E.account_of_bank_name("FHB - Student Refund - UTC"),
+                         "FHB_STUDENT_REFUND_UTC")
+        # a plain UTC file carries neither "student" nor "refund" -> FHB_UTC
+        self.assertEqual(E.infer_account("20260716_Oracle_CM_FHB_UTC_BSL_UNR.xlsx"), "FHB_UTC")
+        self.assertIsNone(E.account_of_bank_name("FHB - UTFI"))
+
+    def test_check_conflict_bars_payables_candidate(self):
+        # Orphan doctrine R8 end-to-end: a CHECK bank line whose only
+        # same-amount open Payables ST carries a DIFFERENT check number is a
+        # conflict — it must fall to Review, never an amount-only Candidate.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-13", "-150.00", "60410073", "CHECK", "60410073",
+             "Check", "Line 12 , 2026-07-13", "475"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [
+            ("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Transaction Type", "Counterparty"),
+            # same amount, DIFFERENT check number
+            ("2026-07-13", "-150.00", "60400012", "60400012", "Payables", "Check", "BANNER VENDOR"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertEqual(runlog["recon_summary"],
+                         {"matches": 0, "candidates": 0, "misdirected": 0, "reviews": 1})
+
     def _met_rows(self):
         return [
             ("CBE_BANK_ACCOUNT_NAME", "CET_REFERENCE_TEXT", "CET_STATUS",

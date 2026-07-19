@@ -372,6 +372,12 @@ HARD_REQUIRED_ROLES = {"BSL"}
 
 # Account tokens recognized in filenames (Section 1.2 + 4.1).
 _ACCOUNT_TOKENS = [
+    # Student Refund accounts (owner, 2026-07-19) — distinct depository
+    # statements ("FHB - Student Refund - UTK/UTC").  Listed FIRST so the
+    # 4-token match wins over the generic campus token (a plain FHB UTC file
+    # carries neither "student" nor "refund", so it still binds FHB_UTC).
+    ("FHB_STUDENT_REFUND_UTK", ["fhb", "student", "refund", "utk"]),
+    ("FHB_STUDENT_REFUND_UTC", ["fhb", "student", "refund", "utc"]),
     ("FHB_MASTER", ["fhb", "master"]),
     ("FHB_UTHSC", ["fhb", "uthsc"]),
     ("FHB_UTIA", ["fhb", "utia"]),
@@ -2601,7 +2607,13 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   [], "Negative BSL matched to single reference-tied open Payables ST.",
                   "P9_payables")
         elif cands:
-            cands = [e for e in cands if not payer_contradiction(bsl, [e])]
+            # Orphan doctrine R8 (owner, 2026-07-19): on check rails the check
+            # number IS the identity — a same-amount AP check with a DIFFERENT
+            # check number is a conflict, never an amount-only candidate (the
+            # FHB AP $1,100 cascade).  Payer contradiction bars the rest.
+            cands = [e for e in cands
+                     if not payer_contradiction(bsl, [e])
+                     and not _check_number_conflict(bsl, e)]
             if not cands:
                 continue
             ordered = _sorted(cands)
