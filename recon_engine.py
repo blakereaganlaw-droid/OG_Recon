@@ -1415,6 +1415,7 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
             by_id.setdefault(p.base_id or p.id, []).append(p)
         merged = 0
         dropped_mismatch = 0
+        met_status_overrides = 0
         for e in deduped:
             group = by_id.get(e.base_id or e.id)
             if not group:
@@ -1447,7 +1448,18 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 prev.znref = znorm(e.reference)
                 prev.digits = digit_runs(e.reference)
                 prev.is_mid = prev.is_mid or e.is_mid
+            # Orphan doctrine R3 (owner, 2026-07-19): MET status OUTRANKS the
+            # ST export.  If MET says the transaction's money is already
+            # consumed (REC / cleared), the open-looking ST is an orphan or a
+            # stale-export artifact — never consume it, whatever the ST
+            # export's recon status says.
+            if prev.available and not e.available:
+                prev.available = False
+                prev.status = e.status or prev.status
+                met_status_overrides += 1
         runlog["met_bridged_to_st"] = merged
+        if met_status_overrides:
+            runlog["met_status_overrides"] = met_status_overrides
         if dropped_mismatch:
             runlog["met_bridge_amount_mismatch_dropped"] = dropped_mismatch
 
@@ -1489,6 +1501,24 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 enriched += 1
         runlog["ar_matched_enriched"] = enriched
         runlog["ar_matched_rows"] = len(by_recno)
+
+    # Orphan doctrine 2.3 (owner, 2026-07-19): one ORT receipt occasionally
+    # spawns two identical open external STs (dual-fire; 132 confirmed on FHB
+    # Master).  The twin is not new money — prior reconciliation consumed one
+    # copy's line, or will.  Keep exactly ONE available (deterministic order),
+    # mark the twin(s) unavailable so nothing ever matches them.
+    by_fire = {}
+    for e in pool:
+        if e.available and e.receipt_id and not e.foreign_account:
+            by_fire.setdefault((N(e.receipt_id), e.amount_cents), []).append(e)
+    dual_fire_twins = 0
+    for key, group in by_fire.items():
+        if len(group) > 1 and len({e.id for e in group}) > 1:
+            for twin in _sorted(group)[1:]:
+                twin.available = False
+                dual_fire_twins += 1
+    if dual_fire_twins:
+        runlog["dual_fire_twins"] = dual_fire_twins
 
     runlog["pool_sizes"] = counts
     runlog["pool_total"] = len(pool)
@@ -2006,6 +2036,23 @@ def _has_any_tie(bsl, e):
                               | _mid_tokens(e.counterparty)):
         return True
     return False
+
+
+def _check_number_conflict(bsl, e):
+    """Orphan doctrine R8 (owner, 2026-07-19): on check rails the check
+    number IS the identity.  Same amount + a DIFFERENT check number is a
+    conflict, never a partial match — this is exactly how the FHB AP $1,100
+    auto-rec cascade propagated.  Applies only when BOTH sides carry a
+    numeric check-shaped reference (>= 4 digits); a blank reference is
+    silence and never conflicts.  Compare canonically (leading zeros
+    stripped; text reads only — float coercion corrupts 0006789599)."""
+    if "CHECK" not in _norm_header(bsl.transaction_type):
+        return False
+    bref = znorm(bsl.reference_raw) or znorm(bsl.recon_reference)
+    eref = znorm(e.reference)
+    if not (bref.isdigit() and len(bref) >= 4 and eref.isdigit() and len(eref) >= 4):
+        return False
+    return bref.lstrip("0") != eref.lstrip("0")
 
 
 def _type_incongruent_uncorroborated(bsl, e):
@@ -2586,6 +2633,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 continue
             if _type_incongruent_uncorroborated(bsl, e):
                 continue  # Misc BSL vs electronic ST, amount-only (owner 2026-07-13)
+            if _check_number_conflict(bsl, e):
+                continue  # check rails: different check number = conflict (R8)
             elig.append(e)
         if not elig:
             continue
@@ -2766,7 +2815,7 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
 
     # ---- P10 Residual -> Review -------------------------------------
     for bsl in unplaced():
-        codes, expl = _p10_review_cause(bsl, pool, feed_errors)
+        codes, expl = _p10_review_cause(bsl, pool, feed_errors, deposit_index)
         if _is_deposit_correction(bsl):
             codes = ["MANUAL_ECT"] + [c for c in codes if c != "MANUAL_ECT"]
             expl = ("Deposit correction — rarely has an ST; manual ECT "
@@ -3066,7 +3115,7 @@ def _mid_note(bsl, mid_dir, account):
     return note
 
 
-def _p10_review_cause(bsl, pool, feed_errors):
+def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None):
     """Name the dominant Review cause (Section 9 P10), distinguishing open
     counterparts from already-reconciled ones and testing the ties it names."""
     exact = [e for e in pool if e.amount_cents == bsl.amount_cents]
@@ -3081,6 +3130,23 @@ def _p10_review_cause(bsl, pool, feed_errors):
 
     codes = []
     if not exact:
+        # Orphan doctrine signature #6 (owner, 2026-07-19): a stranded line
+        # with NO counterpart at exact cents, but an ALL-closed MET deposit
+        # summing exactly to it — the deposit's receipts were cherry-picked
+        # onto other lines by earlier (auto) reconciliations.  Stop searching
+        # the open pool; the consuming groups need an unwind first.
+        for dep in sorted(deposit_index or {}):
+            members = deposit_index[dep]
+            if members and all(not e.available for e in members) and \
+                    sum(e.amount_cents for e in members) == bsl.amount_cents:
+                codes.append("POSSIBLE_AUTO_REC_SPLIT")
+                expl = (f"No open counterpart, but CLOSED ORT deposit d:{dep} "
+                        f"({len(members)} already-reconciled receipt(s): "
+                        + ", ".join(e.id for e in _sorted(members)[:8])
+                        + ") sums exactly to this line — its receipts were "
+                        "cherry-picked onto other lines. Run Unreconcile2; "
+                        "the line closes only after those groups release.")
+                return list(dict.fromkeys(codes)), expl
         codes.append("NO_MATCH_FOUND")
         expl = "No exact-amount counterpart in the pool."
     elif bsl.lane == LANE_MERCHANT and open_exact:

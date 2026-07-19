@@ -1061,6 +1061,116 @@ class TestRealDataShapes(unittest.TestCase):
         self.assertEqual(runlog["pool_total"], 4)
         self.assertEqual(runlog["met_foreign_account_open_rows"], 1)
 
+    def test_met_status_outranks_st_export(self):
+        # Orphan doctrine R3 (owner, 2026-07-19): if MET says REC for the
+        # bridged transaction, the open-looking ST is consumed — never match
+        # it, whatever the (stale) ST export says.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-03", "150.00", "REF100200", "ACH CREDIT", "REF100200",
+             "Automated clearing house", "Line 2 , 2026-07-03", "142"),
+        ]
+        self._build(bsl)
+        rows = self._met_rows()
+        # flip the bridged trx (601) to REC in MET while ST export says open
+        rows[3] = ("FHB - Master Account", "REF100200", "REC", "2026-07-02", 601,
+                   "150.00", "2026-07-02", "d:901 | r:13 | VENDOR", 901, 13)
+        _write_xlsx(os.path.join(self.d, "20260710_MET_All_Accounts.xlsx"),
+                    [("Miscellaneous External Transact", rows)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertEqual(runlog["met_status_overrides"], 1)
+        self.assertEqual(runlog["recon_summary"]["matches"], 0)
+        tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
+        rev = [r for r in tabs["Review Notes"][3:] if any(A._N(c) for c in r)]
+        blob = " ".join(A._N(r[A.COL_EXPL]) for r in rev)
+        self.assertIn("already-reconciled", blob.lower())
+
+    def test_dual_fire_twin_never_matches_twice(self):
+        # Orphan doctrine 2.3: two identical open STs sharing one MET
+        # RECEIPT_ID are a dual-fire pair — exactly one stays available.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-03", "150.00", "REF100200", "ACH CREDIT", "REF100200",
+             "Automated clearing house", "Line 2 , 2026-07-03", "142"),
+        ]
+        self._build(bsl)
+        rows = self._met_rows()
+        # a dual-fire twin of trx 601: different trx id, same receipt r:13
+        rows.append(("FHB - Master Account", "REF100200", "UNR", "2026-07-02", 602,
+                     "150.00", "2026-07-02", "d:901 | r:13 | VENDOR", 901, 13))
+        _write_xlsx(os.path.join(self.d, "20260710_MET_All_Accounts.xlsx"),
+                    [("Miscellaneous External Transact", rows)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertEqual(runlog["dual_fire_twins"], 1)
+        # the line still matches — but exactly one of the twins is cited
+        self.assertEqual(runlog["recon_summary"]["matches"], 1)
+
+    def test_check_rail_number_conflict(self):
+        # Orphan doctrine R8: on check rails the check number is the identity;
+        # same amount + different check number is a conflict, never a
+        # candidate (the FHB AP $1,100 cascade).
+        class _B:
+            transaction_type = "Check"
+            reference_raw = "0006789599"
+            recon_reference = "6789599"
+        b = _B()
+        other = E._mk_entry("901", 110000, date(2026, 7, 1), "6789601", "", "EXT", "UNR", True, "ST")
+        same = E._mk_entry("902", 110000, date(2026, 7, 1), "0006789599", "", "EXT", "UNR", True, "ST")
+        blank = E._mk_entry("903", 110000, date(2026, 7, 1), "", "", "EXT", "UNR", True, "ST")
+        self.assertTrue(E._check_number_conflict(b, other))   # different check no.
+        self.assertFalse(E._check_number_conflict(b, same))   # same check (zero-padded)
+        self.assertFalse(E._check_number_conflict(b, blank))  # silence never conflicts
+        class _B2:
+            transaction_type = "Automated clearing house"
+            reference_raw = "0006789599"
+            recon_reference = "6789599"
+        self.assertFalse(E._check_number_conflict(_B2(), other))  # not a check rail
+
+    def test_cherry_pick_split_review(self):
+        # Orphan doctrine signature #6: no open counterpart at exact cents,
+        # but an ALL-closed MET deposit sums exactly — enriched Review naming
+        # the deposit, never a forced match.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-03", "1134.00", "NA", "DEPOSIT 099", "NA",
+             "Miscellaneous", "Line 9 , 2026-07-03", "174"),
+        ]
+        self._build(bsl)
+        met = [
+            ("CBE_BANK_ACCOUNT_NAME", "CET_REFERENCE_TEXT", "CET_STATUS",
+             "CET_TRANSACTION_DATE", "CET_TRANSACTION_ID", "AMOUNT",
+             "TRANSACTION_DATE", "CET_DESCRIPTION", "DEPOSIT_ID", "RECEIPT_ID"),
+            ("FHB - Master Account", "DEPREF88", "REC", "2026-07-01", 801,
+             "400.00", "2026-07-01", "d:910 | r:21 | PAYER X", 910, 21),
+            ("FHB - Master Account", "DEPREF88", "REC", "2026-07-01", 802,
+             "600.00", "2026-07-01", "d:910 | r:22 | PAYER X", 910, 22),
+            ("FHB - Master Account", "DEPREF88", "REC", "2026-07-01", 803,
+             "134.00", "2026-07-01", "d:910 | r:23 | PAYER X", 910, 23),
+            # bridged open ST for the other line
+            ("FHB - Master Account", "REF100200", "UNR", "2026-07-02", 601,
+             "150.00", "2026-07-02", "d:901 | r:13 | VENDOR", 901, 13),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_MET_All_Accounts.xlsx"),
+                    [("Miscellaneous External Transact", met)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
+        rev = [r for r in tabs["Review Notes"][3:] if any(A._N(c) for c in r)]
+        target = [r for r in rev if A._N(r[2]).replace(",", "") in ("1134.00", "1 134.00")]
+        self.assertEqual(len(target), 1)
+        expl = A._N(target[0][A.COL_EXPL])
+        self.assertIn("d:910", expl)
+        self.assertIn("cherry-picked", expl)
+        self.assertIn("POSSIBLE_AUTO_REC_SPLIT", A._N(target[0][A.COL_EXPL]) + " " + expl)
+
     def test_misdirected_receipt_gets_own_tab(self):
         # Owner HARD GUARDRAIL (2026-07-18, City of Memphis $70,992.66): the
         # bank line lands in THIS account but the receipt remits to ANOTHER

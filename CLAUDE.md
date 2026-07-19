@@ -156,6 +156,28 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    without a reroute/ECT. Conservation spans all four tabs; audit enforces
    citation+sum, foreign-account naming ("booked to"), non-reuse, and the
    4-tab structure.
+8h. **Orphan doctrine (owner, 2026-07-19 — `UT_Recon_Forward_Orphan_Doctrine.md`,
+   binding).** The open pool is shaped by prior (often automated, often wrong)
+   reconciliations: it CONTAINS orphans (open STs whose money is already
+   consumed) and is MISSING consumed counterparts. Incorporated forward rules:
+   **R3 — MET status outranks the ST export**: the MET↔ST bridge now
+   propagates a closed MET status onto the open-looking ST
+   (`available=False`, runlog `met_status_overrides`) — never consume a
+   candidate whose MET row is REC/cleared. **Dual-fire twin guard (2.3)**:
+   available entries sharing one MET `RECEIPT_ID` at the same signed cents
+   keep exactly ONE available (deterministic; runlog `dual_fire_twins` — 33
+   live on real UTIA data). **R8 — check rails**: the check number IS the
+   identity; same amount + different check number is a CONFLICT
+   (`_check_number_conflict`, P9b amount-only lane) — the FHB AP $1,100
+   cascade; blank references are silence. **Signature #6 — cherry-pick
+   split**: a stranded line with no exact counterpart but an ALL-closed MET
+   deposit summing exactly gets an enriched Review naming d:/members
+   (`POSSIBLE_AUTO_REC_SPLIT` → run Unreconcile2), never a forced match.
+   Already covered elsewhere: R1 (amount never identity, rule 4), R6 (type
+   gates, 8e), R7 (Regions dual-encoded deposit refs — never build a
+   deposit-slip ref-tie check), R9 (refer, don't route around — Review with
+   named evidence). R2/R5 (Recon History `Created By`, CFG_TCR coverage)
+   activate only when those exports are present in a run.
 9. **Determinism.** No randomness, no clock. `Date.now`/serials excepted where
    parsing Excel. Sort candidate sets by (amount, date, id) before choosing.
 
@@ -203,7 +225,8 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   `.xlsb` MET made its real-deposit set empty and every citation failed C4).
   Real exports are NOT committed; `TestRealDataShapes` pins their
   shapes synthetically. The relationship docs
-  (`UT_Recon_ORT_Data_Relationships.md`, SPN companion) are the domain
+  (`UT_Recon_ORT_Data_Relationships.md`, SPN companion,
+  `UT_Recon_Forward_Orphan_Doctrine.md`) are the domain
   authority for joins/gates alongside the spec.
 - **COA GL scope key (owner, 2026-07-18).** The Chart of Accounts assigns
   each depository bank account a natural-account GL code, stamped in the
