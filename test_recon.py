@@ -1128,6 +1128,30 @@ class TestRealDataShapes(unittest.TestCase):
         blob = " ".join(A._N(r[A.COL_EXPL]) for r in rev)
         self.assertIn("already-reconciled", blob.lower())
 
+    def test_r3_override_requires_amount_equality(self):
+        # R3 must NOT close an open ST when the bridged MET row carries a
+        # DIFFERENT amount (keep-largest kept a REC total row while the ST
+        # export carries only the open split, or a CET-id collision).  The
+        # 150.00 ST stays open and matches its bank line.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-03", "150.00", "REF100200", "ACH CREDIT", "REF100200",
+             "Automated clearing house", "Line 2 , 2026-07-03", "142"),
+        ]
+        self._build(bsl)
+        rows = self._met_rows()
+        # bridged trx 601: MET says REC but at a DIFFERENT amount (300.00)
+        rows[3] = ("FHB - Master Account", "REF100200", "REC", "2026-07-02", 601,
+                   "300.00", "2026-07-02", "d:901 | r:13 | VENDOR", 901, 13)
+        _write_xlsx(os.path.join(self.d, "20260710_MET_All_Accounts.xlsx"),
+                    [("Miscellaneous External Transact", rows)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertIsNone(runlog.get("met_status_overrides"))  # amount mismatch: no override
+        self.assertEqual(runlog["recon_summary"]["matches"], 1)  # 150.00 ST still open
+
     def test_dual_fire_twin_never_matches_twice(self):
         # Orphan doctrine 2.3: two identical open STs sharing one MET
         # RECEIPT_ID are a dual-fire pair — exactly one stays available.
@@ -1160,12 +1184,14 @@ class TestRealDataShapes(unittest.TestCase):
             reference_raw = "0006789599"
             recon_reference = "6789599"
         b = _B()
-        other = E._mk_entry("901", 110000, date(2026, 7, 1), "6789601", "", "EXT", "UNR", True, "ST")
-        same = E._mk_entry("902", 110000, date(2026, 7, 1), "0006789599", "", "EXT", "UNR", True, "ST")
-        blank = E._mk_entry("903", 110000, date(2026, 7, 1), "", "", "EXT", "UNR", True, "ST")
-        self.assertTrue(E._check_number_conflict(b, other))   # different check no.
+        other = E._mk_entry("901", 110000, date(2026, 7, 1), "6789601", "", "AP", "UNR", True, "ST")
+        same = E._mk_entry("902", 110000, date(2026, 7, 1), "0006789599", "", "AP", "UNR", True, "ST")
+        blank = E._mk_entry("903", 110000, date(2026, 7, 1), "", "", "AP", "UNR", True, "ST")
+        arrcpt = E._mk_entry("904", 110000, date(2026, 7, 1), "6789601", "", "AR", "UNR", True, "RECEIPTS")
+        self.assertTrue(E._check_number_conflict(b, other))   # different check no. (AP)
         self.assertFalse(E._check_number_conflict(b, same))   # same check (zero-padded)
         self.assertFalse(E._check_number_conflict(b, blank))  # silence never conflicts
+        self.assertFalse(E._check_number_conflict(b, arrcpt)) # AR receipt is not a check rail
         class _B2:
             transaction_type = "Automated clearing house"
             reference_raw = "0006789599"

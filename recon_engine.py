@@ -1458,8 +1458,14 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
             # ST export.  If MET says the transaction's money is already
             # consumed (REC / cleared), the open-looking ST is an orphan or a
             # stale-export artifact — never consume it, whatever the ST
-            # export's recon status says.
-            if prev.available and not e.available:
+            # export's recon status says.  Guarded by exact signed-cent
+            # equality: a singleton same-label merge with a different amount
+            # (keep-largest kept a REC total row while the ST export carries
+            # only an open split; or a CET id collides with an unrelated
+            # receipt number) must NOT flip availability — only the true
+            # same-transaction bridge does.
+            if prev.available and not e.available and \
+                    prev.amount_cents == e.amount_cents:
                 prev.available = False
                 prev.status = e.status or prev.status
                 met_status_overrides += 1
@@ -1516,7 +1522,7 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
     by_fire = {}
     for e in pool:
         if e.available and e.receipt_id and not e.foreign_account:
-            by_fire.setdefault((N(e.receipt_id), e.amount_cents), []).append(e)
+            by_fire.setdefault((_norm_id(e.receipt_id), e.amount_cents), []).append(e)
     dual_fire_twins = 0
     for key, group in by_fire.items():
         if len(group) > 1 and len({e.id for e in group}) > 1:
@@ -2053,6 +2059,11 @@ def _check_number_conflict(bsl, e):
     silence and never conflicts.  Compare canonically (leading zeros
     stripped; text reads only — float coercion corrupts 0006789599)."""
     if "CHECK" not in _norm_header(bsl.transaction_type):
+        return False
+    # Check-vs-check only: a check number conflicts with another CHECK/Payables
+    # entry, not with an AR receipt that merely carries a numeric reference —
+    # barring a legitimate receipt candidate here would be over-broad.
+    if "CHECK" not in _norm_header(e.transaction_type) and e.source != "AP":
         return False
     bref = znorm(bsl.reference_raw) or znorm(bsl.recon_reference)
     eref = znorm(e.reference)
@@ -3147,9 +3158,17 @@ def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None):
         # summing exactly to it — the deposit's receipts were cherry-picked
         # onto other lines by earlier (auto) reconciliations.  Stop searching
         # the open pool; the consuming groups need an unwind first.
+        def _reconciled_closed(e):
+            # A genuinely consumed-by-prior-reconciliation member: unavailable
+            # BECAUSE its status is closed (REC/cleared), not because it is a
+            # foreign-account shadow entry or a dual-fire-suppressed twin
+            # (both available=False for unrelated reasons — counting them
+            # would falsely accuse a deposit of being cherry-picked).
+            return (not e.available and not e.foreign_account
+                    and _norm_header(e.status) in CLOSED_RECEIPT_STATUSES)
         for dep in sorted(deposit_index or {}):
             members = deposit_index[dep]
-            if members and all(not e.available for e in members) and \
+            if members and all(_reconciled_closed(e) for e in members) and \
                     sum(e.amount_cents for e in members) == bsl.amount_cents:
                 codes.append("POSSIBLE_AUTO_REC_SPLIT")
                 expl = (f"No open counterpart, but CLOSED ORT deposit d:{dep} "
