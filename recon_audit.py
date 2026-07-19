@@ -332,27 +332,32 @@ def _reparse_source_bsls(input_dir):
     if not candidates:
         return None
     # Newest YYYYMMDD stamp wins, mirroring the engine's routing — the audit
-    # must re-parse the SAME file the engine reconciled, not the first name
-    # alphabetically.  Stable sort keeps alphabetical order among ties.
+    # must re-parse the SAME file(s) the engine reconciled.  ALL candidates
+    # sharing the newest date key are pages of one paginated export (the
+    # engine unions same-date BSL shards), so the audit unions them too —
+    # a single-file read would falsely fail C1 on a paginated upload.
     candidates.sort(key=_newest_date_key, reverse=True)
-    bsl_file = os.path.join(input_dir, candidates[0])
-    rows = _read_table(bsl_file)
-    if not rows:
-        return []
-    hi = _locate_header(rows, _BSL_HEADER_VOCAB)
-    if hi is None:
-        raise AuditBindError(
-            f"{os.path.basename(bsl_file)}: no BSL header row found — "
-            "refusing to re-parse from a positional guess")
-    dcol = _find_col(rows, hi, _BSL_DATE_ALIASES, _pred_date)
-    acol = _find_col(rows, hi, _BSL_AMOUNT_ALIASES, _pred_amount)
+    newest = _newest_date_key(candidates[0])
+    shards = [n for n in candidates if _newest_date_key(n) == newest]
     bag = []
-    for r in rows[hi + 1:]:
-        amt = _cents(r[acol]) if acol is not None and acol < len(r) else None
-        if amt is None:
+    for name in shards:
+        bsl_file = os.path.join(input_dir, name)
+        rows = _read_table(bsl_file)
+        if not rows:
             continue
-        dt = _parse_date(r[dcol]) if dcol is not None and dcol < len(r) else None
-        bag.append((dt.isoformat() if dt else "", amt))
+        hi = _locate_header(rows, _BSL_HEADER_VOCAB)
+        if hi is None:
+            raise AuditBindError(
+                f"{os.path.basename(bsl_file)}: no BSL header row found — "
+                "refusing to re-parse from a positional guess")
+        dcol = _find_col(rows, hi, _BSL_DATE_ALIASES, _pred_date)
+        acol = _find_col(rows, hi, _BSL_AMOUNT_ALIASES, _pred_amount)
+        for r in rows[hi + 1:]:
+            amt = _cents(r[acol]) if acol is not None and acol < len(r) else None
+            if amt is None:
+                continue
+            dt = _parse_date(r[dcol]) if dcol is not None and dcol < len(r) else None
+            bag.append((dt.isoformat() if dt else "", amt))
     return bag
 
 

@@ -1841,6 +1841,67 @@ class TestRoutingHardening(unittest.TestCase):
             runlog = E.run(self.d, self.out, present=True)
         self.assertEqual(len(runlog["files_ignored_by_name"]), 3)
 
+    def test_bsl_pagination_union_end_to_end(self):
+        # Two same-date BSL page shards: engine unions them, conservation
+        # spans both pages, and the audit's C1 re-parse unions the same
+        # shards (a single-file read would falsely fail C1).
+        hdr = ("Date", "Amount (USD)", "Reference", "Additional Information",
+               "Account Servicer Reference", "Transaction Type", "Statement",
+               "Transaction Code")
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [hdr,
+                     ("2026-07-01", "10.00", "R1", "", "R1", "Miscellaneous",
+                      "Line 1 , 2026-07-01", "174")])])
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR_2.xlsx"),
+                    [("Exported", [hdr,
+                     ("2026-07-02", "20.00", "R2", "", "R2", "Miscellaneous",
+                      "Line 2 , 2026-07-02", "174")])])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              ("2026-06-30", "999.00", "X", 601, "Receivables", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["bsl_count"], 2)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        self.assertIn("union_of", runlog["roles_bound"]["BSL"])
+
+    def test_pagination_duplicate_upload_fails_loud(self):
+        # An identical data row across two same-date shards is a duplicate
+        # upload, not pagination — unioning would double-count money.
+        hdr = ("Date", "Amount (USD)", "Reference", "Additional Information",
+               "Account Servicer Reference", "Transaction Type", "Statement",
+               "Transaction Code")
+        row = ("2026-07-01", "10.00", "R1", "", "R1", "Miscellaneous",
+               "Line 1 , 2026-07-01", "174")
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [hdr, row])])
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR_2.xlsx"),
+                    [("Exported", [hdr, row])])
+        with self.assertRaises(E.InvalidSourceData) as cm:
+            E.run(self.d, self.out, present=True)
+        self.assertIn("duplicate", str(cm.exception).lower())
+
+    def test_non_paginatable_role_still_fails_loud_on_tie(self):
+        # DEPT_INFO is not paginatable: two same-date files stay a conflict.
+        hdr = ("Department Name", "Campus Name", "Credit Card Mid")
+        _write_xlsx(os.path.join(self.d, "20260710_ORT_Department_Info.xlsx"),
+                    [("Report", [hdr, ("Dept A", "UTK", "8011111111")])])
+        _write_xlsx(os.path.join(self.d, "20260710_ORT_Department_Info_2.xlsx"),
+                    [("Report", [hdr, ("Dept B", "UTC", "8022222222")])])
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [("Date", "Amount (USD)", "Reference",
+                                    "Additional Information",
+                                    "Account Servicer Reference",
+                                    "Transaction Type", "Statement",
+                                    "Transaction Code"),
+                                   ("2026-07-01", "10.00", "R1", "", "R1",
+                                    "Miscellaneous", "L1", "174")])])
+        with self.assertRaises(E.InvalidSourceData) as cm:
+            E.run(self.d, self.out, present=True)
+        self.assertIn("tie", str(cm.exception).lower())
+
     def test_c11_fabricated_st_id_fails(self):
         # A Match citing an ST id absent from every source export fails C11.
         bsl = [("Date", "Amount (USD)", "Reference", "Additional Information",

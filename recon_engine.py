@@ -4814,33 +4814,20 @@ def load_and_bind(by_role, runlog):
         specs = role_specs.get(role)
         if specs is None and role != "MID_MASTER":
             continue  # recognized; no binding required at this layer
-        # MET pagination union (owner review, 2026-07-19): real OTBI exports
-        # arrive as same-date "_2/_3" page shards (20260717_..._MET_..._2.csv).
-        # Same-date MET files are PAGES of one export — union them, requiring
-        # an identical column binding (else fail loud naming both files).
-        # Different-date MET files stay newest-wins (they are refreshes).
-        if role == "MET" and len(files) > 1 and \
+        # Pagination union (owner review, 2026-07-19; generalized beyond MET
+        # 2026-07-19): real Oracle exports arrive as same-date "_2/_3" page
+        # shards.  Same-date files of a paginatable role are PAGES of one
+        # export — union them (identical column binding required, duplicate
+        # rows barred).  Different-date files stay newest-wins (refreshes).
+        if role in PAGINATABLE_ROLES and len(files) > 1 and \
                 len({_leading_date_key(f.filename) for f in files}) == 1:
-            shards = sorted(files, key=lambda f: f.filename)
-            rows, _ = read_rows(shards[0])
-            mapping, hi = bind_columns(rows, specs, filename=shards[0].filename)
-            rows = list(rows)
-            for extra in shards[1:]:
-                erows, _ = read_rows(extra)
-                emap, ehi = bind_columns(erows, specs, filename=extra.filename)
-                if emap != mapping:
-                    raise InvalidSourceData(
-                        extra.filename, role,
-                        f"MET page shard binds different columns than "
-                        f"{shards[0].filename} ({emap} vs {mapping}) — "
-                        "not pages of one export")
-                rows.extend(erows[ehi + 1:])
-            fname = " + ".join(f.filename for f in shards)
-            loaded[role] = {"rows": rows, "map": mapping, "header_index": hi,
-                            "file": fname}
-            bound_report[role] = {"file": fname, "columns": mapping,
-                                  "header_index": hi,
-                                  "union_of": [f.filename for f in shards]}
+            entry = _union_same_date_shards(files, specs, role)
+            loaded[role] = {k: entry[k] for k in
+                            ("rows", "map", "header_index", "file")}
+            bound_report[role] = {"file": entry["file"],
+                                  "columns": entry["map"],
+                                  "header_index": entry["header_index"],
+                                  "union_of": entry["union_of"]}
             continue
         rf = _pick_newest(files, role)  # newest YYYYMMDD stamp wins
         if role == "MID_MASTER":
@@ -4855,6 +4842,69 @@ def load_and_bind(by_role, runlog):
         bound_report[role] = {"file": rf.filename, "columns": mapping, "header_index": hi}
     runlog["roles_bound"] = bound_report
     return loaded
+
+
+# Roles whose real exports paginate into same-date "_2/_3" shards.  Every
+# other role keeps single-file semantics (a same-date second file is a
+# conflict, not a page): MID_MASTER / DEPT_INFO / CFG_* / EDISON_* /
+# ENRICHED stay newest-wins-or-fail-loud; CHART_OF_ACCOUNTS has its own
+# multi-file loader; BAI2 has its own index-level union.
+PAGINATABLE_ROLES = {"BSL", "ST", "RECEIPTS", "PAYMENTS", "ALL_BSL", "MET"}
+
+
+def _union_same_date_shards(files, specs, role):
+    """Union same-date page shards of one paginated export.  Requires every
+    shard to bind the IDENTICAL column mapping (else fail loud naming both
+    files), and bars duplicate data rows across shards — a re-uploaded copy
+    of the same export is a DUPLICATE, not a page, and unioning it would
+    double-count money (fatal for BSL conservation)."""
+    shards = sorted(files, key=lambda f: f.filename)
+    rows, _ = read_rows(shards[0])
+    mapping, hi = bind_columns(rows, specs, filename=shards[0].filename)
+    rows = list(rows)
+    seen_rows = {tuple(N(c) for c in r) for r in rows[hi + 1:]
+                 if any(N(c) for c in r)}
+    for extra in shards[1:]:
+        erows, _ = read_rows(extra)
+        emap, ehi = bind_columns(erows, specs, filename=extra.filename)
+        if emap != mapping:
+            raise InvalidSourceData(
+                extra.filename, role,
+                f"page shard binds different columns than "
+                f"{shards[0].filename} ({emap} vs {mapping}) — "
+                "not pages of one export")
+        for r in erows[ehi + 1:]:
+            key = tuple(N(c) for c in r)
+            if any(key):
+                if key in seen_rows:
+                    raise InvalidSourceData(
+                        extra.filename, role,
+                        f"data row duplicated across same-date shards "
+                        f"({shards[0].filename} + {extra.filename}) — a "
+                        "duplicate upload, not pagination; remove one file "
+                        "(unioning it would double-count)")
+                seen_rows.add(key)
+            rows.append(r)
+    # BSL pages carry globally unique statement-line keys; a repeat across
+    # shards means the same bank line twice — conservation poison.
+    if role == "BSL":
+        lk = mapping.get("line_key")
+        if lk is not None:
+            seen_lk = set()
+            for r in rows[hi + 1:]:
+                v = N(_cell(r, lk))
+                if not v:
+                    continue
+                if v in seen_lk:
+                    raise InvalidSourceData(
+                        shards[0].filename, role,
+                        f"statement line {v!r} appears in more than one "
+                        "same-date BSL shard — duplicate upload, not "
+                        "pagination")
+                seen_lk.add(v)
+    fname = " + ".join(f.filename for f in shards)
+    return {"rows": rows, "map": mapping, "header_index": hi, "file": fname,
+            "union_of": [f.filename for f in shards]}
 
 
 def _pick_newest(files, role):
