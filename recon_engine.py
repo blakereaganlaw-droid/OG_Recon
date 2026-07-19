@@ -396,6 +396,13 @@ _ACCOUNT_TOKENS = [
     # carries neither "student" nor "refund", so it still binds FHB_UTC).
     ("FHB_STUDENT_REFUND_UTK", ["fhb", "student", "refund", "utk"]),
     ("FHB_STUDENT_REFUND_UTC", ["fhb", "student", "refund", "utc"]),
+    # The TCR config export (owner, 2026-07-19) names Student Refund
+    # depositories for UTHSC/UTM/UTSO too — without these entries the
+    # generic campus token would swallow them ("FHB - Student Refund -
+    # UTHSC" -> FHB_UTHSC), poisoning the misdirected shadow scope (8g).
+    ("FHB_STUDENT_REFUND_UTHSC", ["fhb", "student", "refund", "uthsc"]),
+    ("FHB_STUDENT_REFUND_UTM", ["fhb", "student", "refund", "utm"]),
+    ("FHB_STUDENT_REFUND_UTSO", ["fhb", "student", "refund", "utso"]),
     ("FHB_MASTER", ["fhb", "master"]),
     ("FHB_UTHSC", ["fhb", "uthsc"]),
     ("FHB_UTIA", ["fhb", "utia"]),
@@ -403,6 +410,9 @@ _ACCOUNT_TOKENS = [
     ("FHB_UTM", ["fhb", "utm"]),
     ("FHB_UTSO", ["fhb", "utso"]),
     ("FHB_AP", ["fhb", "ap"]),
+    # Long-form bank name ("FHB - Accounts Payable"): "ap" only matches a
+    # whole name segment, so the spelled-out form needs its own entry.
+    ("FHB_AP", ["fhb", "accounts", "payable"]),
     ("REGIONS_UTIA", ["regions", "utia"]),
     ("REGIONS_UTIPS", ["regions", "utips"]),
     ("REGIONS_UTM", ["regions", "utm"]),
@@ -622,10 +632,17 @@ def route_folder(input_dir) -> dict:
         path = os.path.join(input_dir, name)
         if not os.path.isfile(path):
             continue
-        if not name.lower().endswith((".xlsx", ".xlsm", ".xlsb", ".csv")):
+        low = name.lower()
+        if not low.endswith((".xlsx", ".xlsm", ".xlsb", ".csv", ".txt")):
             continue
         role = classify_file(name)
         if role is None:
+            continue
+        # Raw bank files (owner, 2026-07-19): a .txt is accepted ONLY as a
+        # native BAI2 transmission ("FHB_UTHSC_BAI2.txt") — the raw reader
+        # parses type-16/88 records with the FULL untruncated addenda the
+        # Oracle BSL feed cuts off.  Any other .txt stays unrouted.
+        if low.endswith(".txt") and role != "BAI2":
             continue
         rf = RoutedFile(role, path, name, rule_by_role[role].sheet)
         by_role.setdefault(role, []).append(rf)
@@ -1134,6 +1151,80 @@ def _read_csv_rows(path):
     return [tuple(r) for r in rows]
 
 
+def _bai2_date(yymmdd):
+    """BAI2 YYMMDD -> ISO date string ('' when malformed).  BAI2 years are
+    two-digit; the format postdates 2000, so 20YY is always correct here."""
+    s = N(yymmdd)
+    if len(s) == 6 and s.isdigit():
+        return f"20{s[0:2]}-{s[2:4]}-{s[4:6]}"
+    return ""
+
+
+def _read_bai2_txt(path):
+    """Parse a NATIVE BAI2 transmission (.txt) into spreadsheet-shaped rows
+    binding the existing BAI2_ROLES: header row + one row per type-16 detail
+    record, with the 88-continuation addenda preserved UNTRUNCATED in
+    DETAIL1..DETAILn columns (the whole point — the Oracle BSL feed cuts the
+    addenda; the raw file carries Customer ID / Trace Number / TRN1 / check
+    numbers in full).  Record types: 01 file header, 02 group header (as-of
+    date, YYMMDD), 03 account identifier, 16 detail
+    (,type-code,amount-in-minor-units,funds-type,bank-ref,customer-ref,text),
+    88 continuation of the PREVIOUS record, 49/98/99 trailers.  Sign follows
+    the BAI type-code convention: 100-399 credit (+), 400-699 debit (-).
+    Money stays integer cents throughout (no float)."""
+    details = []          # [date, desc, signed_amount_str, bank_ref, cust_ref, code, [addenda...]]
+    group_date = ""
+    cur = None            # the open type-16 record collecting 88 lines
+    max_addenda = 0
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.rstrip("\r\n").rstrip()
+            if line.endswith("/"):
+                line = line[:-1].rstrip()
+            if not line:
+                continue
+            rec, _, rest = line.partition(",")
+            if rec == "02":
+                f = rest.split(",")
+                # 02,receiver,originator,group-status,as-of-date,...
+                group_date = _bai2_date(f[3]) if len(f) > 3 else group_date
+                cur = None
+            elif rec == "16":
+                f = rest.split(",")
+                code = N(f[0]) if f else ""
+                minor = N(f[1]) if len(f) > 1 else ""
+                sign = ""
+                if code.isdigit() and 400 <= int(code) <= 699:
+                    sign = "-"
+                # integer minor units -> decimal string (never float)
+                digits = minor if minor.isdigit() else ""
+                if digits:
+                    cents_ = int(digits)
+                    amt = f"{sign}{cents_ // 100}.{cents_ % 100:02d}"
+                else:
+                    amt = ""
+                bank_ref = N(f[3]) if len(f) > 3 else ""
+                cust_ref = N(f[4]) if len(f) > 4 else ""
+                text = ",".join(f[5:]).strip() if len(f) > 5 else ""
+                cur = [group_date, text, amt, bank_ref, cust_ref, code, []]
+                details.append(cur)
+            elif rec == "88":
+                if cur is not None:
+                    cur[6].append(rest.strip())
+                    max_addenda = max(max_addenda, len(cur[6]))
+            elif rec in ("03", "49", "98", "99", "01"):
+                if rec != "03":
+                    pass
+                cur = None  # continuations after non-16 records are not detail addenda
+    header = ["Post Date", "Transaction Description", "Amount",
+              "Bank Reference", "Customer Reference", "BAI Code"] + \
+             [f"DETAIL{i + 1}" for i in range(max_addenda)]
+    rows = [tuple(header)]
+    for d in details:
+        rows.append(tuple(d[:6] + d[6] + [""] * (max_addenda - len(d[6]))))
+    return rows
+
+
 def _xlsb_norm(v):
     """pyxlsb returns EVERY numeric cell as a float, so an integral Oracle id
     (DEPOSIT_ID/RECEIPT_ID/TRANSACTION_ID = 65105) arrives as 65105.0 and would
@@ -1185,6 +1276,9 @@ def read_rows(routed_file: RoutedFile):
     try:
         if ext == ".csv":
             return _read_csv_rows(routed_file.path), "csv"
+        if ext == ".txt":
+            # Only BAI2 .txt files are routed (route_folder); parse natively.
+            return _read_bai2_txt(routed_file.path), "bai2-raw"
         if ext == ".xlsb":
             return _read_xlsb_rows(routed_file.path, routed_file.sheet_hint)
         return _read_sheet_rows(routed_file.path, routed_file.sheet_hint)
@@ -3865,6 +3959,117 @@ def load_chart_of_accounts(files):
             "postable_efdp": postable_efdp}
 
 
+# ---- CM Configuration exports (owner, 2026-07-19) --------------------
+# The five Cash Management configuration reports (Transaction Creation
+# Rules, Parse Rules, Matching Rules, Tolerance Rules, Recon Rulesets).
+# Loaded for the ADVISORY config audit only (orphan-doctrine R5 activation:
+# "CFG_TCR coverage activates only when those exports are present") — they
+# never gate a placement.  Paginated exports: title + run-date preamble,
+# header row located by marker (never assumed), column A blank padding,
+# repeated headers / "N of M" footer rows dropped.
+
+def _cfg_read_table(rf, marker, fields):
+    """Read one CM_Configurations export into a list of dicts.  `fields` maps
+    output key -> header alias; the header row is located by `marker`; a row
+    is kept when its marker column is non-blank and not a repeated header."""
+    rows, _ = read_rows(rf)
+    hi = _coa_header_index(rows, marker)
+    if hi is None:
+        raise InvalidSourceData(rf.filename, rf.role,
+                                f"no header row carrying {marker!r} found")
+    idx = _coa_colmap(rows[hi])
+    cols = {k: idx.get(_norm_header(alias)) for k, alias in fields.items()}
+    key0 = next(iter(fields))
+    if cols[key0] is None:
+        raise InvalidSourceData(rf.filename, rf.role,
+                                f"marker column {fields[key0]!r} did not bind")
+    out = []
+    marker_norm = _norm_header(marker)
+    for r in rows[hi + 1:]:
+        first = N(_cell(r, cols[key0]))
+        if not first or _norm_header(first) == marker_norm:
+            continue  # blank spacer / repeated page header
+        rec = {}
+        for k, ci in cols.items():
+            rec[k] = N(_cell(r, ci)) if ci is not None else ""
+        out.append(rec)
+    return out
+
+
+def load_cm_config(role, rf):
+    """Dispatch one CFG_* routed file to its table shape."""
+    if role == "CFG_TCR":
+        return _cfg_read_table(rf, "BNK ACCNTNME", {
+            "bank_account": "BNK ACCNTNME", "enabled": "ENBLD",
+            "seq": "SQC NUM", "name": "RLE NME", "descr": "DSCRPT",
+            "trx_code": "TRX CDE", "trx_type": "TRX TPE",
+            "search_field": "SRCH FLD", "search_string": "SRCH STRNG",
+            "cash": "CASH", "offset": "OFFSET",
+            "last_update": "LST UPDTE", "updated_by": "UPDTEBY"})
+    if role == "CFG_PARSE":
+        return _cfg_read_table(rf, "PRS RLE SET", {
+            "rule_set": "PRS RLE SET", "descr": "DSCRPT",
+            "set_enabled": "RLE SET ENBLD", "seq": "SQNCENUM",
+            "enabled": "ENBLD", "trx_code": "TRX CDE", "trx_type": "TRX TPE",
+            "source_field": "SRCE FLD", "target_field": "TRGT FLD",
+            "pattern": "PRSE RLE", "overwrite": "OVRWRTE",
+            "last_update": "LST UPDTE", "updated_by": "UPDTE BY"})
+    if role == "CFG_MATCHING":
+        return _cfg_read_table(rf, "MTCH RLE NME", {
+            "name": "MTCH RLE NME", "descr": "DSCRPT", "enabled": "ENBLD",
+            "source": "TRX SRCE", "match_type": "MTCH TPE",
+            "amount_match": "AMNT MTCH", "date_match": "DTE MTCH",
+            "ref_match": "REF ID MTCH", "type_match": "TPE MTCH",
+            "stmt_groupby": "STMT GRPBY", "trx_groupby": "TRX GRPBY",
+            "criteria": "ADV CRTRA",
+            "last_update": "LST UPDTE", "updated_by": "UPDTEBY"})
+    if role == "CFG_TOLERANCE":
+        return _cfg_read_table(rf, "TOL RLE NME", {
+            "name": "TOL RLE NME", "descr": "DSCRPT",
+            "date_enabled": "DTE ENBLD", "days_before": "DAYS BFR",
+            "days_after": "DAYS AFTR", "amount_enabled": "AMNT ENBLD",
+            "amount_below": "AMNT BELOW", "amount_above": "AMNT ABOVE",
+            "percent_enabled": "PRCNT ENBLD",
+            "last_update": "LST UPDTE", "updated_by": "LST UPDTE BY"})
+    if role == "CFG_RULESETS":
+        return _cfg_read_table(rf, "RLST NME", {
+            "ruleset": "RLST NME", "descr": "RLST DSCRPT",
+            "last_update": "RLST LST UPDTE", "updated_by": "RLST UPDTE BY",
+            "seq": "SQNCE NUM", "matching_rule": "MTCH RLE NME",
+            "tolerance_rule": "TOL RLE NME"})
+    return None
+
+
+CM_CONFIG_ROLES = ("CFG_TCR", "CFG_PARSE", "CFG_MATCHING",
+                   "CFG_TOLERANCE", "CFG_RULESETS")
+
+
+@functools.lru_cache(maxsize=4096)
+def _like_regex(pattern):
+    """Compile an Oracle LIKE pattern (% = any run, _ = any one char) to a
+    case-insensitive regex.  Used to SIMULATE Transaction Creation Rule
+    firing against bank-line addenda — advisory config audit only."""
+    out = []
+    for ch in N(pattern):
+        if ch == "%":
+            out.append(".*")
+        elif ch == "_":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+    return re.compile("".join(out), re.IGNORECASE | re.DOTALL)
+
+
+def like_match(pattern, text):
+    """Oracle LIKE semantics, full-match, case-insensitive.  Oracle applies
+    LIKE to the whole column value; TCR search strings carry their own
+    leading/trailing % when substring semantics are intended."""
+    p = N(pattern)
+    if not p:
+        return False
+    return _like_regex(p).fullmatch(N(text)) is not None
+
+
 # ======================================================================
 # Section 9 P0 — Load & validate; build BSL list
 # ======================================================================
@@ -3907,6 +4112,15 @@ def load_and_bind(by_role, runlog):
                                       "combos": len(coa["combo_decode"]),
                                       "entities": len(coa["entity_desc"]),
                                       "postable_efdp": len(coa["postable_efdp"])}
+            continue
+        if role in CM_CONFIG_ROLES:
+            # CM configuration reports (orphan-doctrine R5 activation):
+            # loaded for the advisory config audit only, never a gate.
+            rf = _pick_newest(files, role)
+            rules = load_cm_config(role, rf)
+            if rules:
+                loaded[role] = {"rules": rules, "file": rf.filename}
+                bound_report[role] = {"file": rf.filename, "rows": len(rules)}
             continue
         specs = role_specs.get(role)
         if specs is None and role != "MID_MASTER":

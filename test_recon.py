@@ -1635,5 +1635,119 @@ class TestChartOfAccounts(unittest.TestCase):
                          {"rows_seen": 1, "unrecognized_combo": 0, "non_postable_efdp": 0})
 
 
+class TestCMConfig(unittest.TestCase):
+    """CM Configuration exports (owner, 2026-07-19): the five CFG_* loaders,
+    the Oracle-LIKE simulator, and the raw BAI2 .txt reader."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_cfg_router(self):
+        cases = {
+            "CM_Configurations_Transaction_Creation_Rules.xlsx": "CFG_TCR",
+            "CM_Configurations_Parse_Rules.xlsx": "CFG_PARSE",
+            "CM_Configurations_Matching_Rules.xlsx": "CFG_MATCHING",
+            "CM_Configurations_Tolerance_Rules.xlsx": "CFG_TOLERANCE",
+            "CM_Configurations_Recon_Rulesets.xlsx": "CFG_RULESETS",
+            "FHB_UTHSC_BAI2.txt": "BAI2",
+        }
+        for name, want in cases.items():
+            self.assertEqual(E.classify_file(name), want, msg=name)
+
+    def test_cfg_tcr_loader(self):
+        # Paginated export shape: preamble rows, header at row 6, footer.
+        rows = [("",) * 16] * 4 + [
+            ("Transaction Creation Rules",) + ("",) * 15,
+            ("Run Date: 7/19/2026",) + ("",) * 15,
+            ("", "BNK ACCNTNME", "ENBLD", "SQC NUM", "RLE NME", "DSCRPT",
+             "TRX CDE", "TRX TPE", "SRCH FLD", "SRCH STRNG", "CASH", "OFFSET",
+             "ACCNT FLG", "LST UPDTE", "UPDTEBY", ""),
+            ("", "FHB - Master Account", "Y", "1", "EFT 495_Test", "d",
+             "495", "EFT", "ADDENDA", "%LGIP%", "01-1100098-000000-100210-000-0000-00-0000",
+             "01-1100001-000000-100930-000-0000-00-0000", "Y",
+             "2026-04-02 17:03:10", "AOWENS43", ""),
+            ("",) * 16,                            # blank spacer
+            ("", "BNK ACCNTNME", "ENBLD", "SQC NUM", "RLE NME", "DSCRPT",
+             "TRX CDE", "TRX TPE", "SRCH FLD", "SRCH STRNG", "CASH", "OFFSET",
+             "ACCNT FLG", "LST UPDTE", "UPDTEBY", ""),  # repeated page header
+            ("", "FHB - UTHSC", "N", "2", "ACH 142_Test", "d",
+             "142", "ACH", "", "", "01-1100098-000000-100500-000-0000-00-0000",
+             "", "Y", "2026-01-01 00:00:00", "X", ""),
+            ("1 of 2",) + ("",) * 15,              # footer
+        ]
+        p = os.path.join(self.d, "CM_Configurations_Transaction_Creation_Rules.xlsx")
+        _write_xlsx(p, [("Sheet1", rows)])
+        rf = E.RoutedFile("CFG_TCR", p, os.path.basename(p), "first")
+        rules = E.load_cm_config("CFG_TCR", rf)
+        self.assertEqual(len(rules), 2)            # spacer/header/footer dropped
+        self.assertEqual(rules[0]["bank_account"], "FHB - Master Account")
+        self.assertEqual(rules[0]["trx_code"], "495")
+        self.assertEqual(rules[0]["search_string"], "%LGIP%")
+        self.assertEqual(rules[1]["enabled"], "N")
+
+    def test_like_match(self):
+        self.assertTrue(E.like_match("%LGIP Account No.: 447112-10%",
+                                     "PRIOR TEXT LGIP Account No.: 447112-10 TRAILER"))
+        self.assertTrue(E.like_match("RETURN SETTLE%", "RETURN SETTLEMENT X"))
+        self.assertFalse(E.like_match("RETURN SETTLE%", "X RETURN SETTLEMENT"))
+        self.assertTrue(E.like_match("%PAY%REVERSAL%", "ACH PAY 33 REVERSAL 9"))
+        self.assertTrue(E.like_match("A_C", "AbC"))          # _ = one char
+        self.assertFalse(E.like_match("A_C", "AbbC"))
+        self.assertFalse(E.like_match("", "anything"))       # blank never fires
+
+    def test_raw_bai2_txt_reader(self):
+        raw = "\n".join([
+            "01,000000000,000000000,260719,0759,2659562,,,2/",
+            "02,084000026,084000026,1,260718,,USD,2/",
+            "03,90603,USD,010,0,,,015,0,,,/",
+            "88,060,0,,,063,0,,,072,0,,,/",                      # 03 continuation: ignored
+            "16,142,5100,Z,25202003732875,08035701948,",
+            "88,MERCHANT SERVICEDEPOSIT 2507218035701948",
+            "88,Customer ID: 8035701948",
+            "88,Trace Number: 084000023732875",
+            "16,475,250000,Z,99887766,00001234,",
+            "49,0,2/",
+            "98,0,1,2/",
+            "99,0,1,2/",
+        ])
+        p = os.path.join(self.d, "FHB_UTHSC_BAI2.txt")
+        with open(p, "w") as fh:
+            fh.write(raw)
+        rows = E._read_bai2_txt(p)
+        self.assertEqual(len(rows), 3)                    # header + 2 details
+        hdr = rows[0]
+        self.assertEqual(hdr[:6], ("Post Date", "Transaction Description",
+                                   "Amount", "Bank Reference",
+                                   "Customer Reference", "BAI Code"))
+        # credit 142: positive, group as-of date, addenda in DETAIL columns
+        self.assertEqual(rows[1][0], "2026-07-18")
+        self.assertEqual(E.cents(rows[1][2]), 5100)
+        self.assertEqual(rows[1][5], "142")
+        self.assertIn("Customer ID: 8035701948", rows[1])
+        # the 03-record continuation must NOT leak into detail addenda
+        self.assertFalse(any("060,0" in str(c) for c in rows[1]))
+        # debit 475: negated
+        self.assertEqual(E.cents(rows[2][2]), -250000)
+        # binds the existing BAI2 role vocabulary
+        m, hi = E.bind_columns(rows, E.BAI2_ROLES, filename="FHB_UTHSC_BAI2.txt")
+        self.assertEqual(hi, 0)
+        self.assertEqual(m["bai_code"], 5)
+
+    def test_student_refund_uthsc_utm_utso_accounts(self):
+        # Config export exposed three more Student Refund depositories; the
+        # generic campus token must not swallow them (misdirected scope, 8g).
+        self.assertEqual(E.account_of_bank_name("FHB - Student Refund - UTHSC"),
+                         "FHB_STUDENT_REFUND_UTHSC")
+        self.assertEqual(E.account_of_bank_name("FHB - Student Refund - UTM"),
+                         "FHB_STUDENT_REFUND_UTM")
+        self.assertEqual(E.account_of_bank_name("FHB - Student Refund - UTSO"),
+                         "FHB_STUDENT_REFUND_UTSO")
+        self.assertEqual(E.account_of_bank_name("FHB - UTHSC"), "FHB_UTHSC")
+        self.assertEqual(E.account_of_bank_name("FHB - Accounts Payable"), "FHB_AP")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
