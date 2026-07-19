@@ -71,6 +71,16 @@ import recon_engine as E
 
 SPREADSHEET_EXTS = (".xlsx", ".xlsm", ".xlsb", ".csv")
 
+
+def _stageable(name: str) -> bool:
+    """A file the run should stage: any spreadsheet, plus a .txt that the
+    router recognizes as a NATIVE BAI2 transmission (owner, 2026-07-19) —
+    any other .txt stays ignored (route_folder would never read it anyway)."""
+    low = name.lower()
+    if low.endswith(SPREADSHEET_EXTS):
+        return True
+    return low.endswith(".txt") and E.classify_file(name) == "BAI2"
+
 # Claude web uploads are prefixed "933782d6-Name.xlsx" (8 hex chars + dash).
 # A prefix that parses as a plausible YYYYMMDD date is kept — the router's
 # newest-wins ordering depends on it; anything else (including the ~2% of
@@ -119,9 +129,9 @@ def collect_sources(paths):
                     continue
                 if not os.path.isfile(fp):
                     continue
-                (spreadsheets if name.lower().endswith(SPREADSHEET_EXTS) else ignored).append(fp)
+                (spreadsheets if _stageable(name) else ignored).append(fp)
         elif os.path.isfile(p):
-            (spreadsheets if p.lower().endswith(SPREADSHEET_EXTS) else ignored).append(p)
+            (spreadsheets if _stageable(os.path.basename(p)) else ignored).append(p)
         else:
             raise PerRunError(f"input path does not exist: {p}")
     # A file named explicitly AND found via its parent directory is one source.

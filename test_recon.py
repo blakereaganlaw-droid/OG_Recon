@@ -1833,6 +1833,13 @@ class TestCMConfig(unittest.TestCase):
         self.assertIn("STATE-TNRECEIPTS", text)
         self.assertIn("SIMULATED", text)
 
+    def test_run_recon_stages_bai2_txt(self):
+        # A native BAI2 .txt must be staged by the per-run wrapper; any other
+        # .txt stays ignored (preserves ignored_non_spreadsheets semantics).
+        self.assertTrue(R._stageable("20260718_FHB_Master_BAI2.txt"))
+        self.assertFalse(R._stageable("readme.txt"))
+        self.assertTrue(R._stageable("20260710_FHB_Master_BSL_UNR.xlsx"))
+
     def test_student_refund_uthsc_utm_utso_accounts(self):
         # Config export exposed three more Student Refund depositories; the
         # generic campus token must not swallow them (misdirected scope, 8g).
