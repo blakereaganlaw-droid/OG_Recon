@@ -1641,9 +1641,11 @@ class TestCMConfig(unittest.TestCase):
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
+        self.out = tempfile.mkdtemp()
 
     def tearDown(self):
         shutil.rmtree(self.d, ignore_errors=True)
+        shutil.rmtree(self.out, ignore_errors=True)
 
     def test_cfg_router(self):
         cases = {
@@ -1735,6 +1737,101 @@ class TestCMConfig(unittest.TestCase):
         m, hi = E.bind_columns(rows, E.BAI2_ROLES, filename="FHB_UTHSC_BAI2.txt")
         self.assertEqual(hi, 0)
         self.assertEqual(m["bai_code"], 5)
+
+    def test_cfg_tcr_orphan_rows_load(self):
+        # The real export carries rules with a BLANK bank-account cell
+        # (detached rules, 3 still enabled) — they must load, not be
+        # silently dropped as spacer rows (doctrine rule 3).
+        rows = [("",) * 16] * 6 + [
+            ("", "BNK ACCNTNME", "ENBLD", "SQC NUM", "RLE NME", "DSCRPT",
+             "TRX CDE", "TRX TPE", "SRCH FLD", "SRCH STRNG", "CASH", "OFFSET",
+             "ACCNT FLG", "LST UPDTE", "UPDTEBY", ""),
+            ("", "FHB - UTHSC", "Y", "1", "normal rule", "d", "142", "ACH",
+             "", "", "01-x", "", "Y", "", "A", ""),
+            ("", "", "Y", "", "DIR 555 orphan rule", "d", "555", "MSC",
+             "", "", "", "", "Y", "", "A", ""),
+        ]
+        p = os.path.join(self.d, "CM_Configurations_Transaction_Creation_Rules.xlsx")
+        _write_xlsx(p, [("Sheet1", rows)])
+        rules = E.load_cm_config("CFG_TCR", E.RoutedFile("CFG_TCR", p, os.path.basename(p), "first"))
+        self.assertEqual(len(rules), 2)
+        orphan = [r for r in rules if not r["bank_account"]]
+        self.assertEqual(len(orphan), 1)
+        self.assertEqual(orphan[0]["name"], "DIR 555 orphan rule")
+
+    def test_recommend_gl_offset_only_and_foreign_excluded(self):
+        # Adversarial-review fixes: the CoA fallback recommends ONLY the
+        # OFFSET combo (the ECT posting side) and never cites a
+        # foreign-account shadow entry (rule 8g).
+        coa = {"combo_decode": {}, "entity_desc": {"01": "UT System"},
+               "postable_efdp": set()}
+        loaded = {"CHART_OF_ACCOUNTS": coa}
+        b = E.make_bsl("1", date(2026, 7, 1), 25000, "R", "R", "", "Miscellaneous", "174")
+        # foreign shadow entry with offset combo: must NOT be recommended
+        foreign = E._mk_entry("F1", 25000, date(2026, 7, 1), "X", "", "EXT",
+                              "UNR", True, "MET",
+                              offset_segments="70-1100001-000000-461000-000-0000-00-0000")
+        foreign.foreign_account = "FHB_UTHSC"
+        foreign.available = False
+        self.assertEqual(E.recommend_gl_string(b, loaded, [foreign]), "")
+        # asset-only entry (no offset combo): nothing to recommend
+        asset_only = E._mk_entry("A1", 25000, date(2026, 7, 1), "X", "", "EXT",
+                                 "UNR", True, "MET",
+                                 asset_segments="01-1100001-000000-100210-000-0000-00-0000")
+        self.assertEqual(E.recommend_gl_string(b, loaded, [asset_only]), "")
+        # in-account entry with offset combo: recommended, entity decoded
+        ok = E._mk_entry("K1", 25000, date(2026, 7, 1), "X", "", "EXT",
+                         "UNR", True, "MET",
+                         offset_segments="01-1100001-011413-546500-260-0000-00-0000")
+        got = E.recommend_gl_string(b, loaded, [asset_only, foreign, ok])
+        self.assertIn("01-1100001-011413-546500-260-0000-00-0000", got)
+        self.assertIn("UT System", got)
+
+    def test_config_audit_end_to_end(self):
+        # CFG files present: placements byte-identical, artifacts written,
+        # creation-failure vs uncovered classification correct.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            # claimed by the enabled TCR, but NO pool entry -> creation failure
+            ("2026-07-16", "290.50", "NA", "USDA TREAS 310 MISC PAY", "626001636",
+             "Automated clearing house", "Line 1 , 2026-07-16", "142"),
+            # recurring uncovered signature (x2)
+            ("2026-07-15", "-100.00", "NA", "STATE-TNRECEIPTSTNRECEIPTS 1", "NA",
+             "Automated clearing house", "Line 2 , 2026-07-15", "451"),
+            ("2026-07-16", "-200.00", "NA", "STATE-TNRECEIPTSTNRECEIPTS 2", "NA",
+             "Automated clearing house", "Line 3 , 2026-07-16", "451"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Counterparty"),
+              ("2026-07-02", "999.00", "OTHER", 601, "External", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        tcr = [("",) * 16] * 6 + [
+            ("", "BNK ACCNTNME", "ENBLD", "SQC NUM", "RLE NME", "DSCRPT",
+             "TRX CDE", "TRX TPE", "SRCH FLD", "SRCH STRNG", "CASH", "OFFSET",
+             "ACCNT FLG", "LST UPDTE", "UPDTEBY", ""),
+            ("", "FHB - Master Account", "Y", "334", "142-FHB - Master Account-626001636",
+             "d", "142", "ACH", "ACCOUNT_SERV_REFERENCE", "626001636",
+             "01-1100098-000000-100210-000-0000-00-0000", "", "Y", "", "A", ""),
+        ]
+        _write_xlsx(os.path.join(self.d, "CM_Configurations_Transaction_Creation_Rules.xlsx"),
+                    [("Sheet1", tcr)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        ca = runlog["config_audit"]
+        self.assertEqual(ca["tcr"]["creation_failures"], 1)
+        self.assertEqual(ca["tcr"]["uncovered_review_lines"], 2)
+        self.assertEqual(ca["tcr"]["uncovered_recurring_signatures"], 1)
+        self.assertTrue(os.path.exists(ca["report_path"]))
+        self.assertTrue(os.path.exists(ca["json_path"]))
+        text = open(ca["report_path"]).read()
+        self.assertIn("creation FAILURES", text)
+        self.assertIn("626001636", text)
+        self.assertIn("STATE-TNRECEIPTS", text)
+        self.assertIn("SIMULATED", text)
 
     def test_student_refund_uthsc_utm_utso_accounts(self):
         # Config export exposed three more Student Refund depositories; the
