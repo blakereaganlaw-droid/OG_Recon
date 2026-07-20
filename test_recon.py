@@ -1518,7 +1518,14 @@ class TestChartOfAccounts(unittest.TestCase):
     def test_router_coa_structural_files(self):
         for name in ("AcctCombos_base.csv", "AcctCombos_6.csv", "Segments.csv",
                      "ComboSets.xlsx", "CombosTech_UTSystem.xlsx",
-                     "RelatedValueSets.csv"):
+                     "RelatedValueSets.csv",
+                     # the REAL Oracle export names (owner CoA bundle,
+                     # 2026-07-20) — previously routed to None and never loaded.
+                     "COA_Account_Combinations_COA_Account_Combinations.csv",
+                     "COA_Combination_Sets_UTHSC.xlsx",
+                     "COA_Combos_Technical_UT_System.xlsx",
+                     "COA_Segments_COA_Segments.csv",
+                     "COA_Related_Value_Sets_COA_Related_Value_Sets.csv"):
             self.assertEqual(E.classify_file(name), "CHART_OF_ACCOUNTS", msg=name)
         # ORT_Department_* stays DEPT_INFO (bound before CHART_OF_ACCOUNTS).
         self.assertEqual(E.classify_file("ORT_Department_Info.xlsx"), "DEPT_INFO")

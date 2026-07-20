@@ -382,7 +382,9 @@ ROUTER_TABLE = [
     # table).  Placed AFTER DEPT_INFO so ORT_Department_* still bind DEPT_INFO.
     RouterRule("CHART_OF_ACCOUNTS", [], [],
                ["chart_of_accounts", "gl_departments", "acctcombos",
-                "combosets", "combostech", "segments", "relatedvaluesets"],
+                "account_combinations", "combosets", "combination_sets",
+                "combostech", "combos_technical", "segments",
+                "relatedvaluesets", "related_value_sets"],
                "Report", False),
     RouterRule("ORT_AR", ["ort", "_ar"], [], [], "Report", False),
     RouterRule("ORT_MISC", ["ort", "misc"], [], [], "Report", False),
@@ -4708,9 +4710,15 @@ def load_chart_of_accounts(files):
     combo_decode, entity_desc, postable_efdp = {}, {}, set()
     for rf in files:
         low = rf.filename.lower()
-        if "acctcombos" in low:
+        # Accept BOTH the short internal tokens and the real Oracle export
+        # names (owner CoA bundle, 2026-07-20): AcctCombos == "Account
+        # Combinations"; ComboSets == "Combination Sets"; CombosTech ==
+        # "Combos Technical".  Segments must be checked LAST so the
+        # "…_Segments" suffix on other CoA files never shadows the combo readers.
+        if "acctcombos" in low or "account_combinations" in low:
             _coa_read_acctcombos(rf, combo_decode)
-        elif "combosets" in low or "combostech" in low:
+        elif ("combosets" in low or "combostech" in low
+              or "combination_sets" in low or "combos_technical" in low):
             _coa_read_combosets(rf, postable_efdp)
         elif "segments" in low:
             _coa_read_segments(rf, entity_desc)
