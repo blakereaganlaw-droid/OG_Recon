@@ -115,6 +115,21 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    `POSSIBLE_AUTO_REC_SPLIT` Candidate instead of the coincidence's
    amount-only path barring the line into Review. Corroborated exact-open
    deposits still win over splits.
+8c3. **Merchant MID is a grouping key, not a 1:1 identity (owner,
+   2026-07-20).** A MID is shared across ALL of a merchant's receipts, so
+   amount + shared-MID is amount-only-WITHIN-merchant (rule 4). In P3 (exact
+   1:1), when a MERCHANT bank line's equal amount+reference candidates are
+   ALL same-MID receipts (`all(e.is_mid)`), P3 DEFERS the whole ambiguity to
+   the deposit/merchant lanes (P4 phase 2 + P6) — it never coin-flips one
+   arbitrary same-MID component into a `MULTIPLE_EQUAL_CANDIDATES` Candidate,
+   because consuming it cannibalizes the ORT deposit chain other lines need.
+   Real FHB UTSO case: consuming $150 receipt 1031272 broke deposit
+   d:129321 (= $310 + $150 = $460), stranding the $460 line into a wrong
+   "no subset sums" Review; deferring recovers BOTH lines as corroborated
+   deposit Matches. Byte-safe on the four baseline accounts (a mixed
+   candidate set with any non-MID tie keeps P3's normal behavior). The
+   symmetric N=1 arm (a single same-MID receipt Matched 1:1 in P3) is a
+   known follow-up under owner review, not yet closed.
 8d. **12-day stale-candidate ceiling (owner, 2026-07-12).** An
    External-source ST entered 12+ days BEFORE the BSL statement date is
    almost certainly not the counterpart — barred even as a Candidate
@@ -335,6 +350,28 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   Master data: 14 of 39 stranded State lines named, all reference-tied.
   Edison records are the payer's, never pool entries — they can never
   place anything.
+- **Sponsored Projects / SPN bridge (owner, 2026-07-20).** Five sponsored/
+  receivables reports LOAD as the cross-linked SPN reference bridge, each to
+  a DISTINCT role (the generic `unapplied` / `rpt_gms_0` catch-alls no longer
+  swallow them): `GMS_AGING` (RPT_GMS_001, invoice→award/sponsor/outstanding/
+  aging), `GMS_AWARD_PROFILE` (RPT_GMS_002, award→sponsor/grant-code(AWARD_NAME)
+  /SPN(PROJECT_NUMBER)/ALN), `GMS_PROJECT_FUNDING` (RPT_GMS_035, the clean
+  SPN→award→funding-source map), `AR_UNAPPLIED_CUST` (RPT_AR_059, SPN-bearing
+  unapplied receipts→customer), `AR_UNAPPLIED_SUMMARY` (RPT_AR_063, customer
+  unapplied rollup).  `_sponsored_index` unifies whichever are present into
+  {invoice, amount, spn, award, grant, unapplied_amt}; `_sponsored_note` (P10)
+  annotates a stranded line by the MOST SPECIFIC tie — invoice # → SPN in the
+  addenda → award # → federal grant code → exact amount + sponsor name →
+  unapplied receipt — naming the award/sponsor/SPN(s)/outstanding so the
+  reconciler knows exactly which SPN to search the pool for.  ANNOTATION ONLY
+  (mirrors Edison): the reports are the receivable's, never pool entries, so
+  placements are byte-identical with or without them; ambiguous amount-only
+  sets are never guessed.  These reports have a multi-row Oracle parameter
+  preamble above the data header (rows ~10-13) — bound with a widened header
+  scan (`_WIDE_HEADER_SCAN_ROLES`) so a preamble filter label
+  ("Invoice Number:") is never mistaken for the header.  AUTO-PLACEMENT from
+  the bridge (turning an SPN tie into a Candidate/Match) is a future
+  placement-affecting step under owner review, not yet built.
 - **Recon-history advisory audit (owner, 2026-07-19 — orphan-doctrine R2
   activation).** A staged `Reconciled_*` export (the `Exported` sheet,
   17 cols, `Created By` = ESSADMIN AutoReconcile / OIC_SYSTEM_USER TCR /
