@@ -210,6 +210,27 @@ def digit_runs(s, n=5) -> set:
     return {r for r in _DIGIT_RUN_RE.findall(N(s)) if len(r) >= n}
 
 
+_DESC_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+# A description word appearing in more than this many pool entries is
+# boilerplate ("Disbursing", "Master", "Account", "Payables") — high collision
+# risk, no discriminatory value.  A word appearing in <= this many is
+# distinctive (owner collision-risk framework, 2026-07-20).
+DESC_WORD_MAX_FREQ = 3
+
+
+def desc_word_tokens(s) -> tuple:
+    """>=6-char znorm word tokens (each carrying >=1 letter) from a free-text
+    description — the candidates for the inverse-frequency distinctive-word
+    screen.  Pure-numeric runs are handled separately (desc_refs), so a token
+    must contain a letter to qualify here."""
+    out = set()
+    for w in _DESC_WORD_RE.findall(N(s)):
+        z = znorm(w)
+        if len(z) >= 6 and any(c.isalpha() for c in z):
+            out.add(z)
+    return tuple(sorted(out))
+
+
 def payer_tokens(s) -> set:
     """Set of alpha tokens length>=4, minus the generic stopword set."""
     return {t.upper() for t in _ALPHA_TOKEN_RE.findall(N(s))
@@ -722,16 +743,25 @@ def route_folder(input_dir, skipped=None) -> dict:
                 "BSL / _ST_ / MET / Receipts / Payables_Payments / BAI2 ...)"))
             continue
         # Raw bank files (owner, 2026-07-19): a .txt is accepted ONLY as a
-        # native BAI2 transmission ("FHB_UTHSC_BAI2.txt") — the raw reader
-        # parses type-16/88 records with the FULL untruncated addenda the
-        # Oracle BSL feed cuts off.  Any other .txt stays unrouted.
+        # native BAI2 transmission — the raw reader parses type-16/88 records
+        # with the FULL untruncated addenda the Oracle BSL feed cuts off.
+        # A .txt whose NAME carries no BAI token but whose CONTENT is a BAI2
+        # transmission (owner, 2026-07-20: "BAIEXP_07202026_071541.txt") is
+        # recognized by its 01/02/16 structure and routed as BAI2 — never
+        # silently dropped over a filename.  Any other .txt stays unrouted.
         if low.endswith(".txt") and role != "BAI2":
-            skipped.append(_skip_notice(
-                name, f".txt is accepted only for raw BAI2 transmissions "
-                      f"(this name routes as {role})",
-                "export as .xlsx/.csv, or add a _BAI2 token if it is a raw "
-                "bank file"))
-            continue
+            if _looks_like_bai2(path):
+                role = "BAI2"
+                print(f"NOTE (file content): {name} routed as BAI2 by its "
+                      "01/02/16 record structure (the filename carries no BAI "
+                      "token).", file=sys.stderr)
+            else:
+                skipped.append(_skip_notice(
+                    name, f".txt is accepted only for raw BAI2 transmissions "
+                          f"(this name routes as {role})",
+                    "export as .xlsx/.csv, or add a _BAI2 token if it is a raw "
+                    "bank file"))
+                continue
         rf = RoutedFile(role, path, name, rule_by_role[role].sheet)
         by_role.setdefault(role, []).append(rf)
         if role in _RECOGNIZED_NOT_LOADED:
@@ -1346,6 +1376,37 @@ def _bai2_date(yymmdd):
     return ""
 
 
+def _looks_like_bai2(path):
+    """Content sniff (owner, 2026-07-20): a raw BAI2 transmission is
+    self-identifying — the first non-blank line is the "01," file-header
+    record, and the body carries "02," group and "16," detail records.  Real
+    bank exports are named every which way ("BAIEXP_07202026_071541.txt"), so
+    the name-token router alone silently drops them; this recognizes the file
+    by its structure instead.  Conservative: all three record types required."""
+    try:
+        seen = {"01": False, "02": False, "16": False}
+        first = True
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, raw in enumerate(fh):
+                line = raw.strip()
+                if not line:
+                    continue
+                if first:
+                    if not line.startswith("01,"):
+                        return False   # a BAI2 file MUST open with 01,
+                    first = False
+                code = line[:2]
+                if code in seen:
+                    seen[code] = True
+                if all(seen.values()):
+                    return True
+                if i > 2000:           # header/first details are near the top
+                    break
+    except OSError:
+        return False
+    return all(seen.values())
+
+
 def _read_bai2_txt(path):
     """Parse a NATIVE BAI2 transmission (.txt) into spreadsheet-shaped rows
     binding the existing BAI2_ROLES: header row + one row per type-16 detail
@@ -1521,9 +1582,11 @@ class PoolEntry:
     #                            HERE, never from the cash-side asset combo
     desc_refs: tuple = ()      # >=6-digit numeric runs embedded in the MET/ORT
     #                            free-text description (owner, 2026-07-20: "review
-    #                            all cells… especially the description text").
-    #                            Distinctive identifiers only (numbers are
-    #                            low-collision); fed into the cross-reference tie.
+    #                            all cells… especially the description text"), PLUS
+    #                            the distinctive (low-frequency) description WORDS
+    #                            finalized in build_pool.  Fed into the tie screen.
+    desc_alpha: tuple = ()     # raw >=6-char description word candidates, before
+    #                            the inverse-frequency screen (build_pool).
 
 
 def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
@@ -1537,6 +1600,10 @@ def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
     # low-collision, so they are safe reference evidence.
     desc_refs = tuple(sorted(d for d in digit_runs(description, 6)
                              if len(d) >= 6 and znorm(ref) != d))
+    # Description WORD candidates (letters); the inverse-frequency screen in
+    # build_pool keeps only the distinctive (rare) ones and folds them into
+    # desc_refs.  Common banking words are dropped there, not here.
+    desc_alpha = desc_word_tokens(description)
     return PoolEntry(
         id=N(id),
         amount_cents=amount_cents,
@@ -1559,6 +1626,7 @@ def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
         asset_segments=N(asset_segments),
         offset_segments=N(offset_segments),
         desc_refs=desc_refs,
+        desc_alpha=desc_alpha,
     )
 
 
@@ -2079,6 +2147,31 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
 
     runlog["pool_sizes"] = counts
     runlog["pool_total"] = len(pool)
+    # Inverse-frequency distinctive-word screen (owner collision-risk framework,
+    # 2026-07-20): a description WORD appearing in many entries is boilerplate
+    # (high collision, no discriminatory value); a word in <= DESC_WORD_MAX_FREQ
+    # entries is distinctive.  Keep only the rare ones and fold them into the
+    # entry's tie fields (desc_refs) — numbers were already added unfiltered
+    # (low collision).  Finalized HERE (immutable after build_pool, before the
+    # tie index) so common banking words can never forge >=6-char alpha ties.
+    word_freq = {}
+    for e in pool:
+        for t in e.desc_alpha:
+            word_freq[t] = word_freq.get(t, 0) + 1
+    distinctive_added = 0
+    for e in pool:
+        if not e.desc_alpha:
+            continue
+        keep = [t for t in e.desc_alpha if word_freq[t] <= DESC_WORD_MAX_FREQ]
+        if keep:
+            e.desc_refs = tuple(sorted(set(e.desc_refs) | set(keep)))
+            distinctive_added += 1
+    runlog["desc_word_screen"] = {
+        "candidate_words": len(word_freq),
+        "distinctive_words": sum(1 for v in word_freq.values()
+                                 if v <= DESC_WORD_MAX_FREQ),
+        "entries_enriched": distinctive_added,
+        "max_freq": DESC_WORD_MAX_FREQ}
     # Status breakdown for the run log.
     by_status = {}
     for e in pool:

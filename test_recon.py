@@ -61,6 +61,19 @@ class TestPrimitives(unittest.TestCase):
         self.assertEqual(E.digit_runs("ab12345cd678", 5), {"12345"})
         self.assertEqual(E.digit_runs("12 34", 5), set())
 
+    def test_desc_word_tokens(self):
+        # >=6-char znorm words carrying a letter; pure numbers and short words
+        # (which the numeric/other lanes handle) are excluded.
+        t = E.desc_word_tokens("Controlled Disbursing 581_FHB Master Account")
+        self.assertIn("CONTROLLED", t)
+        self.assertIn("DISBURSING", t)
+        self.assertIn("MASTER", t)
+        self.assertIn("ACCOUNT", t)
+        self.assertNotIn("FHB", t)      # 3 chars
+        self.assertNotIn("581", t)      # pure numeric
+        # an alphanumeric security/reference code qualifies (has a letter)
+        self.assertIn("6698M4UV2", E.desc_word_tokens("CUSIP 6698M4UV2 lot"))
+
     def test_payer_tokens_excludes_bai2_labels(self):
         toks = E.payer_tokens("SENDING CO NAME ACME WIDGETS COMPANY")
         self.assertIn("ACME", toks)
