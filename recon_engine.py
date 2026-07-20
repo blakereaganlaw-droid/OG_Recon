@@ -1519,12 +1519,24 @@ class PoolEntry:
     #                            the ECT posting side (§6 account-string
     #                            sourcing); the CoA-recommended GL comes from
     #                            HERE, never from the cash-side asset combo
+    desc_refs: tuple = ()      # >=6-digit numeric runs embedded in the MET/ORT
+    #                            free-text description (owner, 2026-07-20: "review
+    #                            all cells… especially the description text").
+    #                            Distinctive identifiers only (numbers are
+    #                            low-collision); fed into the cross-reference tie.
 
 
 def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
               available, origin, deposit_id="", receipt_id="", transaction_type="",
-              spr="", asset_segments="", offset_segments=""):
+              spr="", asset_segments="", offset_segments="", description=""):
     ref = clean_ref(reference)
+    # Distinctive numeric runs (>=6 digits) from the free-text description.
+    # Alpha description tokens are DELIBERATELY excluded here — common banking
+    # words ("FHB Master Account", "Payables") would manufacture false >=6-char
+    # containment ties (owner hard-guardrail); numbers are inherently
+    # low-collision, so they are safe reference evidence.
+    desc_refs = tuple(sorted(d for d in digit_runs(description, 6)
+                             if len(d) >= 6 and znorm(ref) != d))
     return PoolEntry(
         id=N(id),
         amount_cents=amount_cents,
@@ -1546,6 +1558,7 @@ def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
         spr=clean_ref(spr),
         asset_segments=N(asset_segments),
         offset_segments=N(offset_segments),
+        desc_refs=desc_refs,
     )
 
 
@@ -1868,6 +1881,7 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 transaction_type=_cell(r, m.get("transaction_type")),
                 asset_segments=asset_seg,
                 offset_segments=offset_seg,
+                description=desc,
             )
             if foreign_acc:
                 # Shadow entry: only the misdirected search may cite it, and
@@ -2362,13 +2376,17 @@ def _bsl_znorms(bsl):
 
 
 def _entry_znorms(e):
-    """Non-empty znorms of the ST entry's 4 identifier fields."""
+    """Non-empty znorms of the ST entry's identifier fields PLUS the
+    distinctive numeric runs carried in its free-text description (MET/ORT
+    'description' text — owner 2026-07-20).  Numbers only; common description
+    words are excluded upstream so they cannot forge >=6-char containment ties."""
     out = []
     for v in (e.reference, e.id, e.spr, e.counterparty):
         if v:
             z = znorm(v)
             if z:
                 out.append(z)
+    out.extend(e.desc_refs)      # already znorm digit-runs, len >= 6
     return tuple(out)
 
 

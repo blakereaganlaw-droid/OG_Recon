@@ -2278,6 +2278,30 @@ class TestGuardrails2026(unittest.TestCase):
         self.assertEqual(p.kind, E.CANDIDATE, msg=p.explanation)
         self.assertIn("AMBIGUOUS_GROUP", p.codes)
 
+    def test_description_number_creates_reference_tie(self):
+        # MET/ORT free-text descriptions (owner, 2026-07-20): a >=6-digit number
+        # embedded in the description ("...LGIP 44711210") is now a searchable
+        # reference — a bank line carrying that number ties to the entry, where
+        # before the description was invisible to the cross-reference screen.
+        b = E.make_bsl("L1", date(2026, 7, 10), 500000, "44711210", "44711210",
+                       "LGIP TRANSFER 44711210", "Automated clearing house", "142")
+        e = E._mk_entry("ST9", 500000, date(2026, 7, 9), "OTHERREF", "",
+                        "EXT", "UNR", True, "MET",
+                        description="495-FHB - Master Account-LGIP 44711210")
+        self.assertIn("44711210", e.desc_refs)
+        p = self._one(self._fwd([b], [e]), "L1")
+        self.assertEqual(p.kind, E.MATCH, msg=p.explanation)
+        self.assertEqual([x.id for x in p.st_entries], ["ST9"])
+        # A common description WORD must NOT tie (only distinctive numbers do).
+        b2 = E.make_bsl("L2", date(2026, 7, 10), 700000, "NA", "NA",
+                        "FHB MASTER ACCOUNT DEPOSIT", "Miscellaneous", "174")
+        e2 = E._mk_entry("ST8", 700000, date(2026, 7, 9), "ZZZ", "",
+                         "EXT", "UNR", True, "MET",
+                         description="Controlled Disbursing 581_FHB Master Account")
+        self.assertEqual(e2.desc_refs, ())   # "581" is <6 digits; words excluded
+        p2 = self._one(self._fwd([b2], [e2]), "L2")
+        self.assertNotEqual(p2.kind, E.MATCH, msg=p2.explanation)
+
     def test_merchant_mid_ambiguity_does_not_cannibalize_deposit(self):
         # Merchant grouping-key guard (rule 7 + doctrine 8c; owner: minimize
         # false candidates).  A MID is a GROUPING key shared across all of a
