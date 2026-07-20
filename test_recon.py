@@ -2465,6 +2465,43 @@ class TestCMConfig(unittest.TestCase):
         self.assertEqual(hi, 0)
         self.assertEqual(m["bai_code"], 5)
 
+    def test_bai2_content_sniff_routes_unnamed_txt(self):
+        # A raw BAI2 whose FILENAME carries no BAI token (real bank export
+        # "BAIEXP_07202026_071541.txt") is recognized by its 01/02/16 record
+        # structure and routed as BAI2 — never silently dropped over a name.
+        raw = "\n".join([
+            "01,000000000,000000000,260720,1916,2663008,,,2/",
+            "02,084000026,084000026,1,260718,,USD,2/",
+            "16,142,5100,Z,25202003732875,08035701948,",
+            "88,MERCHANT SERVICEDEPOSIT",
+            "49,0,2/", "98,0,1,2/", "99,0,1,2/",
+        ])
+        p = os.path.join(self.d, "BAIEXP_07202026_071541.txt")
+        with open(p, "w") as fh:
+            fh.write(raw)
+        self.assertIsNone(E.classify_file("BAIEXP_07202026_071541.txt"))
+        self.assertTrue(E._looks_like_bai2(p))
+        # a non-BAI2 .txt must NOT sniff as BAI2
+        q = os.path.join(self.d, "notes.txt")
+        with open(q, "w") as fh:
+            fh.write("just some notes\nnothing structured\n")
+        self.assertFalse(E._looks_like_bai2(q))
+        # route_folder (needs a BSL present) routes the content-BAI2 as BAI2
+        # and leaves the plain .txt skipped.
+        _write_xlsx(os.path.join(self.d, "20260720_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [
+                        ("Date", "Amount (USD)", "Reference", "Additional Information",
+                         "Account Servicer Reference", "Transaction Type",
+                         "Statement", "Transaction Code"),
+                        ("2026-07-20", "1.00", "NA", "X", "NA", "Miscellaneous",
+                         "Line 1 , 2026-07-20", "174")])])
+        skipped = []
+        by_role = E.route_folder(self.d, skipped)
+        self.assertIn("BAI2", by_role)
+        self.assertTrue(any(f.filename == "BAIEXP_07202026_071541.txt"
+                            for f in by_role["BAI2"]))
+        self.assertTrue(any(s["file"] == "notes.txt" for s in skipped))
+
     def test_cfg_tcr_orphan_rows_load(self):
         # The real export carries rules with a BLANK bank-account cell
         # (detached rules, 3 still enabled) — they must load, not be

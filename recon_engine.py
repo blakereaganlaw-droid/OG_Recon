@@ -736,6 +736,16 @@ def route_folder(input_dir, skipped=None) -> dict:
                 "token if it is a raw bank transmission"))
             continue
         role = classify_file(name)
+        # Content-sniff a raw BAI2 whose FILENAME carries no BAI token BEFORE
+        # the unrecognized-name skip (real bank export
+        # "BAIEXP_07202026_071541.txt"): a BAI2 transmission is self-identifying
+        # by its 01/02/16 record structure, so it is never silently dropped
+        # over a filename.
+        if role != "BAI2" and low.endswith(".txt") and _looks_like_bai2(path):
+            role = "BAI2"
+            print(f"NOTE (file content): {name} routed as BAI2 by its "
+                  "01/02/16 record structure (the filename carries no BAI "
+                  "token).", file=sys.stderr)
         if role is None:
             skipped.append(_skip_notice(
                 name, "no router rule matches this name",
@@ -745,23 +755,15 @@ def route_folder(input_dir, skipped=None) -> dict:
         # Raw bank files (owner, 2026-07-19): a .txt is accepted ONLY as a
         # native BAI2 transmission — the raw reader parses type-16/88 records
         # with the FULL untruncated addenda the Oracle BSL feed cuts off.
-        # A .txt whose NAME carries no BAI token but whose CONTENT is a BAI2
-        # transmission (owner, 2026-07-20: "BAIEXP_07202026_071541.txt") is
-        # recognized by its 01/02/16 structure and routed as BAI2 — never
-        # silently dropped over a filename.  Any other .txt stays unrouted.
+        # A .txt that NAME-routes to a non-BAI2 role (and did not content-sniff
+        # as BAI2 above) stays unrouted.
         if low.endswith(".txt") and role != "BAI2":
-            if _looks_like_bai2(path):
-                role = "BAI2"
-                print(f"NOTE (file content): {name} routed as BAI2 by its "
-                      "01/02/16 record structure (the filename carries no BAI "
-                      "token).", file=sys.stderr)
-            else:
-                skipped.append(_skip_notice(
-                    name, f".txt is accepted only for raw BAI2 transmissions "
-                          f"(this name routes as {role})",
-                    "export as .xlsx/.csv, or add a _BAI2 token if it is a raw "
-                    "bank file"))
-                continue
+            skipped.append(_skip_notice(
+                name, f".txt is accepted only for raw BAI2 transmissions "
+                      f"(this name routes as {role})",
+                "export as .xlsx/.csv, or add a _BAI2 token if it is a raw "
+                "bank file"))
+            continue
         rf = RoutedFile(role, path, name, rule_by_role[role].sheet)
         by_role.setdefault(role, []).append(rf)
         if role in _RECOGNIZED_NOT_LOADED:
