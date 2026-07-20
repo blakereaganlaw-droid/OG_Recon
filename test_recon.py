@@ -2271,6 +2271,52 @@ class TestGuardrails2026(unittest.TestCase):
         self.assertEqual(p.kind, E.CANDIDATE, msg=p.explanation)
         self.assertIn("AMBIGUOUS_GROUP", p.codes)
 
+    def test_merchant_mid_ambiguity_does_not_cannibalize_deposit(self):
+        # Merchant grouping-key guard (rule 7 + doctrine 8c; owner: minimize
+        # false candidates).  A MID is a GROUPING key shared across all of a
+        # merchant's receipts, not a 1:1 identity.  Real UTSO case: a $150
+        # merchant line found FOUR equal open $150 receipts all carrying the
+        # same MID; P3 coin-flipped one and CONSUMED it — but that receipt was
+        # a member of the ORT deposit summing to a SEPARATE $460 line, which
+        # was then stranded.  P3 must defer the whole ambiguity to the deposit
+        # lane, which sums the whole deposit.
+        MID = "8037859173"
+        line460 = E.make_bsl("L460", date(2026, 7, 13), 46000, MID, MID,
+                             f"MERCHANT SERVICE MERCH DEP {MID}",
+                             "Automated clearing house", "142")
+        line150 = E.make_bsl("L150", date(2026, 7, 13), 15000, MID, MID,
+                             f"MERCHANT SERVICE MERCH DEP {MID}",
+                             "Automated clearing house", "142")
+        self.assertEqual(line460.lane, E.LANE_MERCHANT)
+        self.assertEqual(line150.lane, E.LANE_MERCHANT)
+
+        def rc(i, cents, dep):
+            return E._mk_entry(i, cents, date(2026, 7, 13), MID, "Touchnet",
+                               "EXT", "UNR", True, "MET", deposit_id=dep,
+                               receipt_id=f"r{i}")
+        # deposit A ($460) = $310 + $150; deposit B ($150) = single $150.
+        r_a1 = rc("1000", 31000, "500001")
+        r_a2 = rc("1001", 15000, "500001")   # sorts first among the $150s
+        r_b1 = rc("1002", 15000, "500002")
+        # two extra loose $150 receipts (no deposit) to force P3 ambiguity.
+        r_x1 = rc("1003", 15000, "")
+        r_x2 = rc("1004", 15000, "")
+        pool = [r_a1, r_a2, r_b1, r_x1, r_x2]
+
+        placements = self._fwd([line460, line150], pool)
+        p460 = self._one(placements, "L460")
+        p150 = self._one(placements, "L150")
+
+        # The $460 line matches its deposit — impossible if P3 had eaten r1001.
+        self.assertEqual(p460.kind, E.MATCH, msg=p460.explanation)
+        self.assertEqual({e.id for e in p460.st_entries}, {"1000", "1001"})
+        self.assertEqual(p460.pass_name, "P4_deposit_group", msg=p460.explanation)
+        # The $150 line is resolved through the deposit lane, never a P3
+        # coin-flip that cites one arbitrary same-MID receipt.
+        self.assertNotEqual(p150.pass_name, "P3_exact_1to1", msg=p150.explanation)
+        for p in placements:
+            self.assertNotIn("MULTIPLE_EQUAL_CANDIDATES", p.codes or [])
+
 
 class TestCMConfig(unittest.TestCase):
     """CM Configuration exports (owner, 2026-07-19): the five CFG_* loaders,

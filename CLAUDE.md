@@ -115,6 +115,21 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    `POSSIBLE_AUTO_REC_SPLIT` Candidate instead of the coincidence's
    amount-only path barring the line into Review. Corroborated exact-open
    deposits still win over splits.
+8c3. **Merchant MID is a grouping key, not a 1:1 identity (owner,
+   2026-07-20).** A MID is shared across ALL of a merchant's receipts, so
+   amount + shared-MID is amount-only-WITHIN-merchant (rule 4). In P3 (exact
+   1:1), when a MERCHANT bank line's equal amount+reference candidates are
+   ALL same-MID receipts (`all(e.is_mid)`), P3 DEFERS the whole ambiguity to
+   the deposit/merchant lanes (P4 phase 2 + P6) — it never coin-flips one
+   arbitrary same-MID component into a `MULTIPLE_EQUAL_CANDIDATES` Candidate,
+   because consuming it cannibalizes the ORT deposit chain other lines need.
+   Real FHB UTSO case: consuming $150 receipt 1031272 broke deposit
+   d:129321 (= $310 + $150 = $460), stranding the $460 line into a wrong
+   "no subset sums" Review; deferring recovers BOTH lines as corroborated
+   deposit Matches. Byte-safe on the four baseline accounts (a mixed
+   candidate set with any non-MID tie keeps P3's normal behavior). The
+   symmetric N=1 arm (a single same-MID receipt Matched 1:1 in P3) is a
+   known follow-up under owner review, not yet closed.
 8d. **12-day stale-candidate ceiling (owner, 2026-07-12).** An
    External-source ST entered 12+ days BEFORE the BSL statement date is
    almost certainly not the counterpart — barred even as a Candidate

@@ -2754,6 +2754,19 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                   f"{note}; source {e.source}.",
                   "P3_exact_1to1")
         elif len(cands) > 1:
+            # Merchant-lane grouping-key guard (owner: minimize false
+            # candidates; rule 7 + doctrine 8c).  For a merchant BSL the tie
+            # here is the shared MID — and multiplicity PROVES that MID is a
+            # GROUPING key, not a 1:1 identity: each of N same-MID receipts
+            # equals the settlement amount.  Citing (and consuming) one is a
+            # coin-flip that cannibalizes the ORT deposit chain the OTHER
+            # lines need (real UTSO case: consuming $150 receipt 1031272 broke
+            # deposit d:129321 = $310 + $150 = $460, stranding the $460 line
+            # in Review).  Defer the whole ambiguity to the deposit/merchant
+            # lanes (P4 phase 2 + P6), which sum the deposit/window instead of
+            # picking a single component.
+            if bsl.lane == LANE_MERCHANT and all(e.is_mid for e in cands):
+                continue
             ordered = _sorted(cands)
             place(bsl, CANDIDATE, CONF_MEDIUM, [ordered[0]],
                   ["MULTIPLE_EQUAL_CANDIDATES"],
