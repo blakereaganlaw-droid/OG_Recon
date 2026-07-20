@@ -4280,21 +4280,31 @@ def _sponsored_note(bsl, spx):
 
 
 def _coa_tag(e, coa):
-    """" (dept <DEP_DESC>, entity <ENT_DESC>)" for a named ST that carries a
-    CoA-decodable asset combo, else "".  ADVISORY text only (rule 8c); returns
-    "" when the CoA is absent, so Review output is byte-identical without it."""
-    seg = getattr(e, "asset_segments", "")
-    if not coa or not seg:
-        return ""
-    d = coa_decode(seg, coa)
-    if not d:
+    """" (dept …, entity …; posts to <offset dept> / <natural account>)" for a
+    named ST — the CoA decode of the asset (cash) combo AND the OFFSET combo
+    (the ECT posting side).  Owner (2026-07-20): compare the CoA to the offset
+    accounts on the External System Transactions, so the reconciler sees the
+    fund/dept/natural-account each candidate posts to.  ADVISORY text only
+    (rule 8c: fund/dept/account is CONTEXT — it confers no MATCH by itself);
+    returns "" when the CoA is absent, so Review output is byte-identical
+    without it."""
+    if not coa:
         return ""
     bits = []
-    if d.get("dep_desc"):
-        bits.append(f"dept {d['dep_desc']}")
-    if d.get("ent_desc"):
-        bits.append(f"entity {d['ent_desc']}")
-    return f" ({', '.join(bits)})" if bits else ""
+    d = coa_decode(getattr(e, "asset_segments", ""), coa)
+    if d:
+        if d.get("dep_desc"):
+            bits.append(f"dept {d['dep_desc']}")
+        if d.get("ent_desc"):
+            bits.append(f"entity {d['ent_desc']}")
+    inner = ", ".join(bits)
+    o = coa_decode(getattr(e, "offset_segments", ""), coa)
+    if o:
+        posts = [x for x in (o.get("dep_desc") or o.get("dept", ""),
+                             o.get("act_desc") or o.get("account", "")) if x]
+        if posts:
+            inner = (inner + "; " if inner else "") + "posts to " + " / ".join(posts)
+    return f" ({inner})" if inner else ""
 
 
 def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None, coa=None,
