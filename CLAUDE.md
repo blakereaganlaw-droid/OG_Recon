@@ -305,6 +305,32 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   GL), and NEVER a foreign-account shadow entry (rule 8g: another
   depository's posting must not steer this account's ECT).  P10 builds one
   amount index for the whole residual pass (no per-line pool rescans).
+  **Real-name routing (owner, 2026-07-20):** the router + `load_chart_of_accounts`
+  dispatch now accept Oracle's ACTUAL export names (`COA_Account_Combinations`,
+  `COA_Combination_Sets`, `COA_Combos_Technical`) alongside the short internal
+  tokens — before, only `Segments` matched, so the combination-sets files never
+  loaded (postable E-F-D-P keys jumped 1,257 → 64,209 once fixed).  **Offset
+  decode in Review (owner, 2026-07-20 — "compare CoA to the offset accounts on
+  EXT STs"):** `_coa_tag` now decodes BOTH the asset combo AND the OFFSET combo,
+  annotating each named ST with "posts to <offset dept> / <natural account>"
+  (all 74,775 real Master EXT offsets decode).  ADVISORY (rule 8c refined:
+  fund/dept/account is CONTEXT, not a MATCH by itself; campus still confers
+  nothing).  A placement-affecting offset-dept corroborator was **probed and
+  rejected**: BSL-payer vs offset-dept fires for 0/131 real Master BSLs (bank
+  addenda carry no GL dept), so it would be dead code — delivered as the
+  advisory decode instead.
+- **Description-number cross-reference (owner, 2026-07-20).** Free-text MET/ORT
+  descriptions ("495-FHB - Master Account-LGIP 44711210") were invisible to the
+  tie screen (`parse_met_description` only handles the pipe-delimited
+  `d:|r:|payer` shape).  `_mk_entry` now captures the `>=6-digit` numeric runs
+  embedded in the description (`PoolEntry.desc_refs`), fed through the single
+  tie-field source (`_entry_znorms`) so both `cross_reference_tie` and the
+  6-gram index see them.  HARD GUARDRAIL: **numbers ONLY** — common description
+  WORDS ("FHB Master Account", "Payables") are excluded, since a `>=6-char`
+  alpha token would forge false containment ties across the thousands of rows
+  sharing boilerplate; numbers are low-collision, so they are safe reference
+  evidence.  Byte-identical on all four baselines (no false ties); the
+  distinctive-alpha screen (inverse frequency) is a designed follow-up.
 - **CM configuration audit (owner, 2026-07-19 — orphan-doctrine R5
   activation).** The five `CM_Configurations_*` exports load as `CFG_TCR` /
   `CFG_PARSE` / `CFG_MATCHING` / `CFG_TOLERANCE` / `CFG_RULESETS`
