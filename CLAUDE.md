@@ -350,6 +350,28 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   Master data: 14 of 39 stranded State lines named, all reference-tied.
   Edison records are the payer's, never pool entries — they can never
   place anything.
+- **Sponsored Projects / SPN bridge (owner, 2026-07-20).** Five sponsored/
+  receivables reports LOAD as the cross-linked SPN reference bridge, each to
+  a DISTINCT role (the generic `unapplied` / `rpt_gms_0` catch-alls no longer
+  swallow them): `GMS_AGING` (RPT_GMS_001, invoice→award/sponsor/outstanding/
+  aging), `GMS_AWARD_PROFILE` (RPT_GMS_002, award→sponsor/grant-code(AWARD_NAME)
+  /SPN(PROJECT_NUMBER)/ALN), `GMS_PROJECT_FUNDING` (RPT_GMS_035, the clean
+  SPN→award→funding-source map), `AR_UNAPPLIED_CUST` (RPT_AR_059, SPN-bearing
+  unapplied receipts→customer), `AR_UNAPPLIED_SUMMARY` (RPT_AR_063, customer
+  unapplied rollup).  `_sponsored_index` unifies whichever are present into
+  {invoice, amount, spn, award, grant, unapplied_amt}; `_sponsored_note` (P10)
+  annotates a stranded line by the MOST SPECIFIC tie — invoice # → SPN in the
+  addenda → award # → federal grant code → exact amount + sponsor name →
+  unapplied receipt — naming the award/sponsor/SPN(s)/outstanding so the
+  reconciler knows exactly which SPN to search the pool for.  ANNOTATION ONLY
+  (mirrors Edison): the reports are the receivable's, never pool entries, so
+  placements are byte-identical with or without them; ambiguous amount-only
+  sets are never guessed.  These reports have a multi-row Oracle parameter
+  preamble above the data header (rows ~10-13) — bound with a widened header
+  scan (`_WIDE_HEADER_SCAN_ROLES`) so a preamble filter label
+  ("Invoice Number:") is never mistaken for the header.  AUTO-PLACEMENT from
+  the bridge (turning an SPN tie into a Candidate/Match) is a future
+  placement-affecting step under owner review, not yet built.
 - **Recon-history advisory audit (owner, 2026-07-19 — orphan-doctrine R2
   activation).** A staged `Reconciled_*` export (the `Exported` sheet,
   17 cols, `Created By` = ESSADMIN AutoReconcile / OIC_SYSTEM_USER TCR /

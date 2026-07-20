@@ -40,6 +40,11 @@ YYYYMMDD_<Source>_<Account>_<Role>[_<Status>].<ext>
 | Raw BAI2 transmission | `BAI` (whole segment; `BAI2` fine) — **the only `.txt` accepted** | yes (enrichment) | `20260718_FHB_UTHSC_BAI2.txt` |
 | BAI2 spreadsheet | `BAI` | yes (enrichment) | `20260715_FHB_UTC_BAI2.csv` |
 | Edison payments / invoices | `Edison_Payments` / `Edison_Invoices` | yes (Review annotation) | — |
+| GMS Sponsored AR Aging | `GMS_001` / `Sponsored_AR_Aging` | yes (Sponsored-Projects annotation) | `RPT_GMS_001__Sponsored_AR_Aging_Report.xlsx` |
+| GMS Sponsored Award Profile | `Sponsored_Award_Profile` / `RPT_GMS_002` | yes (SPN/award/sponsor bridge) | `RPT_GMS_002__Sponsored_Award_Profile_Report.csv` |
+| GMS Project Contract & Funding | `Project_Contract_And_Funding` / `RPT_GMS_035` | yes (SPN→award→sponsor bridge) | `RPT_GMS_035__Project_Contract_and_Funding_Source_Report.xlsx` |
+| AR Unapplied by Customer | `AR_Unapplied_By_Customer` / `RPT_AR_059` | yes (unapplied-receipt annotation) | `RPT_AR_059__AR_Unapplied_By_Customer_Report.xlsx` |
+| AR Unapplied Receipts Summary | `AR_063` / `RPT_AR_063` / `Unapplied_Receipts_Summary` | yes (customer unapplied context) | `RPT_AR_063__Unapplied_Receipts_Summary_Report.xlsx` |
 | MID master | `MID_Master` | yes | `UT_MID_Master_Consolidated.xlsx` |
 | ORT misc / AR | `ORT`+`Misc` / `ORT`+`_AR` | yes | `20260719_ORT_Misc_All.xlsx` |
 | ORT departments | `ORT_Department` / `Department_Info` | yes (MID directory) | `ORT_Department_MIDs.xlsx` |
@@ -51,7 +56,7 @@ YYYYMMDD_<Source>_<Account>_<Role>[_<Status>].<ext>
 | Enriched BSL workbook | `Enriched` / `Crossref` | yes (enrichment) | — |
 | **Reconciled forensic exports** | `Reconciled` / `Reconciliation_Report` | recognized; `Reconciled_*` (Exported sheet) feeds the ADVISORY recon-history/orphan audit — never a pool source | `..._Reconciled_..._BSL.xlsx` |
 | Lifecycle workbook | `All_Data` | recognized, never loaded (Unreconcile2) | `FHB_UTC_All_Data.xlsx` |
-| GMS aging / sponsor map / AR invoices / contracts / unapplied summary / rosetta | `GMS_001`, `Sponsored_Aging`, `RPT_GMS_0`, `AR_Invoices`, `Contracts_To_Receivable_Invoices`, `AR_063`, `Relationship_Map`, `Rosetta` | recognized, **not used by the forward engine** (you'll get a console NOTE) | — |
+| Other GMS / AR reference reports | `RPT_GMS_0…` (other), `AR_Invoices`, `Contracts_To_Receivable_Invoices`, `Relationship_Map`, `Rosetta` | recognized, **not used by the forward engine** (you'll get a console NOTE) | — |
 
 Account tokens: `FHB_Master`, `FHB_UTC` (also `FHB_UT_Chatt`), `FHB_UTHSC`,
 `FHB_UTIA`, `FHB_UTM`, `FHB_UTSO`, `FHB_AP` (or `FHB_Accounts_Payable`),

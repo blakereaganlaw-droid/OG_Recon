@@ -391,12 +391,20 @@ ROUTER_TABLE = [
     RouterRule("EDISON_INV", ["edison_invoices"], [], [], "first", False),
     RouterRule("MID_MASTER", ["mid_master"], [], [], "all", False),
     RouterRule("ENRICHED", [], [], ["enriched", "crossref"], "first", False),
+    # Sponsored-projects / receivables reference reports (owner, 2026-07-20):
+    # the SPN <-> Award <-> Sponsor <-> Invoice <-> unapplied-receipt bridge.
+    # Each ADVISORY (annotation only, never a pool source); routed to a
+    # DISTINCT role so the generic "unapplied"/"rpt_gms_0" catch-alls below
+    # never swallow one.  These specific rules must precede those catch-alls.
+    RouterRule("AR_UNAPPLIED_CUST", [], [], ["ar_unapplied_by_customer", "rpt_ar_059"], "first", False),
+    RouterRule("AR_UNAPPLIED_SUMMARY", [], [], ["ar_063", "rpt_ar_063", "unapplied_receipts_summary"], "first", False),
     RouterRule("APPLIED_UNAPPLIED", ["applied", "unapplied"], [], [], "first", False),
     RouterRule("CONTRACTS_INV", ["contracts_to_receivable_invoices"], [], [], "first", False),
     RouterRule("GMS_AGING", [], [], ["gms_001", "sponsored_aging"], "first", False),
+    RouterRule("GMS_AWARD_PROFILE", [], [], ["sponsored_award_profile", "rpt_gms_002"], "first", False),
+    RouterRule("GMS_PROJECT_FUNDING", [], [], ["project_contract_and_funding", "rpt_gms_035"], "first", False),
     RouterRule("AR_INVOICES", ["ar_invoices"], [], [], "first", False),
     RouterRule("AR_MATCHED", [], [], ["ar_matched", "deposit_receipts"], "first", False),
-    RouterRule("AR_UNAPPLIED_SUMMARY", [], [], ["ar_063", "unapplied_receipts_summary"], "first", False),
     RouterRule("GMS_SPONSOR_MAP", ["rpt_gms_0"], [], [], "first", False),
     RouterRule("CFG_MATCHING", ["matching_rules"], [], [], "first", False),
     RouterRule("CFG_PARSE", ["parse_rules"], [], [], "first", False),
@@ -657,9 +665,7 @@ _RECOGNIZED_NOT_LOADED = {
                   "(orphan-doctrine R2): advisory findings + same-transaction-id "
                   "orphan suppression; never a bank-line matching source",
     "CONTRACTS_INV": "contracts-to-invoices reference — not consumed by the forward passes",
-    "GMS_AGING": "sponsored AR aging — not consumed by the forward passes",
     "AR_INVOICES": "AR invoice listing — not consumed by the forward passes",
-    "AR_UNAPPLIED_SUMMARY": "unapplied summary — not consumed by the forward passes",
     "GMS_SPONSOR_MAP": "sponsor map — not consumed by the forward passes",
     "RELATIONSHIP_MAP": "relationship/rosetta doc — reference only",
 }
@@ -1147,6 +1153,80 @@ EDISON_INV_ROLES = {
     "amount": _rs(False, ["Gross Amt", "Gross Amount"], pred_signed_amount),
     "status": _rs(False, ["Approval Status", "Status"], pred_any),
     "voucher": _rs(False, ["Voucher"], pred_reference),
+}
+
+# GMS Sponsored AR Aging (owner, 2026-07-20): one row per OUTSTANDING
+# sponsored-award receivable.  ANNOTATION ONLY — the sponsor/award/aging
+# context for a stranded sponsored-AR bank line (mirrors Edison: never a pool
+# entry, never places anything, so placements stay byte-identical).  The
+# Invoice Number (the 110xxxxxx Oracle AR invoice, shared with the
+# "SPN … Inv 110…" receipt references) is the join key.  The report carries a
+# multi-row parameter preamble; the content-first header locator finds the
+# real header row.
+GMS_AGING_ROLES = {
+    "invoice": _rs(True, ["Invoice Number"], pred_reference),
+    "invoiced_amount": _rs(False, ["Invoiced Amount"], pred_signed_amount),
+    "outstanding": _rs(False, ["Amount Outstanding"], pred_signed_amount),
+    "sponsor": _rs(False, ["Bill to Customer Name", "Customer Name"], pred_any),
+    "award": _rs(False, ["Award Number"], pred_reference),
+    "award_type": _rs(False, ["Award Type"], pred_any),
+    "pi": _rs(False, ["Award PI"], pred_any),
+    "org": _rs(False, ["Owning Org"], pred_any),
+    "legal_entity": _rs(False, ["Legal Entity"], pred_any),
+    "days": _rs(False, ["Days Outstanding"], pred_number),
+}
+
+# GMS Sponsored Award Profile (RPT_GMS_002): AWARD_NUMBER -> sponsor, the
+# federal grant code (AWARD_NAME, e.g. "DOE DE-FG02-96ER40963"), the SPN
+# (PROJECT_NUMBER), and the ALN.  Advisory bridge for SPN searching.
+GMS_AWARD_PROFILE_ROLES = {
+    "award": _rs(True, ["AWARD_NUMBER"], pred_reference),
+    "award_name": _rs(False, ["AWARD_NAME"], pred_any),
+    "sponsor": _rs(False, ["SPONSOR_NAME"], pred_any),
+    "sponsor_number": _rs(False, ["SPONSOR_NUMBER"], pred_reference),
+    "spn": _rs(False, ["PROJECT_NUMBER"], pred_reference),
+    "aln": _rs(False, ["ALN"], pred_reference),
+    "pi": _rs(False, ["AWARD_PI"], pred_any),
+    "award_type": _rs(False, ["AWARD_TYPE"], pred_any),
+    "org": _rs(False, ["AWARD_ORG"], pred_any),
+}
+
+# GMS Project Contract & Funding Source (RPT_GMS_035): the clean SPN bridge —
+# Project Number (SPN) -> Award Number -> Funding Source (sponsor).
+GMS_PROJECT_FUNDING_ROLES = {
+    "spn": _rs(True, ["Project Number"], pred_reference),
+    "project_name": _rs(False, ["Project Name"], pred_any),
+    "award": _rs(False, ["Award Number"], pred_reference),
+    "award_name": _rs(False, ["Award Name"], pred_any),
+    "funding_source_number": _rs(False, ["Funding Source Number"], pred_reference),
+    "funding_source": _rs(False, ["Funding Source Name"], pred_any),
+}
+
+# AR Unapplied by Customer (RPT_AR_059): individual unapplied receipts whose
+# Number embeds an SPN, with the customer and still-unapplied amount.
+AR_UNAPPLIED_CUST_ROLES = {
+    "number": _rs(True, ["Number"], pred_reference),
+    "customer": _rs(False, ["Customer Name"], pred_any),
+    "unapplied": _rs(False, ["Amount Unapplied"], pred_signed_amount),
+    "amount": _rs(False, ["Amount"], pred_signed_amount),
+    "status": _rs(False, ["Status"], pred_any),
+    "rtype": _rs(False, ["Type"], pred_any),
+}
+
+# AR Unapplied Receipts Summary (RPT_AR_063): customer-level unapplied
+# rollup (no SPN/receipt number) — sponsor unapplied balance context.
+AR_UNAPPLIED_SUMMARY_ROLES = {
+    "account_name": _rs(True, ["Account Name"], pred_any),
+    "receipt_amount": _rs(False, ["Receipt Amount"], pred_signed_amount),
+    "unapplied": _rs(False, ["Unapplied Amount"], pred_signed_amount),
+    "customer_class": _rs(False, ["Customer Class"], pred_any),
+}
+
+# RPT_ reports whose data header sits below the default 12-row header scan
+# (a multi-row Oracle parameter preamble precedes it).
+_WIDE_HEADER_SCAN_ROLES = {
+    "GMS_AGING", "GMS_AWARD_PROFILE", "GMS_PROJECT_FUNDING",
+    "AR_UNAPPLIED_CUST", "AR_UNAPPLIED_SUMMARY",
 }
 
 
@@ -3440,6 +3520,8 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
     # P10 reuses the run-level by_amount bucket (same construction: full
     # pool, pool order) for _p10_review_cause and the recommended-GL fallback.
     edison_idx, edison_inv = _edison_index(loaded)
+    spx = _sponsored_index(loaded)
+    gms_notes = 0
     for bsl in unplaced():
         exact_entries = by_amount.get(bsl.amount_cents, [])
         codes, expl = _p10_review_cause(bsl, pool, feed_errors, deposit_index,
@@ -3452,7 +3534,17 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
         if gl:
             expl += f" Recommended GL: {gl}."
         expl += _edison_note(bsl, edison_idx, edison_inv)
+        snote = _sponsored_note(bsl, spx)
+        if snote:
+            gms_notes += 1
+        expl += snote
         place(bsl, REVIEW, CONF_LOW, [], codes, expl, "P10_review")
+    if spx is not None:
+        runlog["sponsored_projects"] = {
+            "invoices": len(spx["invoice"]), "spns": len(spx["spn"]),
+            "awards": len(spx["award"]), "grant_codes": len(spx["grant"]),
+            "unapplied_amounts": len(spx["unapplied_amt"]),
+            "review_lines_annotated": gms_notes}
 
     # ---- Reverse misdirected search (owner, 2026-07-19) -------------
     # The mirror of PM: a THIS-account open ST/receipt whose bank line
@@ -3920,6 +4012,251 @@ def _edison_note(bsl, edison_idx, inv_info):
     if dt:
         note += f" paid {dt}"
     return note + f" matches this line exactly{qual}."
+
+
+_SPONSORED_ROLES = ("GMS_AGING", "GMS_AWARD_PROFILE", "GMS_PROJECT_FUNDING",
+                    "AR_UNAPPLIED_CUST", "AR_UNAPPLIED_SUMMARY")
+
+
+def _grant_tokens(name):
+    """Federal grant-code tokens inside an AWARD_NAME (e.g.
+    'DOE DE-FG02-96ER40963 Papenbrock' -> 'DEFG0296ER40963'): whitespace
+    tokens that carry >=1 digit and znorm to length >= 8."""
+    out = []
+    for tok in N(name).split():
+        z = znorm(tok)
+        if len(z) >= 8 and any(c.isdigit() for c in z):
+            out.append(z)
+    return out
+
+
+def _sponsored_index(loaded):
+    """Cross-linked Sponsored Projects / SPN reference bridge (owner,
+    2026-07-20) built from whichever of the GMS/AR reports are staged.  ALL
+    are ADVISORY — annotation only, never pool entries — so placements are
+    byte-identical with or without them (mirrors Edison).  Returns a spx dict,
+    or None when none of the reports is present.
+
+    Sub-indexes:
+      invoice       : znorm(110xxxxxx invoice) -> aging info      (GMS_001)
+      amount        : signed cents -> [aging info]                (GMS_001)
+      spn           : znorm(SPN) -> {award, sponsor, grant, project}
+                                                             (GMS_035 + GMS_002)
+      award         : award# -> {sponsor, grant, aln, pi, award_type, org}
+                                                             (GMS_002 + GMS_035)
+      grant         : znorm(grant-code) -> (award, sponsor)  (GMS_002/GMS_035)
+      unapplied_amt : signed cents -> [unapplied receipt info] (AR_059 + AR_063)
+    """
+    if not any(loaded.get(r) for r in _SPONSORED_ROLES):
+        return None
+    spx = {"invoice": {}, "amount": {}, "spn": {}, "award": {},
+           "grant": {}, "unapplied_amt": {}}
+
+    def _iter(role):
+        g = loaded.get(role)
+        if not g:
+            return
+        m = g["map"]
+        for r in g["rows"][g["header_index"] + 1:]:
+            yield r, m
+
+    # GMS_002 Award Profile: award -> profile; SPN -> profile; grant codes.
+    for r, m in _iter("GMS_AWARD_PROFILE"):
+        award = N(_cell(r, m.get("award")))
+        if not award:
+            continue
+        sponsor = N(_cell(r, m.get("sponsor")))
+        aname = N(_cell(r, m.get("award_name")))
+        spx["award"].setdefault(award, {
+            "sponsor": sponsor, "grant": aname,
+            "aln": N(_cell(r, m.get("aln"))), "pi": N(_cell(r, m.get("pi"))),
+            "award_type": N(_cell(r, m.get("award_type"))),
+            "org": N(_cell(r, m.get("org")))})
+        spn = znorm(N(_cell(r, m.get("spn"))))
+        if spn:
+            spx["spn"].setdefault(spn, {"award": award, "sponsor": sponsor,
+                                        "grant": aname, "project": ""})
+        for gz in _grant_tokens(aname):
+            spx["grant"].setdefault(gz, (award, sponsor))
+
+    # GMS_035 Project/Funding: the authoritative SPN -> award/sponsor map.
+    for r, m in _iter("GMS_PROJECT_FUNDING"):
+        spn = znorm(N(_cell(r, m.get("spn"))))
+        if not spn:
+            continue
+        award = N(_cell(r, m.get("award")))
+        sponsor = N(_cell(r, m.get("funding_source")))
+        aname = N(_cell(r, m.get("award_name")))
+        spx["spn"].setdefault(spn, {"award": award, "sponsor": sponsor,
+                                    "grant": aname,
+                                    "project": N(_cell(r, m.get("project_name")))})
+        if award:
+            spx["award"].setdefault(award, {
+                "sponsor": sponsor, "grant": aname, "aln": "", "pi": "",
+                "award_type": "", "org": ""})
+        for gz in _grant_tokens(aname):
+            spx["grant"].setdefault(gz, (award, sponsor))
+
+    # GMS_001 Aging: invoice -> aging; amount fallback.
+    for r, m in _iter("GMS_AGING"):
+        inv = znorm(N(_cell(r, m.get("invoice"))))
+        if not inv:
+            continue
+        info = {
+            "invoice": inv, "sponsor": N(_cell(r, m.get("sponsor"))),
+            "award": N(_cell(r, m.get("award"))),
+            "award_type": N(_cell(r, m.get("award_type"))),
+            "pi": N(_cell(r, m.get("pi"))), "org": N(_cell(r, m.get("org"))),
+            "days": N(_cell(r, m.get("days"))),
+            "invoiced": cents(_cell(r, m.get("invoiced_amount"))),
+            "outstanding": cents(_cell(r, m.get("outstanding"))),
+        }
+        spx["invoice"].setdefault(inv, info)
+        for amt in {a for a in (info["invoiced"], info["outstanding"])
+                    if a is not None}:
+            spx["amount"].setdefault(amt, []).append(info)
+
+    # AR_059 unapplied-by-customer (SPN-bearing) + AR_063 summary rollup.
+    for r, m in _iter("AR_UNAPPLIED_CUST"):
+        num = N(_cell(r, m.get("number")))
+        if not num:
+            continue
+        info = {"number": num, "customer": N(_cell(r, m.get("customer"))),
+                "unapplied": cents(_cell(r, m.get("unapplied"))),
+                "status": N(_cell(r, m.get("status")))}
+        for a in {x for x in (info["unapplied"], cents(_cell(r, m.get("amount"))))
+                  if x}:
+            spx["unapplied_amt"].setdefault(a, []).append(info)
+    for r, m in _iter("AR_UNAPPLIED_SUMMARY"):
+        acct = N(_cell(r, m.get("account_name")))
+        if not acct:
+            continue
+        info = {"number": "", "customer": acct, "status": "summary",
+                "unapplied": cents(_cell(r, m.get("unapplied")))}
+        for a in {x for x in (info["unapplied"], cents(_cell(r, m.get("receipt_amount"))))
+                  if x}:
+            spx["unapplied_amt"].setdefault(a, []).append(info)
+    return spx
+
+
+def _fmt_sponsored_award(spx, award, invoice="", sponsor="", grant="",
+                         outstanding=None, days="", pi="", project="",
+                         award_type="", qual=""):
+    """Compose the GMS annotation, enriching the award with its cross-linked
+    profile (sponsor / grant code / SPNs) from the bridge."""
+    prof = spx["award"].get(award) if award else None
+    if prof:
+        sponsor = sponsor or prof.get("sponsor", "")
+        grant = grant or prof.get("grant", "")
+        pi = pi or prof.get("pi", "")
+        award_type = award_type or prof.get("award_type", "")
+    spns = sorted({s for s, p in spx["spn"].items()
+                   if award and p.get("award") == award})
+    head = f"sponsored invoice {invoice}" if invoice else "sponsored award"
+    bits = [head]
+    ctx = []
+    if award:
+        aw = f"award {award}"
+        if award_type:
+            aw += f" {award_type}"
+        ctx.append(aw)
+    if sponsor:
+        ctx.append(sponsor)
+    if grant and znorm(grant) != znorm(sponsor):
+        ctx.append(f"grant {grant}")
+    if spns:
+        ctx.append("SPN " + "/".join(spns[:3]) + ("…" if len(spns) > 3 else ""))
+    elif project:
+        ctx.append(project)
+    if pi:
+        ctx.append(f"PI {pi}")
+    if ctx:
+        bits.append("(" + "; ".join(ctx) + ")")
+    tail = ""
+    if outstanding is not None:
+        tail = f" — ${_usd(outstanding)} outstanding"
+        if days:
+            tail += f", {days}d"
+    return f" GMS: {' '.join(bits)}{qual}{tail}."
+
+
+def _sponsored_note(bsl, spx):
+    """Name the sponsored-projects context a stranded line corresponds to —
+    ANNOTATION ONLY (byte-identical placements; the reports never place).
+    Priority (most specific first): invoice number; SPN in the addenda; award
+    number; federal grant code; exact amount + sponsor name; unapplied
+    receipt.  Ambiguous amount-only sets are never guessed."""
+    if not spx:
+        return ""
+    line_digits = {d for d in
+                   (bsl.ref_digits | digit_runs(bsl.additional_info)
+                    | digit_runs(bsl.account_servicer_reference)
+                    | digit_runs(bsl.recon_reference))
+                   if len(d) >= 6}
+    line_z = znorm(bsl.additional_info)
+
+    # (1) invoice-number tie (GMS_001) — strongest.
+    inv_hits = sorted((inv for inv in spx["invoice"]
+                       if any(inv in d or d in inv for d in line_digits)),
+                      key=lambda z: (-len(z), z))
+    if inv_hits:
+        i = spx["invoice"][inv_hits[0]]
+        return _fmt_sponsored_award(
+            spx, i["award"], invoice=i["invoice"], sponsor=i["sponsor"],
+            outstanding=i["outstanding"], days=i["days"], pi=i["pi"],
+            award_type=i["award_type"])
+
+    # (2) SPN tie — an SPN token in the addenda that the bridge knows.
+    bsl_spn = znorm(spn_of(bsl.additional_info) or spn_of(bsl.recon_reference))
+    if bsl_spn and bsl_spn in spx["spn"]:
+        p = spx["spn"][bsl_spn]
+        return _fmt_sponsored_award(spx, p["award"], sponsor=p["sponsor"],
+                                    grant=p["grant"], project=p["project"])
+
+    # (3) award-number tie (a >=6-digit award# in the line digits).
+    aw_hits = sorted((aw for aw in spx["award"]
+                      if len(znorm(aw)) >= 6 and znorm(aw) in line_digits),
+                     key=lambda a: (-len(a), a))
+    if aw_hits:
+        return _fmt_sponsored_award(spx, aw_hits[0])
+
+    # (4) federal grant-code tie (an AWARD_NAME grant token in the addenda).
+    grant_hits = sorted((g for g in spx["grant"] if g in line_z),
+                        key=lambda g: (-len(g), g))
+    if grant_hits:
+        award, _sp = spx["grant"][grant_hits[0]]
+        return _fmt_sponsored_award(spx, award)
+
+    # (5) exact amount + sponsor-name tie (GMS_001).
+    cands = spx["amount"].get(bsl.amount_cents, [])
+    named = [i for i in cands if payer_tokens(i["sponsor"]) & bsl.payer_tokens]
+    if len(named) == 1:
+        i = named[0]
+        return _fmt_sponsored_award(
+            spx, i["award"], invoice=i["invoice"], sponsor=i["sponsor"],
+            outstanding=i["outstanding"], days=i["days"], pi=i["pi"],
+            award_type=i["award_type"])
+    if not named and len(cands) == 1:
+        i = cands[0]
+        return _fmt_sponsored_award(
+            spx, i["award"], invoice=i["invoice"], sponsor=i["sponsor"],
+            outstanding=i["outstanding"], days=i["days"], pi=i["pi"],
+            award_type=i["award_type"], qual=" (amount-only; uncorroborated)")
+
+    # (6) unapplied-receipt tie (AR_059/AR_063): amount + customer name.
+    un = spx["unapplied_amt"].get(bsl.amount_cents, [])
+    un_named = [u for u in un if u["customer"]
+                and (payer_tokens(u["customer"]) & bsl.payer_tokens)]
+    if len(un_named) == 1:
+        u = un_named[0]
+        s = " GMS: unapplied receipt"
+        if u["number"]:
+            s += f" {u['number']}"
+        s += f" for {u['customer']}"
+        if u["unapplied"] is not None:
+            s += f", ${_usd(u['unapplied'])} unapplied"
+        return s + "."
+    return ""
 
 
 def _coa_tag(e, coa):
@@ -5020,6 +5357,11 @@ def load_and_bind(by_role, runlog):
         "DEPT_INFO": DEPT_INFO_ROLES,
         "EDISON_PAY": EDISON_PAY_ROLES,
         "EDISON_INV": EDISON_INV_ROLES,
+        "GMS_AGING": GMS_AGING_ROLES,
+        "GMS_AWARD_PROFILE": GMS_AWARD_PROFILE_ROLES,
+        "GMS_PROJECT_FUNDING": GMS_PROJECT_FUNDING_ROLES,
+        "AR_UNAPPLIED_CUST": AR_UNAPPLIED_CUST_ROLES,
+        "AR_UNAPPLIED_SUMMARY": AR_UNAPPLIED_SUMMARY_ROLES,
         "APPLIED_UNAPPLIED": APPLIED_UNAPPLIED_ROLES,
         "AR_MATCHED": AR_MATCHED_ROLES,
         "ENRICHED": ENRICHED_ROLES,
@@ -5101,7 +5443,18 @@ def load_and_bind(by_role, runlog):
             rows, _title = read_rows(rf)
         except InvalidSourceData:
             raise
-        mapping, hi = bind_columns(rows, specs, filename=rf.filename)
+        if role in _WIDE_HEADER_SCAN_ROLES:
+            # These Oracle "RPT_" reports carry a multi-row parameter preamble
+            # (filter labels, some colliding with real column names) ABOVE the
+            # data header (rows ~10-13) — beyond the default 12-row header
+            # scan, which would otherwise lock onto a preamble label and read
+            # the preamble as data.  Widen the scan; the max-alias-hits scorer
+            # then correctly prefers the real header (many column matches vs a
+            # preamble row's few).
+            mapping, hi = bind_columns(rows, specs, filename=rf.filename,
+                                       header_scan=30)
+        else:
+            mapping, hi = bind_columns(rows, specs, filename=rf.filename)
         loaded[role] = {"rows": rows, "map": mapping, "header_index": hi, "file": rf.filename}
         bound_report[role] = {"file": rf.filename, "columns": mapping, "header_index": hi}
     runlog["roles_bound"] = bound_report
