@@ -736,16 +736,24 @@ def route_folder(input_dir, skipped=None) -> dict:
                 "token if it is a raw bank transmission"))
             continue
         role = classify_file(name)
-        # Content-sniff a raw BAI2 whose FILENAME carries no BAI token BEFORE
-        # the unrecognized-name skip (real bank export
-        # "BAIEXP_07202026_071541.txt"): a BAI2 transmission is self-identifying
-        # by its 01/02/16 record structure, so it is never silently dropped
-        # over a filename.
+        # Content-sniff a BAI2 whose FILENAME carries no BAI token BEFORE the
+        # unrecognized-name skip, so a real bank export is never dropped over a
+        # name: a .txt by its 01/02/16 record structure
+        # ("BAIEXP_07202026_071541.txt"), a spreadsheet by its distinctive BAI2
+        # columns ("20260720_FHB_Master.xlsx" — a 'BAI Code' + date/bank-ref
+        # header).  The sheet sniff only fires for an otherwise-unrecognized
+        # spreadsheet (role is None), so recognized files are never re-read.
         if role != "BAI2" and low.endswith(".txt") and _looks_like_bai2(path):
             role = "BAI2"
             print(f"NOTE (file content): {name} routed as BAI2 by its "
                   "01/02/16 record structure (the filename carries no BAI "
                   "token).", file=sys.stderr)
+        elif role is None and low.endswith((".xlsx", ".xlsm", ".xlsb", ".csv")) \
+                and _looks_like_bai2_sheet(path):
+            role = "BAI2"
+            print(f"NOTE (file content): {name} routed as BAI2 by its "
+                  "'BAI Code' + date/bank-reference columns (the filename "
+                  "carries no BAI token).", file=sys.stderr)
         if role is None:
             skipped.append(_skip_notice(
                 name, "no router rule matches this name",
@@ -1407,6 +1415,27 @@ def _looks_like_bai2(path):
     except OSError:
         return False
     return all(seen.values())
+
+
+def _looks_like_bai2_sheet(path, sheet_hint="first"):
+    """A SPREADSHEET (csv/xlsx) is a BAI2 bank export when its header row
+    carries the distinctive BAI2 vocabulary — a 'BAI Code' column plus a
+    date or bank-reference column (owner, 2026-07-20: "20260720_FHB_Master.xlsx"
+    with sheet 'CSVEXP_...').  No other export names a 'BAI Code' column, so
+    the sniff is specific; a date/bank-ref co-requirement guards a coincidence."""
+    try:
+        rows, _ = read_rows(RoutedFile("BAI2", path, os.path.basename(path),
+                                       sheet_hint))
+    except (InvalidSourceData, OSError, ValueError):
+        return False
+    for r in rows[:15]:
+        cells = {_norm_header(c) for c in r if c is not None and N(c)}
+        has_bai = any("BAICODE" in c or "BAITYPECODE" in c for c in cells)
+        has_ctx = any(("POSTDATE" in c or "TRANSACTIONDATE" in c
+                       or "BANKREFERENCE" in c) for c in cells)
+        if has_bai and has_ctx:
+            return True
+    return False
 
 
 def _read_bai2_txt(path):

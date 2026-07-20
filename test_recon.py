@@ -2502,6 +2502,41 @@ class TestCMConfig(unittest.TestCase):
                             for f in by_role["BAI2"]))
         self.assertTrue(any(s["file"] == "notes.txt" for s in skipped))
 
+    def test_bai2_sheet_content_sniff_routes_unnamed_xlsx(self):
+        # A BAI2 SPREADSHEET whose filename carries no BAI token
+        # ("20260720_FHB_Master.xlsx", sheet 'CSVEXP_...') is recognized by its
+        # 'BAI Code' + date columns and routed as BAI2.
+        _write_xlsx(os.path.join(self.d, "20260720_FHB_Master.xlsx"),
+                    [("CSVEXP_07202026", [
+                        ("Post Date", "Bank ID", "Account Number", "Account Name",
+                         "Transaction Description", "Amount", "Bank Reference",
+                         "Customer Reference", "BAI Code", "Currency",
+                         "Debit/Credit", "DETAIL1"),
+                        ("2026-07-20", "084000026", "15", "UT General Acct",
+                         "ACH CREDIT", "500000", "ACH260720", "50571", "142",
+                         "USD", "Credit", "ASAP GRANT")])])
+        self.assertIsNone(E.classify_file("20260720_FHB_Master.xlsx"))
+        self.assertTrue(E._looks_like_bai2_sheet(
+            os.path.join(self.d, "20260720_FHB_Master.xlsx")))
+        # a non-BAI2 spreadsheet must NOT sniff
+        _write_xlsx(os.path.join(self.d, "random_export.xlsx"),
+                    [("s", [("Foo", "Bar"), ("1", "2")])])
+        self.assertFalse(E._looks_like_bai2_sheet(
+            os.path.join(self.d, "random_export.xlsx")))
+        _write_xlsx(os.path.join(self.d, "20260720_Oracle_CM_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [
+                        ("Date", "Amount (USD)", "Reference", "Additional Information",
+                         "Account Servicer Reference", "Transaction Type",
+                         "Statement", "Transaction Code"),
+                        ("2026-07-20", "1.00", "NA", "X", "NA", "Miscellaneous",
+                         "Line 1 , 2026-07-20", "174")])])
+        skipped = []
+        by_role = E.route_folder(self.d, skipped)
+        self.assertIn("BAI2", by_role)
+        self.assertTrue(any(f.filename == "20260720_FHB_Master.xlsx"
+                            for f in by_role["BAI2"]))
+        self.assertTrue(any(s["file"] == "random_export.xlsx" for s in skipped))
+
     def test_cfg_tcr_orphan_rows_load(self):
         # The real export carries rules with a BLANK bank-account cell
         # (detached rules, 3 still enabled) — they must load, not be
