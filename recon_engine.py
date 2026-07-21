@@ -2979,29 +2979,56 @@ def _type_incongruent_uncorroborated(bsl, e):
             and not _has_any_tie(bsl, e))
 
 
+def _bsl_type_gate(bsl):
+    """(is_convera, card_fee_mids, tt_norm) for the type gate — computed ONCE
+    per BSL and cached (pure function of immutable fields; owner perf,
+    2026-07-21).  `card_fee_mids` is empty unless the line is a card-fee debit
+    carrying MIDs, so a truthy value alone means "apply the MID gate"."""
+    g = getattr(bsl, "_type_gate_cache", None)
+    if g is None:
+        card = _bsl_card_mids(bsl) if _is_card_fee_debit(bsl) else frozenset()
+        g = (_is_convera(bsl), card, _norm_header(bsl.transaction_type))
+        bsl._type_gate_cache = g
+    return g
+
+
+def _entry_type_gate(e):
+    """(tt_norm, mid_tokens) for the type gate — computed ONCE per pool entry
+    and cached (entry identifier fields are immutable during forward_reconcile)."""
+    g = getattr(e, "_type_gate_cache", None)
+    if g is None:
+        g = (_norm_header(e.transaction_type),
+             _mid_tokens(e.reference) | _mid_tokens(e.id)
+             | _mid_tokens(e.spr) | _mid_tokens(e.counterparty))
+        e._type_gate_cache = g
+    return g
+
+
+def _gate_trivial(bsl):
+    """True when the type gate can NEVER reject any entry for this BSL — it is
+    not Convera, not a card-fee debit carrying MIDs, and not a Check/Misc line
+    (the only three ways the gate rejects).  Then `gated == members` and the
+    per-member gate can be skipped wholesale (owner perf, 2026-07-21)."""
+    convera, card_mids, bt = _bsl_type_gate(bsl)
+    return not convera and not card_mids and "CHECK" not in bt and "MISC" not in bt
+
+
 def _type_gate_ok(bsl, e):
     """Deterministic type gate (ORT doc section 5.2): a Credit Card ST never
     pairs with a Check or Miscellaneous bank line.  EFT is never rejected on
     the label alone.  Convera lines (owner, 2026-07-11) are international
-    wires and ALWAYS Payables — they never pair with a non-Payables ST."""
-    if _is_convera(bsl) and e.source != "AP":
+    wires and ALWAYS Payables — they never pair with a non-Payables ST.
+    Chargeback / merchant-fee debits (owner, 2026-07-12): when the bank line
+    carries a MID, ONLY an ST carrying the SAME MID may pair with it.  Inputs
+    are cached per object (byte-identical to the direct computation)."""
+    convera, card_mids, bt = _bsl_type_gate(bsl)
+    if convera and e.source != "AP":
         return False
-    # Chargeback / merchant-fee debits (owner, 2026-07-12): when the bank
-    # line carries a MID, ONLY an ST carrying the SAME MID may pair with it —
-    # even as a Candidate.  A chargeback against MID 8028920588 has nothing
-    # to do with an ST for MID 8035758468.
-    if _is_card_fee_debit(bsl):
-        bmids = _bsl_card_mids(bsl)
-        if bmids:
-            emids = (_mid_tokens(e.reference) | _mid_tokens(e.id)
-                     | _mid_tokens(e.spr) | _mid_tokens(e.counterparty))
-            if not (bmids & emids):
-                return False
-    et = _norm_header(e.transaction_type)
-    if "CREDITCARD" in et:
-        bt = _norm_header(bsl.transaction_type)
-        if "CHECK" in bt or "MISC" in bt:
-            return False
+    et, emids = _entry_type_gate(e)
+    if card_mids and not (card_mids & emids):
+        return False
+    if "CREDITCARD" in et and ("CHECK" in bt or "MISC" in bt):
+        return False
     return True
 
 
@@ -3291,8 +3318,11 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
 
     for bsl in unplaced():
         exact_open, split_groups = [], []
+        # Gate-trivial BSLs (the common case) pass every member, so skip the
+        # per-member type gate over the whole deposit universe (owner perf).
+        trivial = _gate_trivial(bsl)
         for dep, members in deposit_index.items():
-            gated = [e for e in members if _type_gate_ok(bsl, e)]
+            gated = members if trivial else [e for e in members if _type_gate_ok(bsl, e)]
             if not gated:
                 continue
             open_m = [e for e in gated if ledger.is_available(e)]
