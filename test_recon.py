@@ -575,6 +575,31 @@ class TestColumnRobustness(unittest.TestCase):
         m, _hi = E.bind_columns(rows, specs)
         self.assertNotIn("reference", m)
 
+    def test_required_role_alias_priority_tiebreak(self):
+        # Owner, 2026-07-21: the real AP Payments export carries BOTH a "Payee"
+        # and a "Supplier or Party" column that hold the same name but differ on
+        # a few rows.  Both exact-match the payee alias list and tie on content,
+        # so the binder used to fail loud (AmbiguousColumn).  The alias list is
+        # ordered by preference, so the earlier alias ("Payee") wins.
+        rows = [("Payment Number", "Payee", "Supplier or Party", "Amount"),
+                ("1001", "Acme Inc", "Acme Inc", "10.00"),
+                ("1002", "Beta LLC", "Beta Corp", "20.00"),   # columns differ here
+                ("1003", "Gamma Co", "Gamma Co", "30.00")]
+        specs = {
+            "payment_number": E._rs(True, ["Payment Number"], E.pred_number),
+            "payee": E._rs(True, ["Payee", "Supplier or Party", "Supplier"],
+                           E.pred_customer),
+            "amount": E._rs(True, ["Amount"], E.pred_signed_amount),
+        }
+        m, _hi = E.bind_columns(rows, specs)
+        self.assertEqual(m["payee"], 1)   # the "Payee" column, not col 2
+        # Helper: exact-alias order beats substring; genuine dup header -> None.
+        an = [E._norm_header(a) for a in ["Payee", "Supplier or Party"]]
+        self.assertEqual(E._alias_priority_winner(
+            ("Payee", "Supplier or Party"), [0, 1], an), 0)
+        self.assertIsNone(E._alias_priority_winner(
+            ("Payee", "Payee"), [0, 1], an))   # identical header -> still ambiguous
+
     def test_pred_met_description(self):
         self.assertTrue(E.pred_met_description("d:8812345 | r:991 | UT FOUNDATION"))
         self.assertFalse(E.pred_met_description("d:63363 | r:197960"))  # ID-column stub
@@ -1538,8 +1563,17 @@ class TestChartOfAccounts(unittest.TestCase):
                      "COA_Combination_Sets_UTHSC.xlsx",
                      "COA_Combos_Technical_UT_System.xlsx",
                      "COA_Segments_COA_Segments.csv",
-                     "COA_Related_Value_Sets_COA_Related_Value_Sets.csv"):
+                     "COA_Related_Value_Sets_COA_Related_Value_Sets.csv",
+                     # a CoA campus name embedding a stray "met" segment must
+                     # NOT bind MET (owner, 2026-07-21 — "Vet_Med" mis-typed
+                     # "Vet_Met" leaked the UTIA shard into the MET pool and off
+                     # the CoA decode).
+                     "COA_Combos_Technical_UTIA_Vet_Met_Ag_Research_UT_Extension.xlsx",
+                     "COA_Combination_Sets_UTIA_Vet_Med_Ag_Research_UT_Extension.xlsx"):
             self.assertEqual(E.classify_file(name), "CHART_OF_ACCOUNTS", msg=name)
+        # A genuine MET export still routes to MET.
+        self.assertEqual(E.classify_file("20260720_Oracle_OTBI_MET_FHB_Master.xlsx"), "MET")
+        self.assertEqual(E.classify_file("MET_FHB_UTIA_2.csv"), "MET")
         # ORT_Department_* stays DEPT_INFO (bound before CHART_OF_ACCOUNTS).
         self.assertEqual(E.classify_file("ORT_Department_Info.xlsx"), "DEPT_INFO")
 
