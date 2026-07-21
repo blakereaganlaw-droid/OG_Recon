@@ -435,6 +435,11 @@ ROUTER_TABLE = [
     RouterRule("GMS_AGING", [], [], ["gms_001", "sponsored_aging"], "first", False),
     RouterRule("GMS_AWARD_PROFILE", [], [], ["sponsored_award_profile", "rpt_gms_002"], "first", False),
     RouterRule("GMS_PROJECT_FUNDING", [], [], ["project_contract_and_funding", "rpt_gms_035"], "first", False),
+    # Active Oracle Award Conversion Report (owner, 2026-07-21): the active-award
+    # master that carries the SPONSOR's OWN contract/grant numbers — the
+    # reference federal/sponsored deposits actually cite (our internal SPN is
+    # almost never on a bank line).  Pipe-delimited .txt; ADVISORY annotation.
+    RouterRule("GMS_AWARD_CONVERSION", [], [], ["award_conversion", "oracle_award_conversion"], "first", False),
     RouterRule("AR_INVOICES", ["ar_invoices"], [], [], "first", False),
     RouterRule("AR_MATCHED", [], [], ["ar_matched", "deposit_receipts"], "first", False),
     RouterRule("GMS_SPONSOR_MAP", ["rpt_gms_0"], [], [], "first", False),
@@ -774,7 +779,7 @@ def route_folder(input_dir, skipped=None) -> dict:
         # with the FULL untruncated addenda the Oracle BSL feed cuts off.
         # A .txt that NAME-routes to a non-BAI2 role (and did not content-sniff
         # as BAI2 above) stays unrouted.
-        if low.endswith(".txt") and role != "BAI2":
+        if low.endswith(".txt") and role not in ("BAI2", "GMS_AWARD_CONVERSION"):
             skipped.append(_skip_notice(
                 name, f".txt is accepted only for raw BAI2 transmissions "
                       f"(this name routes as {role})",
@@ -1308,6 +1313,21 @@ AR_UNAPPLIED_SUMMARY_ROLES = {
     "customer_class": _rs(False, ["Customer Class"], pred_any),
 }
 
+# Active Oracle Award Conversion Report (owner, 2026-07-21): the active-award
+# master.  Its value for SPN searching is the SPONSOR's OWN contract/grant
+# reference (`Sponsor Number`, `ERA Award Number`) — the identifier federal
+# deposits actually cite — which the other GMS reports carry only embedded in
+# free-text award names.  Pipe-delimited, single clean header row (no preamble).
+GMS_AWARD_CONVERSION_ROLES = {
+    "spn": _rs(True, ["Project Number"], pred_reference),
+    "award": _rs(False, ["Award Number"], pred_reference),
+    "award_name": _rs(False, ["Award Name"], pred_any),
+    "sponsor_number": _rs(False, ["Sponsor Number"], pred_any),
+    "era_award": _rs(False, ["ERA Award Number"], pred_any),
+    "flow_through": _rs(False, ["FlowThroughPrimarySponsorNumber"], pred_any),
+    "pi": _rs(False, ["Award PI"], pred_any),
+}
+
 # RPT_ reports whose data header sits below the default 12-row header scan
 # (a multi-row Oracle parameter preamble precedes it).
 _WIDE_HEADER_SCAN_ROLES = {
@@ -1418,6 +1438,22 @@ def _read_csv_rows(path):
         first = rows[0]
         if first and first[0].startswith("﻿"):
             first[0] = first[0].lstrip("﻿")
+    return [tuple(r) for r in rows]
+
+
+def _read_delimited_rows(path):
+    """Read a delimited text table, sniffing the separator from the header line
+    (pipe / tab / comma).  The Award Conversion Report is pipe-delimited; other
+    exports arrive comma-delimited.  Mirrors _read_csv_rows' BOM handling."""
+    import csv
+    with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+        first = fh.readline()
+        fh.seek(0)
+        counts = {"|": first.count("|"), "\t": first.count("\t"), ",": first.count(",")}
+        delim = max(counts, key=counts.get) if max(counts.values()) else ","
+        rows = list(csv.reader(fh, delimiter=delim))
+    if rows and rows[0] and rows[0][0].startswith("﻿"):
+        rows[0][0] = rows[0][0].lstrip("﻿")
     return [tuple(r) for r in rows]
 
 
@@ -1599,8 +1635,11 @@ def read_rows(routed_file: RoutedFile):
         if ext == ".csv":
             return _read_csv_rows(routed_file.path), "csv"
         if ext == ".txt":
-            # Only BAI2 .txt files are routed (route_folder); parse natively.
-            return _read_bai2_txt(routed_file.path), "bai2-raw"
+            # BAI2 .txt is parsed natively; any other routed .txt (the Award
+            # Conversion Report) is a delimited table — sniff its separator.
+            if routed_file.role == "BAI2":
+                return _read_bai2_txt(routed_file.path), "bai2-raw"
+            return _read_delimited_rows(routed_file.path), "delimited-txt"
         if ext == ".xlsb":
             return _read_xlsb_rows(routed_file.path, routed_file.sheet_hint)
         return _read_sheet_rows(routed_file.path, routed_file.sheet_hint)
@@ -4396,7 +4435,8 @@ def _edison_note(bsl, edison_idx, inv_info):
 
 
 _SPONSORED_ROLES = ("GMS_AGING", "GMS_AWARD_PROFILE", "GMS_PROJECT_FUNDING",
-                    "AR_UNAPPLIED_CUST", "AR_UNAPPLIED_SUMMARY")
+                    "AR_UNAPPLIED_CUST", "AR_UNAPPLIED_SUMMARY",
+                    "GMS_AWARD_CONVERSION")
 
 
 def _grant_tokens(name):
@@ -4431,7 +4471,7 @@ def _sponsored_index(loaded):
     if not any(loaded.get(r) for r in _SPONSORED_ROLES):
         return None
     spx = {"invoice": {}, "amount": {}, "spn": {}, "award": {},
-           "grant": {}, "unapplied_amt": {}}
+           "grant": {}, "unapplied_amt": {}, "sponsor_ref": {}}
 
     def _iter(role):
         g = loaded.get(role)
@@ -4477,6 +4517,32 @@ def _sponsored_index(loaded):
                 "award_type": "", "org": ""})
         for gz in _grant_tokens(aname):
             spx["grant"].setdefault(gz, (award, sponsor))
+
+    # Award Conversion Report: the active-award master.  Adds SPNs the other
+    # reports may lack, and — the reason to ingest it — indexes the SPONSOR's
+    # OWN contract/grant number (`Sponsor Number`) and ERA number so a bank
+    # line citing the sponsor's reference (which is what federal deposits
+    # carry, not our internal SPN) resolves to our SPN/award.
+    for r, m in _iter("GMS_AWARD_CONVERSION"):
+        spn = znorm(N(_cell(r, m.get("spn"))))
+        if not spn:
+            continue
+        award = N(_cell(r, m.get("award")))
+        aname = N(_cell(r, m.get("award_name")))
+        spx["spn"].setdefault(spn, {"award": award, "sponsor": "",
+                                    "grant": aname, "project": ""})
+        if award:
+            spx["award"].setdefault(award, {
+                "sponsor": "", "grant": aname, "aln": "",
+                "pi": N(_cell(r, m.get("pi"))), "award_type": "", "org": ""})
+        for gz in _grant_tokens(aname):
+            spx["grant"].setdefault(gz, (award, ""))
+        info = {"spn": spn, "award": award, "grant": aname}
+        for ref in (N(_cell(r, m.get("sponsor_number"))),
+                    N(_cell(r, m.get("era_award")))):
+            rz = znorm(ref)
+            if len(rz) >= 6:
+                spx["sponsor_ref"].setdefault(rz, info)
 
     # GMS_001 Aging: invoice -> aging; amount fallback.
     for r, m in _iter("GMS_AGING"):
@@ -4593,6 +4659,23 @@ def _sponsored_note(bsl, spx):
         p = spx["spn"][bsl_spn]
         return _fmt_sponsored_award(spx, p["award"], sponsor=p["sponsor"],
                                     grant=p["grant"], project=p["project"])
+
+    # (2b) sponsor contract-number tie (Award Conversion Report): the sponsor's
+    # OWN award/contract number in the addenda resolves to our SPN/award.
+    # Federal/sponsored deposits cite the sponsor's reference, not our SPN, so
+    # this is often the only usable tie.  Numeric refs match a >=6-digit line
+    # run exactly; alphanumeric refs (e.g. "DEFG0296ER40963") must appear as a
+    # >=8-char distinctive substring so a short/common token never false-hits.
+    sref_hits = sorted(
+        (rz for rz in spx["sponsor_ref"]
+         if (rz.isdigit() and any(rz in d or d in rz for d in line_digits))
+         or (not rz.isdigit() and len(rz) >= 8 and rz in line_z)),
+        key=lambda z: (-len(z), z))
+    if sref_hits:
+        info = spx["sponsor_ref"][sref_hits[0]]
+        return _fmt_sponsored_award(spx, info["award"], grant=info["grant"],
+                                    project=info["spn"],
+                                    qual=f" [via sponsor ref {sref_hits[0]}]")
 
     # (3) award-number tie (a >=6-digit award# in the line digits).
     aw_hits = sorted((aw for aw in spx["award"]
@@ -5757,6 +5840,7 @@ def load_and_bind(by_role, runlog):
         "GMS_AGING": GMS_AGING_ROLES,
         "GMS_AWARD_PROFILE": GMS_AWARD_PROFILE_ROLES,
         "GMS_PROJECT_FUNDING": GMS_PROJECT_FUNDING_ROLES,
+        "GMS_AWARD_CONVERSION": GMS_AWARD_CONVERSION_ROLES,
         "AR_UNAPPLIED_CUST": AR_UNAPPLIED_CUST_ROLES,
         "AR_UNAPPLIED_SUMMARY": AR_UNAPPLIED_SUMMARY_ROLES,
         "APPLIED_UNAPPLIED": APPLIED_UNAPPLIED_ROLES,

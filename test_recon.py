@@ -2944,6 +2944,50 @@ class TestCMConfig(unittest.TestCase):
         self.assertEqual(E._sponsored_note(b, None), "")
         self.assertIsNone(E._sponsored_index({}))
 
+    def test_award_conversion_sponsor_ref_annotation(self):
+        # Active Oracle Award Conversion Report (owner, 2026-07-21): a federal
+        # deposit cites the SPONSOR's OWN contract number, not our internal SPN.
+        # The report's `Sponsor Number` column resolves that contract number to
+        # our SPN/award.  Pipe-delimited .txt; advisory annotation only.
+        self.assertEqual(
+            E.classify_file("Active_Oracle_Award_Conversion_Report.txt"),
+            "GMS_AWARD_CONVERSION")
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Account Servicer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            # the addenda carries the sponsor's contract number, NOT an SPN
+            ("2026-07-16", "4500.00", "NA",
+             "USDA FOREST SERVICE PMT AP25PPQFO000C140 DRAWDOWN", "NA",
+             "Automated clearing house", "Line 5 , 2026-07-16", "142"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Counterparty"),
+              ("2026-07-02", "999.00", "OTHER", 601, "External", "V")]
+        _write_xlsx(os.path.join(self.d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        # pipe-delimited report (sniffed by the reader); one active award whose
+        # Sponsor Number is the contract number the bank line cites.
+        conv = [
+            ["Project Number", "Award Number", "Award Name", "Sponsor Number",
+             "ERA Award Number", "Award PI"],
+            ["SPN112933", "2100490", "USDA APHIS TN F25 Field Crop",
+             "AP25PPQFO000C140", "A012345", "Jerome Grant"],
+        ]
+        with open(os.path.join(self.d, "Active_Oracle_Award_Conversion_Report.txt"),
+                  "w", encoding="utf-8") as fh:
+            fh.write("\n".join("|".join(r) for r in conv) + "\n")
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        tabs, _ = A._read_output_tabs(runlog["recon_workbook"])
+        rev = {A._N(r[2]): A._N(r[A.COL_EXPL])
+               for r in tabs["Review Notes"][3:] if any(A._N(c) for c in r)}
+        note = rev.get("4,500.00", "")
+        self.assertIn("SPN SPN112933", note)
+        self.assertIn("award 2100490", note)
+        self.assertIn("sponsor ref AP25PPQFO000C140", note)
+
     def test_run_recon_stages_bai2_txt(self):
         # A native BAI2 .txt must be staged by the per-run wrapper; any other
         # .txt stays ignored (preserves ignored_non_spreadsheets semantics).
