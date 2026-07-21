@@ -45,6 +45,7 @@ YYYYMMDD_<Source>_<Account>_<Role>[_<Status>].<ext>
 | GMS Project Contract & Funding | `Project_Contract_And_Funding` / `RPT_GMS_035` | yes (SPN→award→sponsor bridge) | `RPT_GMS_035__Project_Contract_and_Funding_Source_Report.xlsx` |
 | AR Unapplied by Customer | `AR_Unapplied_By_Customer` / `RPT_AR_059` | yes (unapplied-receipt annotation) | `RPT_AR_059__AR_Unapplied_By_Customer_Report.xlsx` |
 | AR Unapplied Receipts Summary | `AR_063` / `RPT_AR_063` / `Unapplied_Receipts_Summary` | yes (customer unapplied context) | `RPT_AR_063__Unapplied_Receipts_Summary_Report.xlsx` |
+| Active Award Conversion Report | `Award_Conversion` / `Oracle_Award_Conversion` | yes (SPN annotation — resolves the SPONSOR's own contract number to our SPN/award) | `Active_Oracle_Award_Conversion_Report.txt` (pipe-delimited) |
 | MID master | `MID_Master` | yes | `UT_MID_Master_Consolidated.xlsx` |
 | ORT misc / AR | `ORT`+`Misc` / `ORT`+`_AR` | yes (data-feed-error sweep + per-receipt `REFERENCE_TEXT` cross-reference) | `20260719_ORT_Misc_All.xlsx` |
 | ORT departments | `ORT_Department` / `Department_Info` | yes (MID directory) | `ORT_Department_MIDs.xlsx` |
@@ -68,6 +69,9 @@ Account tokens: `FHB_Master`, `FHB_UTC` (also `FHB_UT_Chatt`), `FHB_UTHSC`,
 
 ## Formats
 
+- **`.txt` is accepted for raw BAI2 transmissions and for the Active Award
+  Conversion Report** (pipe-delimited; the reader sniffs the separator). Any
+  other `.txt` is skipped with a rename suggestion.
 - **`.xlsx` preferred for correctness; `.csv` STRONGLY preferred for the
   big exports (speed).** Reading is the single largest cost of a run, and
   it is dominated by openpyxl's XML parsing of large `.xlsx` files. The

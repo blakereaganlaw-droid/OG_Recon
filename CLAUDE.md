@@ -442,6 +442,24 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   ("Invoice Number:") is never mistaken for the header.  AUTO-PLACEMENT from
   the bridge (turning an SPN tie into a Candidate/Match) is a future
   placement-affecting step under owner review, not yet built.
+- **Award Conversion Report — the sponsor's own reference (owner, 2026-07-21).**
+  The active-award master `Active_Oracle_Award_Conversion_Report` (role
+  `GMS_AWARD_CONVERSION`; pipe-delimited `.txt`, read by the separator-sniffing
+  `_read_delimited_rows`; the router + `route_folder` accept this ONE non-BAI2
+  `.txt`) is ingested for SPN searching.  Its value is empirical: real
+  federal/sponsored bank lines almost never carry our internal SPN (1 of 275
+  Master lines contains "SPN"); they carry the SPONSOR's OWN contract/grant
+  number.  `_sponsored_index` folds this report's `Project Number` (SPN),
+  `Award Number`, and `Award Name` into the existing `spn`/`award`/`grant`
+  sub-indexes, and adds a NEW `sponsor_ref` sub-index — `znorm(Sponsor Number)`
+  and `znorm(ERA Award Number)` (≥6 chars) → {spn, award, grant}.
+  `_sponsored_note` gains tier 2b: a distinctive sponsor reference in the
+  addenda (a ≥6-digit numeric run, or a ≥8-char alphanumeric substring so a
+  short/common token never false-hits) resolves the line to our SPN/award,
+  annotated `[via sponsor ref …]`.  ANNOTATION ONLY (mirrors the rest of the
+  bridge) — placements byte-identical with/without it.  Real Master hits:
+  ~6 lines citing sponsor contract numbers (USDA `AP25PPQFO000C140` → SPN112933,
+  UT-Battelle contract numbers → their SPNs) that no other report resolves.
 - **Recon-history advisory audit (owner, 2026-07-19 — orphan-doctrine R2
   activation).** A staged `Reconciled_*` export (the `Exported` sheet,
   17 cols, `Created By` = ESSADMIN AutoReconcile / OIC_SYSTEM_USER TCR /
