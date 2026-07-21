@@ -2631,6 +2631,53 @@ def cross_reference_tie(bsl, e):
     return _cross_reference_tie_z(_bsl_znorms(bsl), _entry_znorms(e))
 
 
+# A misdirected tie carried ONLY by a common institutional name is boilerplate,
+# not a reference — an alpha carrier in more than this many pool entries is
+# rejected (matches DESC_WORD_MAX_FREQ; owner distinctive-word doctrine).
+MISDIRECTED_COMMON_ALPHA_FREQ = 3
+
+
+def _tie_carriers(bsl, e):
+    """The shared znorm strings that fire the bsl<->shadow reference tie — for
+    a containment hit, the SHORTER (matched) token is the carrier."""
+    out = set()
+    for x in _bsl_znorms(bsl):
+        for y in _entry_znorms(e):
+            if _reference_equal_z(x, y):
+                out.add(x if len(x) <= len(y) else y)
+    return out
+
+
+def _misdirected_tie_distinctive(bsl, e, pool):
+    """A misdirected placement reroutes money across bank accounts on a
+    reference tie, so that tie must be DISTINCTIVE (owner HARD GUARDRAIL,
+    2026-07-21).  A shared >=6-digit numeric run is low-collision and always
+    distinctive; an ALPHA carrier counts only if RARE across the pool — a
+    common institutional name ("UNIVERSITYOFTE" appears on 153 real Master pool
+    entries) is boilerplate, so amount + that name is amount-only in disguise
+    (rule 4 / 8g "never amount alone").  Real false case: a $10,000 Bill.com
+    receivable (ref 996YUENTH151R8H) was rerouted to FHB_UTC purely because the
+    shadow's payer "University of Tennessee Research Foundation" contains
+    "University of Te".  The legitimate DAESUNG honorarium (alpha carrier on 1
+    entry) and every numeric-referenced misdirection are preserved."""
+    alpha = []
+    for s in _tie_carriers(bsl, e):
+        if re.search(r"\d{6,}", s):
+            return True                       # numeric reference run
+        alpha.append(s)
+    for s in alpha:
+        freq = 0
+        for pe in pool:
+            znz = _entry_znorms(pe)
+            if any(_reference_equal_z(z, s) for z in znz):
+                freq += 1
+                if freq > MISDIRECTED_COMMON_ALPHA_FREQ:
+                    break
+        if freq <= MISDIRECTED_COMMON_ALPHA_FREQ:
+            return True                       # rare (distinctive) alpha name
+    return False
+
+
 def _grams6(z):
     """All character 6-grams of a znorm string (index keys)."""
     return [z[i:i + 6] for i in range(len(z) - 5)]
@@ -2932,29 +2979,56 @@ def _type_incongruent_uncorroborated(bsl, e):
             and not _has_any_tie(bsl, e))
 
 
+def _bsl_type_gate(bsl):
+    """(is_convera, card_fee_mids, tt_norm) for the type gate — computed ONCE
+    per BSL and cached (pure function of immutable fields; owner perf,
+    2026-07-21).  `card_fee_mids` is empty unless the line is a card-fee debit
+    carrying MIDs, so a truthy value alone means "apply the MID gate"."""
+    g = getattr(bsl, "_type_gate_cache", None)
+    if g is None:
+        card = _bsl_card_mids(bsl) if _is_card_fee_debit(bsl) else frozenset()
+        g = (_is_convera(bsl), card, _norm_header(bsl.transaction_type))
+        bsl._type_gate_cache = g
+    return g
+
+
+def _entry_type_gate(e):
+    """(tt_norm, mid_tokens) for the type gate — computed ONCE per pool entry
+    and cached (entry identifier fields are immutable during forward_reconcile)."""
+    g = getattr(e, "_type_gate_cache", None)
+    if g is None:
+        g = (_norm_header(e.transaction_type),
+             _mid_tokens(e.reference) | _mid_tokens(e.id)
+             | _mid_tokens(e.spr) | _mid_tokens(e.counterparty))
+        e._type_gate_cache = g
+    return g
+
+
+def _gate_trivial(bsl):
+    """True when the type gate can NEVER reject any entry for this BSL — it is
+    not Convera, not a card-fee debit carrying MIDs, and not a Check/Misc line
+    (the only three ways the gate rejects).  Then `gated == members` and the
+    per-member gate can be skipped wholesale (owner perf, 2026-07-21)."""
+    convera, card_mids, bt = _bsl_type_gate(bsl)
+    return not convera and not card_mids and "CHECK" not in bt and "MISC" not in bt
+
+
 def _type_gate_ok(bsl, e):
     """Deterministic type gate (ORT doc section 5.2): a Credit Card ST never
     pairs with a Check or Miscellaneous bank line.  EFT is never rejected on
     the label alone.  Convera lines (owner, 2026-07-11) are international
-    wires and ALWAYS Payables — they never pair with a non-Payables ST."""
-    if _is_convera(bsl) and e.source != "AP":
+    wires and ALWAYS Payables — they never pair with a non-Payables ST.
+    Chargeback / merchant-fee debits (owner, 2026-07-12): when the bank line
+    carries a MID, ONLY an ST carrying the SAME MID may pair with it.  Inputs
+    are cached per object (byte-identical to the direct computation)."""
+    convera, card_mids, bt = _bsl_type_gate(bsl)
+    if convera and e.source != "AP":
         return False
-    # Chargeback / merchant-fee debits (owner, 2026-07-12): when the bank
-    # line carries a MID, ONLY an ST carrying the SAME MID may pair with it —
-    # even as a Candidate.  A chargeback against MID 8028920588 has nothing
-    # to do with an ST for MID 8035758468.
-    if _is_card_fee_debit(bsl):
-        bmids = _bsl_card_mids(bsl)
-        if bmids:
-            emids = (_mid_tokens(e.reference) | _mid_tokens(e.id)
-                     | _mid_tokens(e.spr) | _mid_tokens(e.counterparty))
-            if not (bmids & emids):
-                return False
-    et = _norm_header(e.transaction_type)
-    if "CREDITCARD" in et:
-        bt = _norm_header(bsl.transaction_type)
-        if "CHECK" in bt or "MISC" in bt:
-            return False
+    et, emids = _entry_type_gate(e)
+    if card_mids and not (card_mids & emids):
+        return False
+    if "CREDITCARD" in et and ("CHECK" in bt or "MISC" in bt):
+        return False
     return True
 
 
@@ -3244,8 +3318,11 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
 
     for bsl in unplaced():
         exact_open, split_groups = [], []
+        # Gate-trivial BSLs (the common case) pass every member, so skip the
+        # per-member type gate over the whole deposit universe (owner perf).
+        trivial = _gate_trivial(bsl)
         for dep, members in deposit_index.items():
-            gated = [e for e in members if _type_gate_ok(bsl, e)]
+            gated = members if trivial else [e for e in members if _type_gate_ok(bsl, e)]
             if not gated:
                 continue
             open_m = [e for e in gated if ledger.is_available(e)]
@@ -3651,6 +3728,16 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 # date fragment, or truncated trace in the addenda and is NOT
                 # acceptable evidence for rerouting money across accounts.
                 if not cross_reference_tie(bsl, e):
+                    continue
+                # Distinctive-tie guard (owner HARD GUARDRAIL, 2026-07-21):
+                # cross_reference_tie admits a >=6-char alpha containment, so a
+                # common institutional name ("University of Tennessee", on 153
+                # pool entries) can carry the tie — but rerouting money across
+                # accounts on amount + a boilerplate payer name is amount-only
+                # in disguise (rule 4 / 8g).  Require a DISTINCTIVE carrier: a
+                # numeric reference run, or a RARE alpha name (DAESUNG on 1
+                # entry stays).  See _misdirected_tie_distinctive.
+                if not _misdirected_tie_distinctive(bsl, e, pool):
                     continue
                 # No payer_contradiction screen here: it is consulted only by
                 # zero-corroboration placements (owner doctrine — reference

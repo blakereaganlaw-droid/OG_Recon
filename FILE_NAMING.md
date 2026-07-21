@@ -68,7 +68,17 @@ Account tokens: `FHB_Master`, `FHB_UTC` (also `FHB_UT_Chatt`), `FHB_UTHSC`,
 
 ## Formats
 
-- **`.xlsx` preferred.** `.xlsm`, `.xlsb` (needs `pyxlsb`), and `.csv`
+- **`.xlsx` preferred for correctness; `.csv` STRONGLY preferred for the
+  big exports (speed).** Reading is the single largest cost of a run, and
+  it is dominated by openpyxl's XML parsing of large `.xlsx` files. The
+  same data as `.csv` reads **~6–7× faster** (measured on real Master:
+  `ORT_Misc` 155k rows = **34s as `.xlsx` vs 5s as `.csv`**). For the
+  three heavy exports — **`ORT_Misc`, `Payables_Payments`, and the `MET`**
+  (each tens-to-hundreds of thousands of rows) — export as `.csv` and the
+  whole run roughly halves. Reference-bearing columns are safe in `.csv`
+  (the reader never float-coerces them); the small exports (BSL, ST,
+  Edison, GMS/AR, MID) can stay `.xlsx`.
+- `.xlsm`, `.xlsb` (needs `pyxlsb`), and `.csv`
   work. **`.txt` is accepted ONLY for raw BAI2 transmissions** and only
   when the name carries a `BAI` token. **`.xls` (legacy Excel) is not
   readable** — you'll be told immediately; re-export as `.xlsx`/`.csv`.
