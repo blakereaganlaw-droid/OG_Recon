@@ -210,6 +210,27 @@ def digit_runs(s, n=5) -> set:
     return {r for r in _DIGIT_RUN_RE.findall(N(s)) if len(r) >= n}
 
 
+_DESC_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+# A description word appearing in more than this many pool entries is
+# boilerplate ("Disbursing", "Master", "Account", "Payables") — high collision
+# risk, no discriminatory value.  A word appearing in <= this many is
+# distinctive (owner collision-risk framework, 2026-07-20).
+DESC_WORD_MAX_FREQ = 3
+
+
+def desc_word_tokens(s) -> tuple:
+    """>=6-char znorm word tokens (each carrying >=1 letter) from a free-text
+    description — the candidates for the inverse-frequency distinctive-word
+    screen.  Pure-numeric runs are handled separately (desc_refs), so a token
+    must contain a letter to qualify here."""
+    out = set()
+    for w in _DESC_WORD_RE.findall(N(s)):
+        z = znorm(w)
+        if len(z) >= 6 and any(c.isalpha() for c in z):
+            out.add(z)
+    return tuple(sorted(out))
+
+
 def payer_tokens(s) -> set:
     """Set of alpha tokens length>=4, minus the generic stopword set."""
     return {t.upper() for t in _ALPHA_TOKEN_RE.findall(N(s))
@@ -382,7 +403,9 @@ ROUTER_TABLE = [
     # table).  Placed AFTER DEPT_INFO so ORT_Department_* still bind DEPT_INFO.
     RouterRule("CHART_OF_ACCOUNTS", [], [],
                ["chart_of_accounts", "gl_departments", "acctcombos",
-                "combosets", "combostech", "segments", "relatedvaluesets"],
+                "account_combinations", "combosets", "combination_sets",
+                "combostech", "combos_technical", "segments",
+                "relatedvaluesets", "related_value_sets"],
                "Report", False),
     RouterRule("ORT_AR", ["ort", "_ar"], [], [], "Report", False),
     RouterRule("ORT_MISC", ["ort", "misc"], [], [], "Report", False),
@@ -713,6 +736,24 @@ def route_folder(input_dir, skipped=None) -> dict:
                 "token if it is a raw bank transmission"))
             continue
         role = classify_file(name)
+        # Content-sniff a BAI2 whose FILENAME carries no BAI token BEFORE the
+        # unrecognized-name skip, so a real bank export is never dropped over a
+        # name: a .txt by its 01/02/16 record structure
+        # ("BAIEXP_07202026_071541.txt"), a spreadsheet by its distinctive BAI2
+        # columns ("20260720_FHB_Master.xlsx" — a 'BAI Code' + date/bank-ref
+        # header).  The sheet sniff only fires for an otherwise-unrecognized
+        # spreadsheet (role is None), so recognized files are never re-read.
+        if role != "BAI2" and low.endswith(".txt") and _looks_like_bai2(path):
+            role = "BAI2"
+            print(f"NOTE (file content): {name} routed as BAI2 by its "
+                  "01/02/16 record structure (the filename carries no BAI "
+                  "token).", file=sys.stderr)
+        elif role is None and low.endswith((".xlsx", ".xlsm", ".xlsb", ".csv")) \
+                and _looks_like_bai2_sheet(path):
+            role = "BAI2"
+            print(f"NOTE (file content): {name} routed as BAI2 by its "
+                  "'BAI Code' + date/bank-reference columns (the filename "
+                  "carries no BAI token).", file=sys.stderr)
         if role is None:
             skipped.append(_skip_notice(
                 name, "no router rule matches this name",
@@ -720,9 +761,10 @@ def route_folder(input_dir, skipped=None) -> dict:
                 "BSL / _ST_ / MET / Receipts / Payables_Payments / BAI2 ...)"))
             continue
         # Raw bank files (owner, 2026-07-19): a .txt is accepted ONLY as a
-        # native BAI2 transmission ("FHB_UTHSC_BAI2.txt") — the raw reader
-        # parses type-16/88 records with the FULL untruncated addenda the
-        # Oracle BSL feed cuts off.  Any other .txt stays unrouted.
+        # native BAI2 transmission — the raw reader parses type-16/88 records
+        # with the FULL untruncated addenda the Oracle BSL feed cuts off.
+        # A .txt that NAME-routes to a non-BAI2 role (and did not content-sniff
+        # as BAI2 above) stays unrouted.
         if low.endswith(".txt") and role != "BAI2":
             skipped.append(_skip_notice(
                 name, f".txt is accepted only for raw BAI2 transmissions "
@@ -1344,6 +1386,58 @@ def _bai2_date(yymmdd):
     return ""
 
 
+def _looks_like_bai2(path):
+    """Content sniff (owner, 2026-07-20): a raw BAI2 transmission is
+    self-identifying — the first non-blank line is the "01," file-header
+    record, and the body carries "02," group and "16," detail records.  Real
+    bank exports are named every which way ("BAIEXP_07202026_071541.txt"), so
+    the name-token router alone silently drops them; this recognizes the file
+    by its structure instead.  Conservative: all three record types required."""
+    try:
+        seen = {"01": False, "02": False, "16": False}
+        first = True
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, raw in enumerate(fh):
+                line = raw.strip()
+                if not line:
+                    continue
+                if first:
+                    if not line.startswith("01,"):
+                        return False   # a BAI2 file MUST open with 01,
+                    first = False
+                code = line[:2]
+                if code in seen:
+                    seen[code] = True
+                if all(seen.values()):
+                    return True
+                if i > 2000:           # header/first details are near the top
+                    break
+    except OSError:
+        return False
+    return all(seen.values())
+
+
+def _looks_like_bai2_sheet(path, sheet_hint="first"):
+    """A SPREADSHEET (csv/xlsx) is a BAI2 bank export when its header row
+    carries the distinctive BAI2 vocabulary — a 'BAI Code' column plus a
+    date or bank-reference column (owner, 2026-07-20: "20260720_FHB_Master.xlsx"
+    with sheet 'CSVEXP_...').  No other export names a 'BAI Code' column, so
+    the sniff is specific; a date/bank-ref co-requirement guards a coincidence."""
+    try:
+        rows, _ = read_rows(RoutedFile("BAI2", path, os.path.basename(path),
+                                       sheet_hint))
+    except (InvalidSourceData, OSError, ValueError):
+        return False
+    for r in rows[:15]:
+        cells = {_norm_header(c) for c in r if c is not None and N(c)}
+        has_bai = any("BAICODE" in c or "BAITYPECODE" in c for c in cells)
+        has_ctx = any(("POSTDATE" in c or "TRANSACTIONDATE" in c
+                       or "BANKREFERENCE" in c) for c in cells)
+        if has_bai and has_ctx:
+            return True
+    return False
+
+
 def _read_bai2_txt(path):
     """Parse a NATIVE BAI2 transmission (.txt) into spreadsheet-shaped rows
     binding the existing BAI2_ROLES: header row + one row per type-16 detail
@@ -1517,12 +1611,30 @@ class PoolEntry:
     #                            the ECT posting side (§6 account-string
     #                            sourcing); the CoA-recommended GL comes from
     #                            HERE, never from the cash-side asset combo
+    desc_refs: tuple = ()      # >=6-digit numeric runs embedded in the MET/ORT
+    #                            free-text description (owner, 2026-07-20: "review
+    #                            all cells… especially the description text"), PLUS
+    #                            the distinctive (low-frequency) description WORDS
+    #                            finalized in build_pool.  Fed into the tie screen.
+    desc_alpha: tuple = ()     # raw >=6-char description word candidates, before
+    #                            the inverse-frequency screen (build_pool).
 
 
 def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
               available, origin, deposit_id="", receipt_id="", transaction_type="",
-              spr="", asset_segments="", offset_segments=""):
+              spr="", asset_segments="", offset_segments="", description=""):
     ref = clean_ref(reference)
+    # Distinctive numeric runs (>=6 digits) from the free-text description.
+    # Alpha description tokens are DELIBERATELY excluded here — common banking
+    # words ("FHB Master Account", "Payables") would manufacture false >=6-char
+    # containment ties (owner hard-guardrail); numbers are inherently
+    # low-collision, so they are safe reference evidence.
+    desc_refs = tuple(sorted(d for d in digit_runs(description, 6)
+                             if len(d) >= 6 and znorm(ref) != d))
+    # Description WORD candidates (letters); the inverse-frequency screen in
+    # build_pool keeps only the distinctive (rare) ones and folds them into
+    # desc_refs.  Common banking words are dropped there, not here.
+    desc_alpha = desc_word_tokens(description)
     return PoolEntry(
         id=N(id),
         amount_cents=amount_cents,
@@ -1544,6 +1656,8 @@ def _mk_entry(id, amount_cents, dt, reference, counterparty, source, status,
         spr=clean_ref(spr),
         asset_segments=N(asset_segments),
         offset_segments=N(offset_segments),
+        desc_refs=desc_refs,
+        desc_alpha=desc_alpha,
     )
 
 
@@ -1866,6 +1980,7 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
                 transaction_type=_cell(r, m.get("transaction_type")),
                 asset_segments=asset_seg,
                 offset_segments=offset_seg,
+                description=desc,
             )
             if foreign_acc:
                 # Shadow entry: only the misdirected search may cite it, and
@@ -2063,6 +2178,31 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
 
     runlog["pool_sizes"] = counts
     runlog["pool_total"] = len(pool)
+    # Inverse-frequency distinctive-word screen (owner collision-risk framework,
+    # 2026-07-20): a description WORD appearing in many entries is boilerplate
+    # (high collision, no discriminatory value); a word in <= DESC_WORD_MAX_FREQ
+    # entries is distinctive.  Keep only the rare ones and fold them into the
+    # entry's tie fields (desc_refs) — numbers were already added unfiltered
+    # (low collision).  Finalized HERE (immutable after build_pool, before the
+    # tie index) so common banking words can never forge >=6-char alpha ties.
+    word_freq = {}
+    for e in pool:
+        for t in e.desc_alpha:
+            word_freq[t] = word_freq.get(t, 0) + 1
+    distinctive_added = 0
+    for e in pool:
+        if not e.desc_alpha:
+            continue
+        keep = [t for t in e.desc_alpha if word_freq[t] <= DESC_WORD_MAX_FREQ]
+        if keep:
+            e.desc_refs = tuple(sorted(set(e.desc_refs) | set(keep)))
+            distinctive_added += 1
+    runlog["desc_word_screen"] = {
+        "candidate_words": len(word_freq),
+        "distinctive_words": sum(1 for v in word_freq.values()
+                                 if v <= DESC_WORD_MAX_FREQ),
+        "entries_enriched": distinctive_added,
+        "max_freq": DESC_WORD_MAX_FREQ}
     # Status breakdown for the run log.
     by_status = {}
     for e in pool:
@@ -2360,13 +2500,17 @@ def _bsl_znorms(bsl):
 
 
 def _entry_znorms(e):
-    """Non-empty znorms of the ST entry's 4 identifier fields."""
+    """Non-empty znorms of the ST entry's identifier fields PLUS the
+    distinctive numeric runs carried in its free-text description (MET/ORT
+    'description' text — owner 2026-07-20).  Numbers only; common description
+    words are excluded upstream so they cannot forge >=6-char containment ties."""
     out = []
     for v in (e.reference, e.id, e.spr, e.counterparty):
         if v:
             z = znorm(v)
             if z:
                 out.append(z)
+    out.extend(e.desc_refs)      # already znorm digit-runs, len >= 6
     return tuple(out)
 
 
@@ -4260,21 +4404,31 @@ def _sponsored_note(bsl, spx):
 
 
 def _coa_tag(e, coa):
-    """" (dept <DEP_DESC>, entity <ENT_DESC>)" for a named ST that carries a
-    CoA-decodable asset combo, else "".  ADVISORY text only (rule 8c); returns
-    "" when the CoA is absent, so Review output is byte-identical without it."""
-    seg = getattr(e, "asset_segments", "")
-    if not coa or not seg:
-        return ""
-    d = coa_decode(seg, coa)
-    if not d:
+    """" (dept …, entity …; posts to <offset dept> / <natural account>)" for a
+    named ST — the CoA decode of the asset (cash) combo AND the OFFSET combo
+    (the ECT posting side).  Owner (2026-07-20): compare the CoA to the offset
+    accounts on the External System Transactions, so the reconciler sees the
+    fund/dept/natural-account each candidate posts to.  ADVISORY text only
+    (rule 8c: fund/dept/account is CONTEXT — it confers no MATCH by itself);
+    returns "" when the CoA is absent, so Review output is byte-identical
+    without it."""
+    if not coa:
         return ""
     bits = []
-    if d.get("dep_desc"):
-        bits.append(f"dept {d['dep_desc']}")
-    if d.get("ent_desc"):
-        bits.append(f"entity {d['ent_desc']}")
-    return f" ({', '.join(bits)})" if bits else ""
+    d = coa_decode(getattr(e, "asset_segments", ""), coa)
+    if d:
+        if d.get("dep_desc"):
+            bits.append(f"dept {d['dep_desc']}")
+        if d.get("ent_desc"):
+            bits.append(f"entity {d['ent_desc']}")
+    inner = ", ".join(bits)
+    o = coa_decode(getattr(e, "offset_segments", ""), coa)
+    if o:
+        posts = [x for x in (o.get("dep_desc") or o.get("dept", ""),
+                             o.get("act_desc") or o.get("account", "")) if x]
+        if posts:
+            inner = (inner + "; " if inner else "") + "posts to " + " / ".join(posts)
+    return f" ({inner})" if inner else ""
 
 
 def _p10_review_cause(bsl, pool, feed_errors, deposit_index=None, coa=None,
@@ -4708,9 +4862,15 @@ def load_chart_of_accounts(files):
     combo_decode, entity_desc, postable_efdp = {}, {}, set()
     for rf in files:
         low = rf.filename.lower()
-        if "acctcombos" in low:
+        # Accept BOTH the short internal tokens and the real Oracle export
+        # names (owner CoA bundle, 2026-07-20): AcctCombos == "Account
+        # Combinations"; ComboSets == "Combination Sets"; CombosTech ==
+        # "Combos Technical".  Segments must be checked LAST so the
+        # "…_Segments" suffix on other CoA files never shadows the combo readers.
+        if "acctcombos" in low or "account_combinations" in low:
             _coa_read_acctcombos(rf, combo_decode)
-        elif "combosets" in low or "combostech" in low:
+        elif ("combosets" in low or "combostech" in low
+              or "combination_sets" in low or "combos_technical" in low):
             _coa_read_combosets(rf, postable_efdp)
         elif "segments" in low:
             _coa_read_segments(rf, entity_desc)

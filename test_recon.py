@@ -61,6 +61,19 @@ class TestPrimitives(unittest.TestCase):
         self.assertEqual(E.digit_runs("ab12345cd678", 5), {"12345"})
         self.assertEqual(E.digit_runs("12 34", 5), set())
 
+    def test_desc_word_tokens(self):
+        # >=6-char znorm words carrying a letter; pure numbers and short words
+        # (which the numeric/other lanes handle) are excluded.
+        t = E.desc_word_tokens("Controlled Disbursing 581_FHB Master Account")
+        self.assertIn("CONTROLLED", t)
+        self.assertIn("DISBURSING", t)
+        self.assertIn("MASTER", t)
+        self.assertIn("ACCOUNT", t)
+        self.assertNotIn("FHB", t)      # 3 chars
+        self.assertNotIn("581", t)      # pure numeric
+        # an alphanumeric security/reference code qualifies (has a letter)
+        self.assertIn("6698M4UV2", E.desc_word_tokens("CUSIP 6698M4UV2 lot"))
+
     def test_payer_tokens_excludes_bai2_labels(self):
         toks = E.payer_tokens("SENDING CO NAME ACME WIDGETS COMPANY")
         self.assertIn("ACME", toks)
@@ -1518,7 +1531,14 @@ class TestChartOfAccounts(unittest.TestCase):
     def test_router_coa_structural_files(self):
         for name in ("AcctCombos_base.csv", "AcctCombos_6.csv", "Segments.csv",
                      "ComboSets.xlsx", "CombosTech_UTSystem.xlsx",
-                     "RelatedValueSets.csv"):
+                     "RelatedValueSets.csv",
+                     # the REAL Oracle export names (owner CoA bundle,
+                     # 2026-07-20) — previously routed to None and never loaded.
+                     "COA_Account_Combinations_COA_Account_Combinations.csv",
+                     "COA_Combination_Sets_UTHSC.xlsx",
+                     "COA_Combos_Technical_UT_System.xlsx",
+                     "COA_Segments_COA_Segments.csv",
+                     "COA_Related_Value_Sets_COA_Related_Value_Sets.csv"):
             self.assertEqual(E.classify_file(name), "CHART_OF_ACCOUNTS", msg=name)
         # ORT_Department_* stays DEPT_INFO (bound before CHART_OF_ACCOUNTS).
         self.assertEqual(E.classify_file("ORT_Department_Info.xlsx"), "DEPT_INFO")
@@ -2271,6 +2291,30 @@ class TestGuardrails2026(unittest.TestCase):
         self.assertEqual(p.kind, E.CANDIDATE, msg=p.explanation)
         self.assertIn("AMBIGUOUS_GROUP", p.codes)
 
+    def test_description_number_creates_reference_tie(self):
+        # MET/ORT free-text descriptions (owner, 2026-07-20): a >=6-digit number
+        # embedded in the description ("...LGIP 44711210") is now a searchable
+        # reference — a bank line carrying that number ties to the entry, where
+        # before the description was invisible to the cross-reference screen.
+        b = E.make_bsl("L1", date(2026, 7, 10), 500000, "44711210", "44711210",
+                       "LGIP TRANSFER 44711210", "Automated clearing house", "142")
+        e = E._mk_entry("ST9", 500000, date(2026, 7, 9), "OTHERREF", "",
+                        "EXT", "UNR", True, "MET",
+                        description="495-FHB - Master Account-LGIP 44711210")
+        self.assertIn("44711210", e.desc_refs)
+        p = self._one(self._fwd([b], [e]), "L1")
+        self.assertEqual(p.kind, E.MATCH, msg=p.explanation)
+        self.assertEqual([x.id for x in p.st_entries], ["ST9"])
+        # A common description WORD must NOT tie (only distinctive numbers do).
+        b2 = E.make_bsl("L2", date(2026, 7, 10), 700000, "NA", "NA",
+                        "FHB MASTER ACCOUNT DEPOSIT", "Miscellaneous", "174")
+        e2 = E._mk_entry("ST8", 700000, date(2026, 7, 9), "ZZZ", "",
+                         "EXT", "UNR", True, "MET",
+                         description="Controlled Disbursing 581_FHB Master Account")
+        self.assertEqual(e2.desc_refs, ())   # "581" is <6 digits; words excluded
+        p2 = self._one(self._fwd([b2], [e2]), "L2")
+        self.assertNotEqual(p2.kind, E.MATCH, msg=p2.explanation)
+
     def test_merchant_mid_ambiguity_does_not_cannibalize_deposit(self):
         # Merchant grouping-key guard (rule 7 + doctrine 8c; owner: minimize
         # false candidates).  A MID is a GROUPING key shared across all of a
@@ -2420,6 +2464,78 @@ class TestCMConfig(unittest.TestCase):
         m, hi = E.bind_columns(rows, E.BAI2_ROLES, filename="FHB_UTHSC_BAI2.txt")
         self.assertEqual(hi, 0)
         self.assertEqual(m["bai_code"], 5)
+
+    def test_bai2_content_sniff_routes_unnamed_txt(self):
+        # A raw BAI2 whose FILENAME carries no BAI token (real bank export
+        # "BAIEXP_07202026_071541.txt") is recognized by its 01/02/16 record
+        # structure and routed as BAI2 — never silently dropped over a name.
+        raw = "\n".join([
+            "01,000000000,000000000,260720,1916,2663008,,,2/",
+            "02,084000026,084000026,1,260718,,USD,2/",
+            "16,142,5100,Z,25202003732875,08035701948,",
+            "88,MERCHANT SERVICEDEPOSIT",
+            "49,0,2/", "98,0,1,2/", "99,0,1,2/",
+        ])
+        p = os.path.join(self.d, "BAIEXP_07202026_071541.txt")
+        with open(p, "w") as fh:
+            fh.write(raw)
+        self.assertIsNone(E.classify_file("BAIEXP_07202026_071541.txt"))
+        self.assertTrue(E._looks_like_bai2(p))
+        # a non-BAI2 .txt must NOT sniff as BAI2
+        q = os.path.join(self.d, "notes.txt")
+        with open(q, "w") as fh:
+            fh.write("just some notes\nnothing structured\n")
+        self.assertFalse(E._looks_like_bai2(q))
+        # route_folder (needs a BSL present) routes the content-BAI2 as BAI2
+        # and leaves the plain .txt skipped.
+        _write_xlsx(os.path.join(self.d, "20260720_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [
+                        ("Date", "Amount (USD)", "Reference", "Additional Information",
+                         "Account Servicer Reference", "Transaction Type",
+                         "Statement", "Transaction Code"),
+                        ("2026-07-20", "1.00", "NA", "X", "NA", "Miscellaneous",
+                         "Line 1 , 2026-07-20", "174")])])
+        skipped = []
+        by_role = E.route_folder(self.d, skipped)
+        self.assertIn("BAI2", by_role)
+        self.assertTrue(any(f.filename == "BAIEXP_07202026_071541.txt"
+                            for f in by_role["BAI2"]))
+        self.assertTrue(any(s["file"] == "notes.txt" for s in skipped))
+
+    def test_bai2_sheet_content_sniff_routes_unnamed_xlsx(self):
+        # A BAI2 SPREADSHEET whose filename carries no BAI token
+        # ("20260720_FHB_Master.xlsx", sheet 'CSVEXP_...') is recognized by its
+        # 'BAI Code' + date columns and routed as BAI2.
+        _write_xlsx(os.path.join(self.d, "20260720_FHB_Master.xlsx"),
+                    [("CSVEXP_07202026", [
+                        ("Post Date", "Bank ID", "Account Number", "Account Name",
+                         "Transaction Description", "Amount", "Bank Reference",
+                         "Customer Reference", "BAI Code", "Currency",
+                         "Debit/Credit", "DETAIL1"),
+                        ("2026-07-20", "084000026", "15", "UT General Acct",
+                         "ACH CREDIT", "500000", "ACH260720", "50571", "142",
+                         "USD", "Credit", "ASAP GRANT")])])
+        self.assertIsNone(E.classify_file("20260720_FHB_Master.xlsx"))
+        self.assertTrue(E._looks_like_bai2_sheet(
+            os.path.join(self.d, "20260720_FHB_Master.xlsx")))
+        # a non-BAI2 spreadsheet must NOT sniff
+        _write_xlsx(os.path.join(self.d, "random_export.xlsx"),
+                    [("s", [("Foo", "Bar"), ("1", "2")])])
+        self.assertFalse(E._looks_like_bai2_sheet(
+            os.path.join(self.d, "random_export.xlsx")))
+        _write_xlsx(os.path.join(self.d, "20260720_Oracle_CM_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", [
+                        ("Date", "Amount (USD)", "Reference", "Additional Information",
+                         "Account Servicer Reference", "Transaction Type",
+                         "Statement", "Transaction Code"),
+                        ("2026-07-20", "1.00", "NA", "X", "NA", "Miscellaneous",
+                         "Line 1 , 2026-07-20", "174")])])
+        skipped = []
+        by_role = E.route_folder(self.d, skipped)
+        self.assertIn("BAI2", by_role)
+        self.assertTrue(any(f.filename == "20260720_FHB_Master.xlsx"
+                            for f in by_role["BAI2"]))
+        self.assertTrue(any(s["file"] == "random_export.xlsx" for s in skipped))
 
     def test_cfg_tcr_orphan_rows_load(self):
         # The real export carries rules with a BLANK bank-account cell

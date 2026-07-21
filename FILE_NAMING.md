@@ -37,8 +37,8 @@ YYYYMMDD_<Source>_<Account>_<Role>[_<Status>].<ext>
 | MET / ORT bridge (OTBI) | `MET` or `Oracle_OTBI` | yes | `20260719_Oracle_OTBI_MET_All.xlsx` |
 | Receivables receipts | `Receivables_Receipts` / `Receipts_All` / `Oracle_Receipts` | yes | `20260718_Oracle_Receivables_Receipts.xlsx` |
 | AP payments | `Payables` **and** `Payments` (both) | yes | `20260719_Oracle_Payables_Payments.xlsx` |
-| Raw BAI2 transmission | `BAI` (whole segment; `BAI2` fine) — **the only `.txt` accepted** | yes (enrichment) | `20260718_FHB_UTHSC_BAI2.txt` |
-| BAI2 spreadsheet | `BAI` | yes (enrichment) | `20260715_FHB_UTC_BAI2.csv` |
+| Raw BAI2 transmission | `BAI` token **OR recognized by content** (a `.txt` opening with an `01,` header + `02,`/`16,` records — e.g. `BAIEXP_07202026_071541.txt`) | yes (enrichment) | `20260718_FHB_UTHSC_BAI2.txt` |
+| BAI2 spreadsheet | `BAI` token **OR recognized by content** (a csv/xlsx whose header carries a `BAI Code` + date/bank-reference column — e.g. `20260720_FHB_Master.xlsx`) | yes (enrichment) | `20260715_FHB_UTC_BAI2.csv` |
 | Edison payments / invoices | `Edison_Payments` / `Edison_Invoices` | yes (Review annotation) | — |
 | GMS Sponsored AR Aging | `GMS_001` / `Sponsored_AR_Aging` | yes (Sponsored-Projects annotation) | `RPT_GMS_001__Sponsored_AR_Aging_Report.xlsx` |
 | GMS Sponsored Award Profile | `Sponsored_Award_Profile` / `RPT_GMS_002` | yes (SPN/award/sponsor bridge) | `RPT_GMS_002__Sponsored_Award_Profile_Report.csv` |
@@ -88,7 +88,7 @@ Account tokens: `FHB_Master`, `FHB_UTC` (also `FHB_UT_Chatt`), `FHB_UTHSC`,
 |---|---|---|
 | **`Reconciled_..._BSL.xlsx` in an upload** | Previously would have bound the open-BSL role and poisoned the run with already-reconciled lines. Now routes to the `RECONCILED` role (advisory recon-history audit only). | Keep `Reconciled` in the name (it's the protection); don't strip it. |
 | **All-accounts BSL named without `All`** | Would bind as THIS account's open BSL → thousands of foreign lines. | Always keep `All_BSL` together (`Oracle_OTBI_All_BSL_UNR`). |
-| **Raw bank file named `Master.txt`** | No `BAI` token → ignored (announced). | Name it `YYYYMMDD_<Account>_BAI2.txt`. |
+| **Raw bank file named `BAIEXP_….txt` / `…_FHB_Master.xlsx`** | No `BAI` token, but recognized by CONTENT (`01/02/16` records, or a `BAI Code` header) and routed as BAI2 (announced as a content NOTE). | Works as-is; a `_BAI2` token still makes it unambiguous. |
 | **Same date stamp on two exports of one role** | Run stops and asks you to disambiguate — nothing silently ignored. | Bump the newer file's date stamp. Exception: **page shards** of BSL/ST/Receipts/Payments/ALL_BSL/MET (`..._X.csv` + `..._X_2.csv`, same date) are unioned automatically — with a fail-loud guard if the "pages" carry duplicate rows (a re-upload is not a page). |
 | **Undated refresh beside a dated file** | The dated file wins even if the undated one is newer. | Always date-stamp refreshes. |
 | **`UT Chatt` spelling** | Now maps to UTC (previously invisible to the mixed-account guard). | Prefer `UTC` for consistency. |
