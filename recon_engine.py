@@ -2631,6 +2631,53 @@ def cross_reference_tie(bsl, e):
     return _cross_reference_tie_z(_bsl_znorms(bsl), _entry_znorms(e))
 
 
+# A misdirected tie carried ONLY by a common institutional name is boilerplate,
+# not a reference — an alpha carrier in more than this many pool entries is
+# rejected (matches DESC_WORD_MAX_FREQ; owner distinctive-word doctrine).
+MISDIRECTED_COMMON_ALPHA_FREQ = 3
+
+
+def _tie_carriers(bsl, e):
+    """The shared znorm strings that fire the bsl<->shadow reference tie — for
+    a containment hit, the SHORTER (matched) token is the carrier."""
+    out = set()
+    for x in _bsl_znorms(bsl):
+        for y in _entry_znorms(e):
+            if _reference_equal_z(x, y):
+                out.add(x if len(x) <= len(y) else y)
+    return out
+
+
+def _misdirected_tie_distinctive(bsl, e, pool):
+    """A misdirected placement reroutes money across bank accounts on a
+    reference tie, so that tie must be DISTINCTIVE (owner HARD GUARDRAIL,
+    2026-07-21).  A shared >=6-digit numeric run is low-collision and always
+    distinctive; an ALPHA carrier counts only if RARE across the pool — a
+    common institutional name ("UNIVERSITYOFTE" appears on 153 real Master pool
+    entries) is boilerplate, so amount + that name is amount-only in disguise
+    (rule 4 / 8g "never amount alone").  Real false case: a $10,000 Bill.com
+    receivable (ref 996YUENTH151R8H) was rerouted to FHB_UTC purely because the
+    shadow's payer "University of Tennessee Research Foundation" contains
+    "University of Te".  The legitimate DAESUNG honorarium (alpha carrier on 1
+    entry) and every numeric-referenced misdirection are preserved."""
+    alpha = []
+    for s in _tie_carriers(bsl, e):
+        if re.search(r"\d{6,}", s):
+            return True                       # numeric reference run
+        alpha.append(s)
+    for s in alpha:
+        freq = 0
+        for pe in pool:
+            znz = _entry_znorms(pe)
+            if any(_reference_equal_z(z, s) for z in znz):
+                freq += 1
+                if freq > MISDIRECTED_COMMON_ALPHA_FREQ:
+                    break
+        if freq <= MISDIRECTED_COMMON_ALPHA_FREQ:
+            return True                       # rare (distinctive) alpha name
+    return False
+
+
 def _grams6(z):
     """All character 6-grams of a znorm string (index keys)."""
     return [z[i:i + 6] for i in range(len(z) - 5)]
@@ -3651,6 +3698,16 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                 # date fragment, or truncated trace in the addenda and is NOT
                 # acceptable evidence for rerouting money across accounts.
                 if not cross_reference_tie(bsl, e):
+                    continue
+                # Distinctive-tie guard (owner HARD GUARDRAIL, 2026-07-21):
+                # cross_reference_tie admits a >=6-char alpha containment, so a
+                # common institutional name ("University of Tennessee", on 153
+                # pool entries) can carry the tie — but rerouting money across
+                # accounts on amount + a boilerplate payer name is amount-only
+                # in disguise (rule 4 / 8g).  Require a DISTINCTIVE carrier: a
+                # numeric reference run, or a RARE alpha name (DAESUNG on 1
+                # entry stays).  See _misdirected_tie_distinctive.
+                if not _misdirected_tie_distinctive(bsl, e, pool):
                     continue
                 # No payer_contradiction screen here: it is consulted only by
                 # zero-corroboration placements (owner doctrine — reference

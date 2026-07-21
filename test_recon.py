@@ -1372,6 +1372,54 @@ class TestRealDataShapes(unittest.TestCase):
         self.assertIn("booked to FHB_UTC", expl)
         self.assertIn("300045836", A._N(mis[0][A.COL_ST_NUMS]))
 
+    def test_misdirected_common_name_tie_is_not_placed(self):
+        # Distinctive-tie guard (owner HARD GUARDRAIL, 2026-07-21): a foreign
+        # receipt whose ONLY tie to the bank line is a COMMON institutional name
+        # ("University of Tennessee", boilerplate on nearly every UT line) plus
+        # the amount is amount-only in disguise (rule 4 / 8g) — it must NOT be
+        # placed on the Misdirected tab.  Real false case: a $10,000 Bill.com
+        # receivable rerouted to FHB_UTC via "University of Te" containment.
+        bsl = [
+            ("Date", "Amount (USD)", "Reference", "Additional Information",
+             "Customer Reference", "Transaction Type", "Statement", "Transaction Code"),
+            ("2026-07-16", "10000.00", "9961518",
+             "University of Te Receivable 260716 996YUENTH151R", "University of Te",
+             "Automated clearing house", "Line 74 , 2026-07-16", "142"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260718_FHB_Master_BSL_UNR.xlsx"),
+                    [("Exported", bsl)])
+        # A realistic population where "University of Tennessee" is boilerplate
+        # (on many entries) — that is what makes the name a common, non-
+        # distinctive carrier (freq > 3), exactly as in the real Master pool.
+        st = [
+            ("Date", "Amount (USD)", "Reference", "Transaction Number", "Source", "Counterparty"),
+            ("2026-07-02", "150.00", "REF100200", 601, "External", "VENDOR INC"),
+            ("2026-07-02", "11.00", "R2", 602, "AR", "University of Tennessee Knoxville"),
+            ("2026-07-02", "12.00", "R3", 603, "AR", "University of Tennessee Martin"),
+            ("2026-07-02", "13.00", "R4", 604, "AR", "University of Tennessee HSC"),
+            ("2026-07-02", "14.00", "R5", 605, "AR", "University of Tennessee Foundation"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260718_FHB_Master_ST_UNR.xlsx"),
+                    [("Exported", st)])
+        receipts = [
+            ("Receipt Number", "Status", "Entered Amount", "Customer Name",
+             "Receipt Date", "Remittance Bank Account", "Reference"),
+            # foreign receipt: amount matches, but ties ONLY on the common name
+            # (payer "University of Tennessee Research Foundation") — no shared
+            # numeric reference (its own ref is unrelated).
+            ("SPN040226", "Remitted", "10000.00",
+             "University of Tennessee Research Foundation", "2026-07-16",
+             "FHB - UTC", "8042156011"),
+        ]
+        _write_xlsx(os.path.join(self.d, "20260718_Oracle_Receivables_Receipts.xlsx"),
+                    [("Export to Excel", receipts)])
+        runlog = E.run(self.d, self.out, present=True)
+        self.assertEqual(runlog["audit"]["status"], "PASS",
+                         msg=str(runlog["audit"].get("failures")))
+        # The common-name coincidence is NOT a misdirected placement.
+        self.assertEqual(runlog["recon_summary"]["misdirected"], 0,
+                         msg="common institutional-name tie must not reroute money")
+
     def test_account_of_gl_segments(self):
         self.assertEqual(E.account_of_gl_segments("01-1100001-000000-100221-000-0000-00-0000"), "FHB_UTIA")
         self.assertEqual(E.account_of_gl_segments("01-1100001-000000-100330-000-0000-00-0000"), "REGIONS_UTM")
