@@ -383,7 +383,16 @@ ROUTER_TABLE = [
     # 'oracle_otbi' also routes here: OTBI is the MET report's source system
     # and real exports sometimes omit the MET token
     # (20260711_Oracle_OTBI_Regions_UTIA_All_Status.xlsx).
-    RouterRule("MET", [], [], ["met", "oracle_otbi"], "first", False),
+    # Exclude the Chart-of-Accounts family: a CoA shard whose campus name
+    # embeds a stray "met" segment ("COA_Combos_Technical_UTIA_Vet_Met_Ag_...")
+    # must NOT bind the MET role (it would lose the MET pagination tiebreak to
+    # the real dated MET and silently drop out of the CoA decode).
+    RouterRule("MET", [],
+               ["coa", "acctcombos", "combosets", "combostech",
+                "combos_technical", "account_combinations", "combination_sets",
+                "segments", "gl_departments", "chart_of_accounts",
+                "relatedvaluesets", "related_value_sets"],
+               ["met", "oracle_otbi"], "first", False),
     # "_st" alone is too greedy: it matches All_Status / Rosetta_Stone /
     # _Statement.  Require a separator (or end) after the token.
     RouterRule("ST", [], [], ["_st_", "_st.", "account_st"], "first", False),
@@ -936,6 +945,29 @@ def _signed_twin(data_rows, cols):
     return signed[0] if len(signed) == 1 else None
 
 
+def _alias_priority_winner(header, tied_cols, alias_norms):
+    """Among `tied_cols` (columns that tied on content+header score for one
+    role), return the single column whose header matches the EARLIEST alias in
+    the ordered `alias_norms` list — exact matches rank ahead of substring
+    matches.  Returns None when no strict unique winner exists (two columns
+    match the same top alias, i.e. a genuine duplicate header)."""
+    def rank(col):
+        hn = _norm_header(header[col]) if col < len(header) else ""
+        if not hn:
+            return (2, 0)
+        for i, a in enumerate(alias_norms):
+            if a and hn == a:
+                return (0, i)          # exact alias match, by alias order
+        for i, a in enumerate(alias_norms):
+            if a and a in hn:
+                return (1, i)          # substring match, after all exacts
+        return (2, 0)
+    ranked = sorted((rank(c), c) for c in tied_cols)
+    if len(ranked) >= 2 and ranked[0][0] == ranked[1][0]:
+        return None                    # tie on the winning alias -> still ambiguous
+    return ranked[0][1]
+
+
 def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50):
     """Bind each role to a column index by scanning content first, header as
     tiebreak (Section 5.1).  Returns (mapping {role: col_index}, header_index).
@@ -1037,7 +1069,19 @@ def bind_columns(rows, role_specs, filename="<rows>", header_scan=12, sample=50)
                     if signed is not None:
                         best = (best[0], best[1], signed)
                     else:
-                        raise AmbiguousColumn(filename, role, tied)
+                        # Alias-priority tiebreak (owner, 2026-07-21): the alias
+                        # list is ordered by preference, so when two required
+                        # columns tie on content AND header score but are NOT
+                        # identical, the column matching the EARLIER alias wins
+                        # ("Payee" over "Supplier or Party" on the AP Payments
+                        # export, where both hold the payee name but differ on a
+                        # few rows).  Only fires where the binder would otherwise
+                        # fail loud, so it never changes an existing binding.
+                        winner = _alias_priority_winner(header, tied, alias_norms)
+                        if winner is not None:
+                            best = (best[0], best[1], winner)
+                        else:
+                            raise AmbiguousColumn(filename, role, tied)
         if spec.required and best[0] == 0:
             raise InvalidSourceData(
                 filename, role,
