@@ -46,7 +46,7 @@ YYYYMMDD_<Source>_<Account>_<Role>[_<Status>].<ext>
 | AR Unapplied by Customer | `AR_Unapplied_By_Customer` / `RPT_AR_059` | yes (unapplied-receipt annotation) | `RPT_AR_059__AR_Unapplied_By_Customer_Report.xlsx` |
 | AR Unapplied Receipts Summary | `AR_063` / `RPT_AR_063` / `Unapplied_Receipts_Summary` | yes (customer unapplied context) | `RPT_AR_063__Unapplied_Receipts_Summary_Report.xlsx` |
 | MID master | `MID_Master` | yes | `UT_MID_Master_Consolidated.xlsx` |
-| ORT misc / AR | `ORT`+`Misc` / `ORT`+`_AR` | yes | `20260719_ORT_Misc_All.xlsx` |
+| ORT misc / AR | `ORT`+`Misc` / `ORT`+`_AR` | yes (data-feed-error sweep + per-receipt `REFERENCE_TEXT` cross-reference) | `20260719_ORT_Misc_All.xlsx` |
 | ORT departments | `ORT_Department` / `Department_Info` | yes (MID directory) | `ORT_Department_MIDs.xlsx` |
 | Chart of Accounts bundle | `Chart_Of_Accounts` / `AcctCombos` / `ComboSets` / `CombosTech` / `Segments` / `GL_Departments` | yes (decode labels; multi-file union) | `AcctCombos_base.csv` + shards |
 | CM config: creation rules | `Transaction_Creation_Rules` | yes (config audit) | `CM_Configurations_Transaction_Creation_Rules.xlsx` |
