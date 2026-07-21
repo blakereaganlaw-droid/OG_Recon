@@ -128,8 +128,35 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
    "no subset sums" Review; deferring recovers BOTH lines as corroborated
    deposit Matches. Byte-safe on the four baseline accounts (a mixed
    candidate set with any non-MID tie keeps P3's normal behavior). The
-   symmetric N=1 arm (a single same-MID receipt Matched 1:1 in P3) is a
-   known follow-up under owner review, not yet closed.
+   symmetric N=1 arm (a single same-MID receipt Matched 1:1 in P3) was
+   probed on real data and **REJECTED** (owner, 2026-07-21): the crude
+   "receipt sits in a multi-member open deposit not summing to this line"
+   guard broke a legitimate FHB Master -$15 chargeback Match (Line 109 ↔
+   receipt 1030161, exact amount + MID + same day) while recovering
+   NOTHING — the open pool is dominated by mostly-closed grab-bag auto-rec
+   deposits (deposit 3084000026 = $129,955 across 21 members, 19 closed)
+   whose two stray open members' sum coincidentally equals some other BSL
+   amount, so amount-based deposit-sum reasoning for DEFERRAL is as
+   unreliable as for matching (rule 4). The N=1 guard is not viable and is
+   not shipped.
+8c4. **Transparency touch — the date window never silently picks one
+   (owner, 2026-07-21).** When ≥2 DISTINCT OPEN same-MID settlements EACH
+   equal a merchant line's amount, the shared MID is a grouping key (8c3)
+   and which one settled THIS line is genuinely ambiguous — so no lane may
+   1:1-consume one via the date window. `_merchant_equal_mid_settlements`
+   (availability-filtered, stale-barred excluded — a CLOSED twin is not a
+   competing open candidate) drives two sites: **P3** defers when its
+   directional date gate has narrowed the merchant tie-set to one by
+   dropping an out-of-window twin (≥2 distinct open equal same-MID →
+   `continue`), and **P6** surfaces the ambiguity as a
+   `MULTIPLE_EQUAL_CANDIDATES`/`GROUPING_CONFLICT` Candidate naming the
+   deposits/receipts instead of the in-window subset Match. The
+   deposit-grouped case is already named by P4 phase 2 (2 corroborated
+   equal-sum deposits → `MULTIPLE_EQUAL_CANDIDATES`); the touch closes the
+   LOOSE-receipt gap (no deposit id) that P4 phase 2 doesn't group.
+   Byte-identical on all four baselines (each merchant line has ≤1 OPEN
+   same-MID equal settlement — closed twins don't count); dormant until a
+   real open competition exists.
 8d. **12-day stale-candidate ceiling (owner, 2026-07-12).** An
    External-source ST entered 12+ days BEFORE the BSL statement date is
    almost certainly not the counterpart — barred even as a Candidate
@@ -331,6 +358,23 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   sharing boilerplate; numbers are low-collision, so they are safe reference
   evidence.  Byte-identical on all four baselines (no false ties); the
   distinctive-alpha screen (inverse frequency) is a designed follow-up.
+- **ORT raw-activity reference cross-reference (owner "cross-reference
+  everything", 2026-07-20).** The MET/ORT chain enters the pool via the MET
+  export, whose `CET_REFERENCE_TEXT` is not always the per-receipt-item bank
+  reference the raw `ORT_Misc` / `ORT_AR` activity reports carry
+  (`REFERENCE_TEXT`, keyed by `Parked Receipt ID`).  `_ort_misc_ref_index`
+  builds `{receipt_id → set(≥6-digit ref numbers)}` from those reports and
+  `build_pool` folds each into the JOINED pool receipt's `desc_refs` (the
+  single tie-field source), so the cross-reference screen finally sees them.
+  HARD GUARDRAIL: **numbers ONLY, ≥6 digits** (low collision — rule 4 / the
+  description-number doctrine), joined by EXACT receipt-id equality (never
+  amount, never fuzzy).  Provably placement-safe on real FHB Master: of the
+  ~18,700 receipts that gain a new ref, **0** are an OPEN receipt whose amount
+  matches an open BSL carrying that number, so no new Match/Candidate is
+  forged — it only enriches Review/split visibility and arms other data sets.
+  Advisory-leaning: byte-identical with the reports present or absent (the
+  role binds `reference_text`/`deposit_id` now; unbound → the index is empty
+  and every consumer no-ops).
 - **CM configuration audit (owner, 2026-07-19 — orphan-doctrine R5
   activation).** The five `CM_Configurations_*` exports load as `CFG_TCR` /
   `CFG_PARSE` / `CFG_MATCHING` / `CFG_TOLERANCE` / `CFG_RULESETS`

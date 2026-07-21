@@ -2361,6 +2361,95 @@ class TestGuardrails2026(unittest.TestCase):
         for p in placements:
             self.assertNotIn("MULTIPLE_EQUAL_CANDIDATES", p.codes or [])
 
+    def test_p3_transparency_defers_two_equal_same_mid_settlements(self):
+        # Transparency touch, P3 arm (owner, 2026-07-21): the P3 date filter can
+        # narrow a merchant tie-set to one open same-MID receipt by dropping an
+        # out-of-window twin.  When >= 2 DISTINCT available same-MID settlements
+        # equal the line, that narrowing is a silent date-window pick — defer so
+        # the merchant lane names the ambiguity instead of 1:1-ing one.
+        MID = "8037859173"
+        line = E.make_bsl("L1", date(2026, 7, 17), 15000, MID, MID,
+                          f"MERCHANT SERVICE {MID}", "Automated clearing house", "142")
+
+        def rc(i, dt):
+            return E._mk_entry(i, 15000, dt, MID, "Touchnet", "EXT", "UNR",
+                               True, "MET", receipt_id=f"r{i}")
+        a = rc("2001", date(2026, 7, 15))   # 2d before -> passes P3 date gate
+        b = rc("2002", date(2026, 7, 7))    # 10d before -> P3 drops it (>8d), not stale-barred (<12d)
+        p = self._one(self._fwd([line], [a, b]), "L1")
+        self.assertNotEqual(p.pass_name, "P3_exact_1to1", msg=p.explanation)
+        self.assertIn("MULTIPLE_EQUAL_CANDIDATES", p.codes or [])
+
+    def test_p3_lone_same_mid_receipt_still_matches(self):
+        # Byte-safety: a lone available same-MID receipt equal to the line is a
+        # legitimate 1:1 merchant settlement and still Matches in P3 (only >= 2
+        # DISTINCT available same-MID settlements defer — real Master Line 109's
+        # single open -$15 chargeback must keep its exact-MID match).
+        MID = "8037859173"
+        line = E.make_bsl("L1", date(2026, 7, 13), 15000, MID, MID,
+                          f"MERCHANT SERVICE {MID}", "Automated clearing house", "142")
+        e = E._mk_entry("3000", 15000, date(2026, 7, 12), MID, "Touchnet",
+                        "EXT", "UNR", True, "MET", deposit_id="700001",
+                        receipt_id="r3000")
+        p = self._one(self._fwd([line], [e]), "L1")
+        self.assertEqual(p.kind, E.MATCH, msg=p.explanation)
+        self.assertEqual(p.pass_name, "P3_exact_1to1", msg=p.explanation)
+
+    def test_p6_transparency_two_equal_same_mid_receipts(self):
+        # Transparency touch (owner, 2026-07-21): two same-MID card receipts
+        # each equal the settlement, one INSIDE the 1-4d window and one outside.
+        # P4 phase 2 groups by deposit id; these loose receipts carry none, so
+        # the merchant lane (P6) is first to see them — and its window match
+        # would silently pick the in-window receipt.  Instead the line surfaces
+        # as an ambiguous Candidate naming both (shared MID is a grouping key).
+        MID = "2000002247"
+        line = E.make_bsl("L75", date(2026, 7, 17), 7500, MID, MID,
+                          f"MERCHANT BANKCD {MID}", "Automated clearing house", "142")
+
+        def rc(i, dt):
+            return E._mk_entry(i, 7500, dt, MID, "Heartland", "EXT", "UNR",
+                               True, "MET", receipt_id=f"r{i}")
+        a = rc("4000", date(2026, 7, 15))   # 2d before -> in the 1-4d window
+        b = rc("4001", date(2026, 7, 7))    # 10d before -> out of window
+        p = self._one(self._fwd([line], [a, b]), "L75")
+        self.assertEqual(p.kind, E.CANDIDATE, msg=p.explanation)
+        self.assertEqual(p.pass_name, "P6_merchant", msg=p.explanation)
+        self.assertIn("MULTIPLE_EQUAL_CANDIDATES", p.codes or [])
+        self.assertIn("4000", p.explanation)
+        self.assertIn("4001", p.explanation)
+
+    def test_p6_single_equal_same_mid_receipt_not_flagged(self):
+        # Byte-safety of the transparency touch: ONE same-MID receipt equal to
+        # the settlement in the card window still Matches (no false ambiguity).
+        MID = "2000002247"
+        line = E.make_bsl("L75", date(2026, 7, 17), 7500, MID, MID,
+                          f"MERCHANT BANKCD {MID}", "Automated clearing house", "142")
+        e = E._mk_entry("4100", 7500, date(2026, 7, 15), MID, "Heartland",
+                        "EXT", "UNR", True, "MET", receipt_id="r4100")
+        p = self._one(self._fwd([line], [e]), "L75")
+        self.assertEqual(p.kind, E.MATCH, msg=p.explanation)
+
+    def test_ort_misc_reference_crossref_index(self):
+        # ORT raw-activity reference cross-reference (owner "cross-reference
+        # everything", 2026-07-20): the ORT_Misc / ORT_AR REFERENCE_TEXT column,
+        # keyed by Parked Receipt ID, supplies per-receipt bank reference
+        # numbers the MET export may lack.  Numbers only, >= 6 digits.
+        rows = [["Parked Receipt ID", "REFERENCE_TEXT"],
+                ["500123", "8042156011"],
+                ["500123", "8042156011"],       # dup item row -> deduped
+                ["500124", "600255"],
+                ["500125", "ABC"],              # non-numeric -> excluded
+                ["500126", "12345"]]            # < 6 digits -> excluded
+        loaded = {"ORT_MISC": {"rows": rows, "header_index": 0,
+                               "map": {"parked_receipt_id": 0, "reference_text": 1}}}
+        idx = E._ort_misc_ref_index(loaded)
+        self.assertEqual(idx.get("500123"), {"8042156011"})
+        self.assertEqual(idx.get("500124"), {"600255"})
+        self.assertNotIn("500125", idx)
+        self.assertNotIn("500126", idx)
+        # Absent report -> empty (pure no-op).
+        self.assertEqual(E._ort_misc_ref_index({}), {})
+
 
 class TestCMConfig(unittest.TestCase):
     """CM Configuration exports (owner, 2026-07-19): the five CFG_* loaders,

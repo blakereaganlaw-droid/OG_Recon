@@ -2178,6 +2178,32 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
 
     runlog["pool_sizes"] = counts
     runlog["pool_total"] = len(pool)
+    # ORT raw-activity reference cross-reference (owner "cross-reference
+    # everything", 2026-07-20).  The MET/ORT chain enters the pool via the MET
+    # export, whose CET_REFERENCE_TEXT is not always the per-receipt-item bank
+    # reference the ORT_Misc / ORT_AR raw activity reports carry (REFERENCE_TEXT
+    # keyed by Parked Receipt ID).  Fold those numbers into the JOINED receipt's
+    # tie fields (desc_refs) so the cross-reference screen sees them.  HARD
+    # GUARDRAIL: numbers ONLY, >= 6 digits (low collision — rule 4 / the
+    # description-number doctrine), joined by EXACT receipt-id equality (never
+    # amount, never fuzzy).  Provably placement-safe on real FHB Master (0 open
+    # receipts gain a ref that ties an open BSL at equal amount); it only
+    # enriches Review/split visibility and arms other data sets.
+    ort_refs = _ort_misc_ref_index(loaded)
+    if ort_refs:
+        ort_enriched = 0
+        for e in pool:
+            if not e.receipt_id:
+                continue
+            extra = ort_refs.get(_norm_id(e.receipt_id))
+            if not extra:
+                continue
+            new = extra - set(e.desc_refs) - {e.znref, znorm(e.id)}
+            if new:
+                e.desc_refs = tuple(sorted(set(e.desc_refs) | new))
+                ort_enriched += 1
+        runlog["ort_ref_crossref"] = {"receipt_keys": len(ort_refs),
+                                      "entries_enriched": ort_enriched}
     # Inverse-frequency distinctive-word screen (owner collision-risk framework,
     # 2026-07-20): a description WORD appearing in many entries is boilerplate
     # (high collision, no discriminatory value); a word in <= DESC_WORD_MAX_FREQ
@@ -2209,6 +2235,32 @@ def build_pool(loaded: dict, account: str, runlog: dict) -> list:
         by_status[e.status] = by_status.get(e.status, 0) + 1
     runlog["pool_by_status"] = by_status
     return pool
+
+
+def _ort_misc_ref_index(loaded):
+    """{ _norm_id(Parked Receipt ID) -> set(>=6-digit reference numbers) } from
+    the ORT_Misc / ORT_AR raw activity reports' REFERENCE_TEXT column.  Numbers
+    only, >= 6 digits (low-collision reference evidence, never a boilerplate
+    word); the receipt-id join is exact.  Empty when neither report is present
+    or the reference column is unbound (a pure no-op then)."""
+    out = {}
+    for role in ("ORT_MISC", "ORT_AR"):
+        src = loaded.get(role)
+        if not src:
+            continue
+        rows, m, hi = src["rows"], src["map"], src["header_index"]
+        prid = m.get("parked_receipt_id")
+        reftext = m.get("reference_text")
+        if prid is None or reftext is None:
+            continue
+        for r in rows[hi + 1:]:
+            rid = _norm_id(_cell(r, prid))
+            if not rid:
+                continue
+            rt = znorm(clean_ref(_cell(r, reftext)))
+            if len(rt) >= 6 and rt.isdigit():
+                out.setdefault(rid, set()).add(rt)
+    return out
 
 
 def _classify_source(source):
@@ -2969,6 +3021,19 @@ def forward_reconcile(bsls, pool, loaded, account, runlog):
                  if date_ok_directional(signed_lag(bsl.date, e.date))]
         if len(cands) == 1:
             e = cands[0]
+            # Transparency touch (owner, 2026-07-21): the P3 date filter above
+            # can narrow a merchant tie-set to ONE by dropping out-of-window
+            # same-MID twins — a silent date-window pick.  When >= 2 DISTINCT
+            # available same-MID settlements equal this line, the shared MID is
+            # a grouping key (doctrine 8c3) and which one settled it is
+            # ambiguous; defer to the deposit / merchant lanes (P4 phase 2 names
+            # the deposits; P6 names loose receipts) rather than 1:1-ing one.
+            # (Availability-filtered >= 2 -> Master Line 109's lone open same-MID
+            # chargeback is untouched; only genuine ambiguities defer.)
+            if bsl.lane == LANE_MERCHANT and \
+                    len({(x.deposit_id or x.id) for x in
+                         _merchant_equal_mid_settlements(bsl, mid_pool, ledger)}) >= 2:
+                continue
             lag = signed_lag(bsl.date, e.date)
             conf = CONF_HIGH if abs(lag) <= DATE_CEILING else CONF_MEDIUM
             note = "" if abs(lag) <= DATE_CEILING else \
@@ -3891,6 +3956,27 @@ def _p4_reference_group(bsl, tied_entries, ledger):
 
 
 
+def _merchant_mid_key(bsl):
+    return bsl.mid or (znorm(bsl.recon_reference)
+                       if is_mid(bsl.recon_reference) else "")
+
+
+def _merchant_equal_mid_settlements(bsl, mid_pool, ledger):
+    """Available same-MID pool entries whose amount EQUALS the settlement
+    (stale-barred excluded).  When >= 2 DISTINCT deposits/receipts qualify the
+    shared MID is acting as a grouping key (doctrine 8c3) and which one settled
+    THIS line is genuinely ambiguous — the transparency touch (owner,
+    2026-07-21) forbids any lane from silently 1:1-ing one via the date window,
+    surfacing the ambiguity as a named Candidate instead."""
+    mid = _merchant_mid_key(bsl)
+    if not mid:
+        return []
+    return [e for e in mid_pool.get(mid, ())
+            if ledger.is_available(e)
+            and e.amount_cents == bsl.amount_cents
+            and not _ext_stale_barred(bsl, e)]
+
+
 def _p6_merchant(unplaced, place, mid_pool, ledger, loaded, runlog, account=None):
     """Merchant / MID (Section 9 P6)."""
     mid_dir = _mid_directory(loaded, account)
@@ -3908,7 +3994,27 @@ def _p6_merchant(unplaced, place, mid_pool, ledger, loaded, runlog, account=None
         in_window = [e for e in group if date_ok_merchant(signed_lag(bsl.date, e.date))]
         stale = [e for e in group if (signed_lag(bsl.date, e.date) or 0) > 30]
         total = sum(e.amount_cents for e in in_window)
-        if in_window and total == bsl.amount_cents:
+        # Transparency touch (owner, 2026-07-21): when 2+ same-MID DEPOSITS each
+        # equal the settlement, the MID is a grouping key (doctrine 8c3) and
+        # which one settled THIS line is genuinely ambiguous — naming one from
+        # the 1-4d window silently hides the ambiguity.  Surface all of them as
+        # an ambiguous Candidate instead of a coin-flip Match.  (Only the
+        # each-equal case; a real multi-receipt card batch that SUMS to the
+        # settlement carries no such duplicate and still Matches below.)
+        equal_singles = _merchant_equal_mid_settlements(bsl, mid_pool, ledger)
+        ambiguous_deps = {(e.deposit_id or e.id) for e in equal_singles}
+        if len(ambiguous_deps) >= 2:
+            ordered = _sorted(equal_singles)
+            dep_names = ", ".join(sorted(
+                {f"d:{e.deposit_id}" if e.deposit_id else f"r:{e.id}"
+                 for e in equal_singles}))
+            place(bsl, CANDIDATE, CONF_MEDIUM, [ordered[0]],
+                  ["MULTIPLE_EQUAL_CANDIDATES", "GROUPING_CONFLICT"],
+                  f"{len(ambiguous_deps)} same-MID deposit(s) each equal the "
+                  f"settlement ({dep_names}); which one settled this line is "
+                  f"ambiguous (shared MID is a grouping key). Citing "
+                  f"{ordered[0].id}.", "P6_merchant")
+        elif in_window and total == bsl.amount_cents:
             place(bsl, MATCH, CONF_HIGH, _sorted(in_window),
                   [], f"Same-MID card group ({len(in_window)}) in 1-4d window sums to settlement.",
                   "P6_merchant")
@@ -5527,9 +5633,13 @@ def load_and_bind(by_role, runlog):
         "ENRICHED": ENRICHED_ROLES,
         "ORT_AR": {"trx_id": _rs(False, ["Transaction Number"], pred_reference),
                    "parked_receipt_id": _rs(False, ["Parked Receipt ID"], pred_number),
+                   "deposit_id": _rs(False, ["Deposit ID"], pred_number),
+                   "reference_text": _rs(False, ["REFERENCE_TEXT", "Reference Text"], pred_reference),
                    "bank_name": _rs(False, ["BANK_NAME", "Bank Account Name"], pred_any)},
         "ORT_MISC": {"trx_id": _rs(False, ["Transaction Number"], pred_reference),
                      "parked_receipt_id": _rs(False, ["Parked Receipt ID"], pred_number),
+                     "deposit_id": _rs(False, ["Deposit ID"], pred_number),
+                     "reference_text": _rs(False, ["REFERENCE_TEXT", "Reference Text"], pred_reference),
                      "bank_name": _rs(False, ["BANK_NAME", "Bank Account Name"], pred_any)},
     }
     bound_report = {}
