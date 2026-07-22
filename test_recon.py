@@ -740,6 +740,63 @@ class TestPerRunScript(unittest.TestCase):
         self.assertEqual(R.staged_name("933782d6-x.xlsx", strip_prefix=False),
                          "933782d6-x.xlsx")
 
+    def test_stageable_matches_engine_txt_acceptance(self):
+        # run_recon must stage every .txt route_folder would read: a NATIVE
+        # BAI2 transmission (by name OR by 01/02/16 content) AND the Award
+        # Conversion Report (GMS_AWARD_CONVERSION).  Before the fix it accepted
+        # only BAI-token .txt, so the Award Conversion .txt was silently
+        # dropped here while the engine happily read it on the direct path.
+        award = os.path.join(self.upload,
+                             "Active_Oracle_Award_Conversion_Report.txt")
+        with open(award, "w") as fh:
+            fh.write("Award Number|Award Name|Project Number|Sponsor Number\n"
+                     "A1|Test Award|SPN112933|AP25PPQFO000C140\n")
+        self.assertEqual(E.classify_file(os.path.basename(award)),
+                         "GMS_AWARD_CONVERSION")
+        self.assertTrue(R._stageable(os.path.basename(award), award))
+
+        # raw BAI2 whose name carries no BAI token -> accepted via content sniff
+        baiexp = os.path.join(self.upload, "BAIEXP_07202026_071541.txt")
+        with open(baiexp, "w") as fh:
+            fh.write("01,0,0,260720,1916,1,,,2/\n"
+                     "02,084000026,084000026,1,260718,,USD,2/\n"
+                     "16,142,5100,Z,25202003732875,08035701948,\n"
+                     "49,0,2/\n98,0,1,2/\n99,0,1,2/\n")
+        self.assertIsNone(E.classify_file(os.path.basename(baiexp)))
+        self.assertTrue(R._stageable(os.path.basename(baiexp), baiexp))
+
+        # a plain, unstructured .txt is still ignored
+        notes = os.path.join(self.upload, "notes.txt")
+        with open(notes, "w") as fh:
+            fh.write("just some notes\nnothing structured\n")
+        self.assertFalse(R._stageable(os.path.basename(notes), notes))
+
+    def test_staged_role_content_sniffs_bai_code_csv(self):
+        # A 'BAI Code' CSV whose filename carries no BAI token routes as BAI2
+        # in the engine; the manifest role + preflight must reflect that, not
+        # the false "UNROUTED / the engine will not read it".
+        csv = os.path.join(self.upload, "20260721_FHB_Master.csv")
+        with open(csv, "w") as fh:
+            fh.write("Post Date,Bank ID,Account Number,Account Name,"
+                     "Transaction Description,Amount,Bank Reference,"
+                     "Customer Reference,BAI Code,Currency,Debit/Credit\n"
+                     "07/21/2026,084000026,15,UT General,ACH CREDIT,180,"
+                     "ACH2607210046,,142,USD,CR\n")
+        self.assertIsNone(E.classify_file(os.path.basename(csv)))
+        self.assertEqual(R._staged_role(os.path.basename(csv), csv), "BAI2")
+
+    def test_collect_sources_stages_award_conversion_txt(self):
+        # End-to-end staging: the Award Conversion .txt lands in the staged
+        # list (not ignored), so it reaches the engine and is used.
+        _build_fhb_utc_inputs(self.upload)
+        award = os.path.join(self.upload,
+                             "Active_Oracle_Award_Conversion_Report.txt")
+        with open(award, "w") as fh:
+            fh.write("Award Number|Project Number\nA1|SPN1\n")
+        spreadsheets, ignored = R.collect_sources([self.upload])
+        self.assertIn(award, spreadsheets)
+        self.assertNotIn(award, ignored)
+
     def test_perform_run_end_to_end(self):
         _build_fhb_utc_inputs(
             self.upload,
