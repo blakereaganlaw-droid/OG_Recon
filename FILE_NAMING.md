@@ -130,6 +130,14 @@ NOTE (file name): FHB_UTC_All_Data.xlsx recognized as ALL_DATA — lifecycle wor
 - **`Reconciliation_Report_*` renderings** — routed to RECONCILED but
   skipped by the recon-history audit (they lack the `Created By` actor
   column; stage the `Reconciled_*` Exported-sheet exports instead).
+- **`Oracle_OTBI_Recon_Report_*`** — the OTBI reconciliation-status report
+  (three sheets: `Bank Statement Lines` / `AR Matched` / `MISC Receipts`,
+  actor in `Rec By`).  Routes to RECONCILED (the rule now matches
+  `recon_report` and precedes MET, so the stray `OTBI` token no longer
+  misroutes it to the MET pool).  Feeds the ADVISORY recon-history audit —
+  the same-transaction-identity orphan findings + the "placement cites an
+  already-reconciled transaction" check; never a pool source, placements
+  byte-identical.
 
 (Previously-listed gaps now BUILT: Recon History in-engine (R2 orphan
 audit), multi-BAI2 union across statement windows, pagination union for

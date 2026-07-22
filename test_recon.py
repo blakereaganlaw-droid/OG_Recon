@@ -2080,6 +2080,74 @@ class TestRoutingHardening(unittest.TestCase):
         rh = E.load_recon_history(files, "FHB_MASTER")
         self.assertTrue(rh is None or not rh.get("coarse"))
 
+    def test_otbi_recon_report_parse_and_identity_findings(self):
+        # The Oracle OTBI Recon Report rendering (three sheets: Bank
+        # Statement Lines / AR Matched / MISC Receipts, actor in "Rec By",
+        # reconciled leg per row) parses into the R2 indexes, and the
+        # same-transaction-identity findings surface even when the MISC
+        # actor is blank (the rendering omits Rec By on that sheet) — WITHOUT
+        # flipping availability (option C is gated on a confirmed automation
+        # actor, so placements stay byte-identical).
+        bsl = [("Date", "Amount (USD)", "Reference", "Additional Information",
+                "Account Servicer Reference", "Transaction Type", "Statement",
+                "Transaction Code"),
+               ("2026-07-01", "460.00", "REF123456", "DEPOSIT",
+                "REF123456", "Miscellaneous", "Line 1 , 2026-07-01", "174")]
+        st = [("Date", "Amount (USD)", "Reference", "Transaction Number",
+               "Source", "Counterparty"),
+              # matches the bank line by reference -> a Match citing 1031272
+              ("2026-06-30", "460.00", "REF123456", "1031272", "External", "V"),
+              # a second open ST that is a reconciled leg but matches nothing
+              ("2026-06-30", "999.00", "OTHERREF7", "1031289", "External", "W")]
+        # OTBI recon report: three sheets, MISC sheet has NO Rec By column.
+        bsl_sheet = [("Rec Grp", "Rec By", "Amnt", "Trx Type", "Rec Status",
+                      "Bank Accnt"),
+                     ("G1", "OIC_SYSTEM_USER", "460.00", "MSC", "REC", "")]
+        ar_sheet = [("Rcpt Num", "Amnt", "Rec Grp", "Rec By", "Strc Pay Ref",
+                     "Bank Accnt")]
+        misc_sheet = [("Trx Id", "Rec Num", "Rec Amnt", "Rec Grp", "Trx Type",
+                       "Rec Ref", "Bank Accnt"),
+                      ("1031272", "1031272", "460.00", "G9", "MSC",
+                       "REF123456", ""),
+                      ("1031289", "1031289", "999.00", "G9", "MSC",
+                       "OTHERREF7", "")]
+
+        def run_it(with_rec):
+            d, out = tempfile.mkdtemp(), tempfile.mkdtemp()
+            _write_xlsx(os.path.join(d, "20260710_FHB_Master_BSL_UNR.xlsx"),
+                        [("Exported", bsl)])
+            _write_xlsx(os.path.join(d, "20260710_FHB_Master_ST_UNR.xlsx"),
+                        [("Exported", st)])
+            if with_rec:
+                _write_xlsx(
+                    os.path.join(d, "20260710_Oracle_OTBI_Recon_Report.xlsx"),
+                    [("Bank Statement Lines", bsl_sheet),
+                     ("AR Matched", ar_sheet),
+                     ("MISC Receipts", misc_sheet)])
+            rl = E.run(d, out, present=True)
+            tabs, _ = A._read_output_tabs(rl["recon_workbook"])
+            dump = {t: [[A._N(c) for c in r] for r in rows]
+                    for t, rows in tabs.items()}
+            shutil.rmtree(d, ignore_errors=True)
+            return rl, dump, out
+
+        base_rl, base_dump, _ = run_it(False)
+        self.assertEqual(base_rl["recon_summary"]["matches"], 1)
+        rl, dump, out = run_it(True)
+        # advisory only: placements byte-identical, no availability flip.
+        self.assertEqual(dump, base_dump)
+        self.assertNotIn("recon_history_consumed", rl)
+        self.assertEqual(rl["audit"]["status"], "PASS")
+        rep = rl["recon_history_orphans"]
+        # the Match cites 1031272 (a reconciled leg) -> flagged.
+        self.assertEqual(rep["placements_citing_reconciled_id"], 1)
+        # the unmatched open ST 1031289 is a same-identity orphan.
+        self.assertGreaterEqual(rep["open_st_reconciled_identity"], 1)
+        with open(rep["report_path"]) as fh:
+            text = fh.read()
+        self.assertIn("1031272", text)
+        self.assertIn("already-reconciled", text)
+
     def test_multi_bai2_index_union_and_dedup(self):
         # Two BAI2 files with overlapping windows: the index unions their
         # coverage but dedups the SAME transaction (same bank reference),
