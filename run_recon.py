@@ -72,14 +72,42 @@ import recon_engine as E
 SPREADSHEET_EXTS = (".xlsx", ".xlsm", ".xlsb", ".csv")
 
 
-def _stageable(name: str) -> bool:
-    """A file the run should stage: any spreadsheet, plus a .txt that the
-    router recognizes as a NATIVE BAI2 transmission (owner, 2026-07-19) —
-    any other .txt stays ignored (route_folder would never read it anyway)."""
+def _stageable(name: str, path: str = None) -> bool:
+    """A file the run should stage: any spreadsheet, plus a .txt the engine's
+    route_folder would read — a NATIVE BAI2 transmission (by BAI token OR by
+    its 01/02/16 record content, owner 2026-07-19) or the Award Conversion
+    Report (`GMS_AWARD_CONVERSION`, owner 2026-07-21).  This MUST mirror
+    route_folder's `.txt` acceptance set (recon_engine `role not in
+    ("BAI2", "GMS_AWARD_CONVERSION")`); before (owner, 2026-07-22) it accepted
+    only BAI-token .txt, so the Award Conversion .txt was silently dropped
+    here while the engine happily read it on the direct path."""
     low = name.lower()
     if low.endswith(SPREADSHEET_EXTS):
         return True
-    return low.endswith(".txt") and E.classify_file(name) == "BAI2"
+    if not low.endswith(".txt"):
+        return False
+    if E.classify_file(name) in ("BAI2", "GMS_AWARD_CONVERSION"):
+        return True
+    return path is not None and E._looks_like_bai2(path)
+
+
+def _staged_role(name: str, path: str) -> str:
+    """The role route_folder will ACTUALLY bind, including its content sniff
+    for a BAI2 file whose NAME carries no BAI token — a 'BAI Code' CSV
+    (`20260721_FHB_Master.csv`) or a raw 01/02/16 .txt.  Name-only
+    `classify_file` returns None for those, so the manifest recorded them
+    UNROUTED and preflight warned "the engine will not read it" — a false
+    alarm, since route_folder content-sniffs and reads them (owner,
+    2026-07-22)."""
+    role = E.classify_file(name)
+    if role is not None:
+        return role
+    low = name.lower()
+    if low.endswith(".txt") and E._looks_like_bai2(path):
+        return "BAI2"
+    if low.endswith(SPREADSHEET_EXTS) and E._looks_like_bai2_sheet(path):
+        return "BAI2"
+    return "UNROUTED"
 
 # Claude web uploads are prefixed "933782d6-Name.xlsx" (8 hex chars + dash).
 # A prefix that parses as a plausible YYYYMMDD date is kept — the router's
@@ -129,9 +157,9 @@ def collect_sources(paths):
                     continue
                 if not os.path.isfile(fp):
                     continue
-                (spreadsheets if _stageable(name) else ignored).append(fp)
+                (spreadsheets if _stageable(name, fp) else ignored).append(fp)
         elif os.path.isfile(p):
-            (spreadsheets if _stageable(os.path.basename(p)) else ignored).append(p)
+            (spreadsheets if _stageable(os.path.basename(p), p) else ignored).append(p)
         else:
             raise PerRunError(f"input path does not exist: {p}")
     # A file named explicitly AND found via its parent directory is one source.
@@ -205,7 +233,7 @@ def stage(spreadsheets, input_dir, strip_prefix=True):
             "staged_as": name,
             "bytes": os.path.getsize(dst),
             "sha256": _sha256(dst),
-            "role": E.classify_file(name) or "UNROUTED",
+            "role": _staged_role(name, dst),
             "account": E.infer_account(name),
         })
     return entries
