@@ -482,6 +482,31 @@ Web sessions install deps via `.claude/hooks/session-start.sh`; locally,
   not second-guessed).  Proven no-op on real FHB Master (open pool and the
   reconciled set are cleanly disjoint — 0 id collisions); acts only where a
   genuine orphan collision exists.
+  **OTBI Recon Report rendering (owner "Build it — route + R2 audit",
+  2026-07-22).** Oracle's `Oracle_OTBI_Recon_Report` is a SECOND reconciled-
+  history shape (three sheets — `Bank Statement Lines` / `AR Matched` /
+  `MISC Receipts`; actor in `Rec By`, group in `Rec Grp`, one row per
+  reconciled leg) whose stray `OTBI` token used to misroute it to MET.  The
+  `RECONCILED` router rule now also matches `recon_report`/
+  `reconciliation_report` and PRECEDES MET (which excludes those tokens), so
+  it is recognized-never-loaded like the `Reconciled_*` family.
+  `_parse_otbi_recon` (a `load_recon_history` fallback when the `Exported`
+  schema is absent) folds all three sheets into the SAME fine/coarse/by_txn
+  indexes, account-scoped by `account_of_bank_name` on the `Bank Accnt`
+  column; the BSL sheet supplies the `Rec Grp → Rec By` actor map (the MISC
+  sheet omits `Rec By`).  Two NEW same-transaction-IDENTITY advisory findings
+  (R3-style, never amount): `open_st_reconciled_identity` (an OPEN pool ST
+  whose transaction id is a reconciled leg at matching cents — a stale
+  orphan) and `placements_citing_reconciled_id` (a Match/Candidate/
+  Misdirected citing a transaction the report lists as reconciled — verify
+  before delivery).  These surface even when `Rec By` is blank (the OTBI
+  MISC rendering omits it), so they catch orphans the automation-gated
+  option-C flip cannot.  ADVISORY only — placements provably byte-identical
+  on all four baselines (report absent → no-op; the four counts unchanged);
+  the availability-flip stays gated on a confirmed ESSADMIN/OIC actor, so a
+  blank-actor OTBI leg NEVER flips availability without owner sign-off.  Real
+  UTSO run: the $460 Line-12 Match is flagged as citing receipts 1031272 /
+  1031289 (both REC in the report), plus 27 open same-identity orphans.
 - **Completeness trio (owner, 2026-07-19):** audit **C11** — every cited
   ST id must exist in a source export (permissive superset: ST/Receipts/
   Payments/MET ids, all files all dates; layered whole-cell → token →

@@ -374,7 +374,11 @@ ROUTER_TABLE = [
     # the whole run with already-reconciled lines) — but never loaded by
     # the forward engine (they fuel the config audit's offline analysis
     # and Unreconcile2).  Must precede ALL_BSL/BSL/ST/MET.
-    RouterRule("RECONCILED", [], [], ["reconciled", "reconciliation_report"], "multi", False),
+    # `recon_report` catches the OTBI reconciliation report
+    # (`Oracle_OTBI_Recon_Report`) whose "OTBI" token would otherwise misroute
+    # it to MET below — it is a reconciliation status report (Rec By actor,
+    # Rec Grp), never a MET pool source.  This rule precedes MET, so it wins.
+    RouterRule("RECONCILED", [], [], ["reconciled", "reconciliation_report", "recon_report"], "multi", False),
     RouterRule("ALL_BSL", ["all", "bsl"], ["all_data", "enriched", "reconciled"], [], "first", False),
     # 'enriched' excluded: an Enriched_..._BSL_... workbook is the parsed
     # enrichment source (ENRICHED below), not a competing BSL export.
@@ -391,7 +395,8 @@ ROUTER_TABLE = [
                ["coa", "acctcombos", "combosets", "combostech",
                 "combos_technical", "account_combinations", "combination_sets",
                 "segments", "gl_departments", "chart_of_accounts",
-                "relatedvaluesets", "related_value_sets"],
+                "relatedvaluesets", "related_value_sets",
+                "recon_report", "reconciliation_report", "reconciled"],
                ["met", "oracle_otbi"], "first", False),
     # "_st" alone is too greedy: it matches All_Status / Rosetta_Stone /
     # _Statement.  Require a separator (or end) after the token.
@@ -5636,6 +5641,111 @@ _RECONCILED_SOURCE_SHORT = {
 }
 
 
+def _parse_otbi_recon(rf, account, fine, coarse, by_txn, seen_rows):
+    """Parse an Oracle OTBI reconciliation report into the R2 indexes.  This
+    rendering (owner, 2026-07-21) carries the actor as `Rec By` and the group
+    as `Rec Grp` across three sheets — `Bank Statement Lines`, `AR Matched
+    Receipts`, `MISC Receipts` — where the Reconciled_* `Exported` schema uses
+    `Created By`/`Reconciled Group` on one sheet.  Account-scoped by the bank
+    column (the report may span accounts).  Returns True if it parsed."""
+    def sheet(hint):
+        try:
+            rows, _ = _read_sheet_rows(rf.path, hint)
+            return rows
+        except Exception:      # noqa: BLE001 — advisory fail-soft
+            return None
+    bsl_rows = sheet("Bank Statement Lines")
+    ar_rows = sheet("AR Matched")
+    misc_rows = sheet("MISC Receipts")
+    if not bsl_rows:
+        return False
+
+    def cm(rows):
+        return _coa_colmap(rows[0]) if rows and rows[0] else {}
+
+    def c(m, alias):
+        return m.get(_norm_header(alias))
+
+    def scoped(bankcell):
+        if not account or account == "UNKNOWN":
+            return True
+        a = account_of_bank_name(bankcell)
+        return a is None or a == account
+
+    parsed = False
+    # 1. Bank Statement Lines -> group->actor map + coarse (cents -> group).
+    grp_creator = {}
+    m = cm(bsl_rows)
+    gc, gb, ga, gt, gs, gk = (c(m, "Rec Grp"), c(m, "Rec By"), c(m, "Amnt"),
+                              c(m, "Trx Type"), c(m, "Rec Status"), c(m, "Bank Accnt"))
+    if gc is not None and gb is not None:
+        parsed = True
+        for r in bsl_rows[1:]:
+            if gs is not None and _norm_header(_cell(r, gs)) != "REC":
+                continue
+            if not scoped(_cell(r, gk)):
+                continue
+            group = N(_cell(r, gc))
+            creator = N(_cell(r, gb))
+            amt = cents(_cell(r, ga)) if ga is not None else None
+            if not group:
+                continue
+            grp_creator.setdefault(group, creator)
+            if amt is not None:
+                g = coarse.setdefault(amt, {}).setdefault(
+                    group, {"creators": set(), "auto": False, "sources": set()})
+                g["creators"].add(creator)
+                g["auto"] = g["auto"] or (creator in _AUTOMATION_CREATORS)
+                g["sources"].add("BSL")
+
+    def _add(src, tid, amt, group, creator, znref, ttype):
+        key = (src, tid, amt, group)
+        if not tid or amt is None or key in seen_rows:
+            return
+        seen_rows.add(key)
+        f = fine.setdefault((src, amt, znref, ttype),
+                            {"ids": set(), "creators": set(), "groups": set()})
+        f["ids"].add(tid)
+        f["creators"].add(creator)
+        if group:
+            f["groups"].add(group)
+        t = by_txn.setdefault(_norm_id(tid), {"creators": set(), "cents": amt})
+        t["creators"].add(creator)
+
+    # 2. AR Matched Receipts -> fine[AR] + by_txn (actor on the row).
+    m = cm(ar_rows)
+    idc, ac, grc, bc, rc, bk = (c(m, "Rcpt Num"), c(m, "Amnt"), c(m, "Rec Grp"),
+                                c(m, "Rec By"), c(m, "Strc Pay Ref"), c(m, "Bank Accnt"))
+    if ar_rows and idc is not None and ac is not None:
+        parsed = True
+        for r in ar_rows[1:]:
+            if not scoped(_cell(r, bk)):
+                continue
+            group = N(_cell(r, grc)) if grc is not None else ""
+            creator = (N(_cell(r, bc)) if bc is not None else "") or grp_creator.get(group, "")
+            _add("AR", N(_cell(r, idc)), cents(_cell(r, ac)), group, creator,
+                 znorm(_cell(r, rc)) if rc is not None else "", "")
+
+    # 3. MISC Receipts -> fine[EXT] + by_txn (actor via the group map).
+    m = cm(misc_rows)
+    tic, rnc, amc, grc, ttc, rrc, bk = (c(m, "Trx Id"), c(m, "Rec Num"),
+        c(m, "Rec Amnt"), c(m, "Rec Grp"), c(m, "Trx Type"), c(m, "Rec Ref"), c(m, "Bank Accnt"))
+    if misc_rows and amc is not None and (tic is not None or rnc is not None):
+        parsed = True
+        for r in misc_rows[1:]:
+            if not scoped(_cell(r, bk)):
+                continue
+            group = N(_cell(r, grc)) if grc is not None else ""
+            creator = grp_creator.get(group, "")
+            znref = znorm(_cell(r, rrc)) if rrc is not None else ""
+            ttype = _norm_header(_cell(r, ttc)) if ttc is not None else ""
+            amt = cents(_cell(r, amc))
+            for idcol in (tic, rnc):
+                if idcol is not None:
+                    _add("EXT", N(_cell(r, idcol)), amt, group, creator, znref, ttype)
+    return parsed
+
+
 def load_recon_history(files, account):
     """Parse the RECONCILED family's `Exported` sheets (one row per
     reconciled-group leg; 17 cols, header row located by 'Reconciled
@@ -5663,7 +5773,11 @@ def load_recon_history(files, account):
             continue
         hi = _coa_header_index(rows, "Reconciled Group")
         if hi is None:
-            continue                # a Reconciliation_Report rendering, not Exported
+            # Not the Exported schema — try the OTBI reconciliation report
+            # rendering (Rec By / Rec Grp across three sheets).
+            if _parse_otbi_recon(rf, account, fine, coarse, by_txn, seen_rows):
+                used_files.append(rf.filename)
+            continue
         idx = _coa_colmap(rows[hi])
         col = {k: idx.get(_norm_header(a)) for k, a in (
             ("group", "Reconciled Group"), ("source", "Transaction Source"),
@@ -5802,6 +5916,66 @@ def recon_history_audit(rh, account, placements, pool, output_dir, runlog):
             lines_md.append(
                 f"- {bsl.date} {_usd(bsl.amount_cents)}: "
                 + ", ".join(groups) + f" (by {', '.join(creators[:4])})")
+        lines_md.append("")
+
+    # 4. Same-transaction-identity reconciled legs (R3-style identity, NOT
+    #    amount).  The recon report states outright that a transaction id is a
+    #    reconciled leg, so an OPEN pool ST — or a PLACEMENT-cited ST —
+    #    carrying that exact transaction id at matching signed cents is money
+    #    already consumed.  This is the highest-value orphan signal because it
+    #    survives even when the Created By actor is blank (the OTBI recon-report
+    #    rendering omits it), so the availability-flip (option C, gated on
+    #    confirmed automation) leaves it untouched by design.  ADVISORY —
+    #    named for the reconciler, never a bar and never a placement change.
+    by_txn = rh.get("by_txn_id") or {}
+    def _rec_leg(e):
+        return by_txn.get(_norm_id(e.id)) or (
+            e.base_id and by_txn.get(_norm_id(e.base_id)))
+    id_orphans = []
+    for e in pool:
+        if not e.available or e.foreign_account or e.id in consumed:
+            continue
+        rec = _rec_leg(e)
+        if rec and rec["cents"] == e.amount_cents:
+            id_orphans.append((e, rec))
+    report["open_st_reconciled_identity"] = len(id_orphans)
+    if id_orphans:
+        lines_md += ["## Open STs whose transaction id is a reconciled leg "
+                     "(same-identity orphan)",
+                     "The recon report lists these exact transaction ids as "
+                     "already reconciled at this signed cents — likely stale "
+                     "orphans.  Do not consume them here without a reroute / "
+                     "unwind (run Unreconcile2).", ""]
+        for e, rec in sorted(id_orphans,
+                             key=lambda t: (t[0].amount_cents, t[0].id))[:30]:
+            who = ", ".join(sorted(c for c in rec["creators"] if c)) \
+                or "(actor n/a)"
+            lines_md.append(f"- {e.id} {_usd(e.amount_cents)} ({e.source}) — "
+                            f"reconciled by {who}")
+        lines_md.append("")
+
+    # Placements that cite an already-reconciled transaction id — a Match /
+    #    Candidate / Misdirected resting on money the report says is consumed.
+    cite_hits = []
+    for p in placements:
+        if p.kind not in (MATCH, CANDIDATE, MISDIRECTED):
+            continue
+        for e in p.st_entries:
+            rec = _rec_leg(e)
+            if rec and rec["cents"] == e.amount_cents:
+                cite_hits.append((p, e, rec))
+    report["placements_citing_reconciled_id"] = len(cite_hits)
+    if cite_hits:
+        lines_md += ["## Placements citing an already-reconciled transaction",
+                     "These placed rows cite a transaction the recon report "
+                     "lists as reconciled — verify before delivery (the open "
+                     "counterpart may be a stale orphan).", ""]
+        for p, e, rec in cite_hits[:30]:
+            who = ", ".join(sorted(c for c in rec["creators"] if c)) \
+                or "(actor n/a)"
+            lines_md.append(
+                f"- {p.kind} {p.bsl.date} {_usd(p.bsl.amount_cents)} cites "
+                f"{e.id} — reconciled by {who}")
         lines_md.append("")
 
     path = os.path.join(output_dir, f"{account}_orphan_findings.md")
